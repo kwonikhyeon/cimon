@@ -59,6 +59,9 @@ pub struct Change {
     pub content: Option<String>,
     #[serde(default)]
     pub delete: bool,
+    /// Raw bytes (`recipe import` of a non-UTF-8 file); wins over `content`.
+    #[serde(skip)]
+    pub bytes: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -92,7 +95,9 @@ pub enum SyncOutcome {
     /// `main` was already in the branch.
     UpToDate { head: String },
     Merged { commit: String },
-    Conflicts { files: Vec<ConflictFile> },
+    /// `main` is the commit the conflicts were computed against — resolutions must come
+    /// back with it, so they are never applied to a different `main`.
+    Conflicts { main: String, files: Vec<ConflictFile> },
 }
 
 pub struct RecipeStore {
@@ -144,6 +149,16 @@ impl RecipeStore {
         self.git.ref_value(&format!("refs/heads/{branch}"))
     }
 
+    /// A caller's pin (`base`, `head`): a commit id only. A symbolic name would always
+    /// match the current head and protect nothing.
+    fn pin(&self, s: &str, what: &str) -> Result<String> {
+        let s = s.trim();
+        if !(7..=40).contains(&s.len()) || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RsError::new("invalid_param", format!("{what} must be a commit id (hex), got {s:?}")));
+        }
+        self.git.rev(s).ok_or_else(|| RsError::new("recipe_conflict", format!("{what} {s} is not a commit in the recipe repository")))
+    }
+
     /// Resolves a caller-supplied recipe ref: `main`, a `recipe/*` branch, or a commit.
     pub fn resolve(&self, r: &str) -> Result<String> {
         let r = r.trim();
@@ -172,6 +187,13 @@ impl RecipeStore {
         let ok = self.git.run_allow(&["check-ref-format", &format!("refs/heads/{branch}")], &[1], &[]).map(|o| o.code == Some(0)).unwrap_or(false);
         if !ok || branch.contains("..") || branch.chars().any(|c| c.is_whitespace() || c == '\\') {
             return Err(RsError::new("trial_ref_not_allowed", format!("{branch:?} is not a valid branch name")));
+        }
+        // why: loose ref files live on NTFS, where recipe/Foo and recipe/foo are one file
+        if branch.chars().any(char::is_uppercase) {
+            return Err(RsError::new("trial_ref_not_allowed", format!("{branch:?}: branch names are lower-case only (Windows ref files ignore case)")));
+        }
+        if branch.split('/').any(|c| c.ends_with('.') || !cimon_recipe::tree::is_safe_rel(c)) {
+            return Err(RsError::new("trial_ref_not_allowed", format!("{branch:?} is not a valid branch name on Windows")));
         }
         Ok(())
     }
@@ -202,6 +224,9 @@ impl RecipeStore {
         let dir = tempfile::tempdir().map_err(|e| RsError::new("io", e.to_string()))?;
         let index = dir.path().join("index");
         let index_s = index.to_string_lossy().to_string();
+        if let Some((a, b)) = cimon_recipe::tree::case_collision(tree.files.keys().map(|s| s.as_str())) {
+            return Err(RsError::new("recipe_invalid", format!("{a} and {b} are the same path on Windows — rename one")));
+        }
         let mut info = String::new();
         for (path, data) in &tree.files {
             if !is_safe_rel(path) {
@@ -253,18 +278,26 @@ impl RecipeStore {
         for c in changes {
             let path = cimon_recipe::tree::normalize(&c.path);
             if !is_safe_rel(&path) {
-                return Err(RsError::new("recipe_invalid", format!("path {:?} must be relative inside the repository", c.path)));
+                return Err(RsError::new(
+                    "recipe_invalid",
+                    format!("path {:?} must be relative inside the repository and valid on Windows (no trailing dot or space, no device names like NUL)", c.path),
+                ));
             }
             if c.delete {
                 if t.files.remove(&path).is_none() {
                     return Err(RsError::new("recipe_invalid", format!("{path} does not exist — nothing to delete")));
                 }
             } else {
-                let Some(content) = &c.content else {
-                    return Err(RsError::new("recipe_invalid", format!("{path}: give content or delete = true")));
+                let data = match (&c.bytes, &c.content) {
+                    (Some(b), _) => b.clone(),
+                    (None, Some(s)) => s.clone().into_bytes(),
+                    (None, None) => return Err(RsError::new("recipe_invalid", format!("{path}: give content or delete = true"))),
                 };
-                t.files.insert(path, content.clone().into_bytes());
+                t.files.insert(path, data);
             }
+        }
+        if let Some((a, b)) = cimon_recipe::tree::case_collision(t.files.keys().map(|s| s.as_str())) {
+            return Err(RsError::new("recipe_invalid", format!("{a} and {b} are the same path on Windows — a checkout would keep only one")));
         }
         Ok(t)
     }
@@ -279,7 +312,7 @@ impl RecipeStore {
         let main = self.require_main()?;
         let refname = format!("refs/heads/{branch}");
         let current = self.git.ref_value(&refname);
-        let base = self.git.rev(base).ok_or_else(|| RsError::new("recipe_conflict", format!("base {base} is not a commit in the recipe repository")))?;
+        let base = self.pin(base, "base")?;
         match &current {
             None if base != main => {
                 return Err(RsError::new(
@@ -319,11 +352,11 @@ impl RecipeStore {
             .files
             .iter()
             .filter(|(p, d)| base_tree.read(p) != Some(d.as_slice()))
-            .map(|(p, d)| Change { path: p.clone(), content: Some(String::from_utf8_lossy(d).into_owned()), delete: false })
+            .map(|(p, d)| Change { path: p.clone(), content: None, delete: false, bytes: Some(d.clone()) })
             .collect();
         for p in base_tree.files.keys() {
             if !tree.files.contains_key(p) {
-                changes.push(Change { path: p.clone(), content: None, delete: true });
+                changes.push(Change { path: p.clone(), content: None, delete: true, bytes: None });
             }
         }
         self.edit(store, user, branch, &base, message, &changes)
@@ -394,15 +427,21 @@ impl RecipeStore {
 
     /// `recipe_sync`: merges `main` into the branch. Conflicts come back with the three
     /// versions of each file; resolved contents produce the merge commit.
-    pub fn sync(&self, store: &Store, user: &str, branch: &str, head: &str, resolutions: &HashMap<String, String>) -> Result<SyncOutcome> {
+    pub fn sync(&self, store: &Store, user: &str, branch: &str, head: &str, main_at: Option<&str>, resolutions: &HashMap<String, String>) -> Result<SyncOutcome> {
         self.validate_branch(branch)?;
         let _g = self.lock();
         let main = self.require_main()?;
         let refname = format!("refs/heads/{branch}");
         let current = self.git.ref_value(&refname).ok_or_else(|| RsError::new("unknown_recipe_ref", format!("{branch} does not exist")))?;
-        let head = self.git.rev(head).unwrap_or_default();
+        let head = self.pin(head, "head")?;
         if current != head {
             return Err(RsError::new("recipe_conflict", format!("{branch} moved to {} — read it again", short(&current))));
+        }
+        if !resolutions.is_empty() {
+            let at = main_at.ok_or_else(|| RsError::new("invalid_param", "resolutions need main — the main commit the conflicts were reported against"))?;
+            if self.pin(at, "main")? != main {
+                return Err(RsError::new("recipe_conflict", format!("{} moved to {} since the conflicts were reported — sync again and resolve against it", self.main, short(&main))));
+            }
         }
         if self.git.is_ancestor(&main, &current) {
             return Ok(SyncOutcome::UpToDate { head: current });
@@ -435,7 +474,7 @@ impl RecipeStore {
                         branch: read(Some(&current), p),
                     })
                     .collect();
-                return Ok(SyncOutcome::Conflicts { files });
+                return Ok(SyncOutcome::Conflicts { main: main.clone(), files });
             }
             for p in &conflicted {
                 let c = &resolutions[p];
@@ -477,7 +516,7 @@ impl RecipeStore {
         }
         let refname = format!("refs/heads/{}", p.branch);
         let current = self.git.ref_value(&refname).ok_or_else(|| RsError::new("unknown_recipe_ref", format!("{} no longer exists", p.branch)))?;
-        let head_full = self.git.rev(head).unwrap_or_default();
+        let head_full = self.pin(head, "head")?;
         if current != head_full {
             return Err(RsError::new("recipe_conflict", format!("the proposal changed to {} since you looked at {} — look again", short(&current), short(head))));
         }
@@ -486,11 +525,17 @@ impl RecipeStore {
             return Err(RsError::new("not_fast_forward", format!("{} moved to {} — recipe_sync, run the trials again, then promote", self.main, short(&main))));
         }
         conditions(&main, &current)?;
-        // Order matters for crash recovery (see `reconcile`): main first, then the
-        // proposal record, then the branch.
-        self.git.update_ref(&self.main_ref(), &current, Some(&main), &format!("recipe_promote {} by {user}", cimon_core::proposal_label(p.id)))?;
-        store.mark_promoted(p.id, &current, user, override_reason)?;
-        self.git.delete_ref(&refname, &current)?;
+        // Order matters for crash recovery (see `reconcile`): who promoted and why is
+        // written first, then main moves, then the proposal is marked, then the branch
+        // goes. Once main has moved the promote has happened — later failures are left
+        // to `reconcile`, which keeps the recorded promoter and reason.
+        store.set_promote_intent(p.id, &current, user, override_reason)?;
+        if let Err(e) = self.git.update_ref(&self.main_ref(), &current, Some(&main), &format!("recipe_promote {} by {user}", cimon_core::proposal_label(p.id))) {
+            let _ = store.clear_promote_intent(p.id);
+            return Err(e.into());
+        }
+        let _ = store.mark_promoted(p.id, &current, user, override_reason);
+        let _ = self.git.delete_ref(&refname, &current);
         Ok(current)
     }
 
@@ -503,8 +548,9 @@ impl RecipeStore {
         }
         let refname = format!("refs/heads/{}", p.branch);
         if let Some(head) = self.git.ref_value(&refname) {
+            // the commits stay reachable from the closed ref, or the branch is not deleted
             let keep = format!("refs/cimon/closed/{}", cimon_core::proposal_label(p.id));
-            let _ = self.git.run(&["update-ref", "-m", "recipe_close", &keep, &head]);
+            self.git.run(&["update-ref", "-m", "recipe_close", &keep, &head])?;
             self.git.delete_ref(&refname, &head)?;
         }
         store.mark_closed(p.id, user, reason)?;
@@ -521,6 +567,12 @@ impl RecipeStore {
         let target = self.git.rev(commit).ok_or_else(|| RsError::new("not_found", format!("no commit {commit}")))?;
         if !self.git.is_ancestor(&target, &main) {
             return Err(RsError::new("recipe_invalid", format!("{} is not in {}'s history", short(&target), self.main)));
+        }
+        if self.git.rev(&format!("{target}^2")).is_some() {
+            return Err(RsError::new(
+                "recipe_invalid",
+                format!("{} is a merge (recipe_sync) commit — reverting it would undo what was merged in from {}; revert the proposal's own commits instead", short(&target), self.main),
+            ));
         }
         let parent = self.git.rev(&format!("{target}^1")).ok_or_else(|| RsError::new("recipe_invalid", "the first commit cannot be reverted"))?;
         let out = self.git.run_allow(
@@ -541,6 +593,9 @@ impl RecipeStore {
             reverted.files.insert(p, d);
         }
         let main_tree = self.tree(&main)?;
+        if *main_tree == reverted {
+            return Err(RsError::new("recipe_invalid", format!("{}'s changes are already gone from {} — nothing to revert", short(&target), self.main)));
+        }
         gate(&main_tree, &reverted)?;
         let subject = self.git.run_str(&["log", "-1", "--format=%s", &target])?;
         let msg = format!("되돌리기: {subject}\n\n되돌린 커밋 {target}\n사유: {reason}");
@@ -601,10 +656,20 @@ impl RecipeStore {
         if path.join("HEAD").exists() {
             return Err(RsError::new("exists", format!("{} already holds a repository — move it away first", path.display())));
         }
-        let git = Git::init_bare(path)?;
-        git.run(&["bundle", "verify", &bundle.to_string_lossy()])?;
-        git.run(&["fetch", "--quiet", &bundle.to_string_lossy(), "+refs/*:refs/*"])?;
-        Ok(())
+        if std::fs::read_dir(path).is_ok_and(|mut d| d.next().is_some()) {
+            return Err(RsError::new("exists", format!("{} is not empty — restore into an empty or new directory", path.display())));
+        }
+        let res = (|| -> Result<()> {
+            let git = Git::init_bare(path)?;
+            git.run(&["bundle", "verify", &bundle.to_string_lossy()])?;
+            git.run(&["fetch", "--quiet", &bundle.to_string_lossy(), "+refs/*:refs/*"])?;
+            Ok(())
+        })();
+        if res.is_err() {
+            // a half-made repository would make the retry fail with "exists"
+            let _ = std::fs::remove_dir_all(path);
+        }
+        res
     }
 
     /// Writes the tree of `commit` to `dir` once (recipe checkout for `${recipes}`).
@@ -664,7 +729,7 @@ pub fn gate(base: &MemTree, new: &MemTree) -> Result<Vec<Diag>> {
         d.message = format!("(이미 있던 오류) {}", d.message);
         d
     }).collect();
-    let old_w: std::collections::BTreeSet<(String, String)> = before.warnings.iter().map(|d| d.key()).collect();
+    let old_w: std::collections::BTreeSet<cimon_recipe::check::DiagKey> = before.warnings.iter().map(|d| d.key()).collect();
     warnings.extend(after.warnings.into_iter().filter(|d| !old_w.contains(&d.key())));
     Ok(warnings)
 }

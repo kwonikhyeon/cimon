@@ -2,7 +2,8 @@
 //! per project, with risk flags. Promote conditions (design §6.5) are computed from it.
 
 use crate::catalog::Catalog;
-use crate::check::{find_recipes_path, step_strings};
+use crate::model::Kind;
+use crate::refs::{project_refs, project_texts, ref_files, RecipeRef, Scope};
 use crate::resolve::{parse_project, resolve_project, Resolved};
 use crate::tree::Tree;
 use serde::Serialize;
@@ -140,6 +141,7 @@ pub fn semantic_diff(old: &dyn Tree, new: &dyn Tree) -> SemanticDiff {
     }
 
     let ids: BTreeSet<String> = old.project_ids().into_iter().chain(new.project_ids()).collect();
+    let indirect = unattributed_files(old, new, &ids, &out.files);
     for id in ids {
         let o = resolve_project(old, &id).ok();
         let n = resolve_project(new, &id);
@@ -169,24 +171,31 @@ pub fn semantic_diff(old: &dyn Tree, new: &dyn Tree) -> SemanticDiff {
                 continue;
             }
         };
-        diff_project(old, new, o.as_ref(), &n, &changed_kinds, &mut pd);
-        if in_old {
-            if let (Ok(op), Ok(np)) = (parse_project(old, &id), parse_project(new, &id)) {
-                if op != np {
-                    pd.project_toml_changed = true;
-                    let ov = serde_json::to_value(&op).unwrap();
-                    let nv = serde_json::to_value(&np).unwrap();
-                    for f in field_changes(&ov, &nv, "") {
-                        let risk = if f.field.starts_with("repo") || f.field.starts_with("allowed_refs") || f.field.starts_with("sibling") {
-                            Some(Risk::Permission)
-                        } else {
-                            Some(Risk::Behavior)
-                        };
-                        if let Some(r) = risk {
-                            pd.risks.insert(r);
+        diff_project(old, new, o.as_ref(), &n, &changed_kinds, &indirect, &mut pd);
+        let pt = format!("projects/{id}/project.toml");
+        if in_old && old.read(&pt) != new.read(&pt) {
+            match (parse_project(old, &id), parse_project(new, &id)) {
+                (Ok(op), Ok(np)) => {
+                    if op != np {
+                        pd.project_toml_changed = true;
+                        let ov = serde_json::to_value(&op).unwrap();
+                        let nv = serde_json::to_value(&np).unwrap();
+                        for f in field_changes(&ov, &nv, "") {
+                            let risk = if f.field.starts_with("repo") || f.field.starts_with("allowed_refs") || f.field.starts_with("sibling") {
+                                Risk::Permission
+                            } else {
+                                Risk::Behavior
+                            };
+                            pd.risks.insert(risk);
+                            pd.project_fields.push(FieldChange { risk: Some(risk), ..f });
                         }
-                        pd.project_fields.push(FieldChange { risk, ..f });
                     }
+                }
+                // one side does not parse: nothing can be compared, so assume the worst
+                _ => {
+                    pd.project_toml_changed = true;
+                    pd.risks.insert(Risk::Permission);
+                    pd.project_fields.push(FieldChange { field: "project.toml".into(), from: Value::Null, to: Value::Null, risk: Some(Risk::Permission) });
                 }
             }
         }
@@ -206,10 +215,59 @@ fn touches(files: &[String], id: &str, _r: Option<&Resolved>) -> bool {
     files.iter().any(|f| f.starts_with(&format!("projects/{id}/")))
 }
 
-fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolved, changed_kinds: &BTreeSet<String>, pd: &mut ProjectDiff) {
+/// Changed files no recipe reads directly: not the catalog, a preset, a project's own
+/// recipe files, or a file a `${recipes}` reference reaches. A referenced script can
+/// still load them (a helper module), so they count against the projects that could
+/// reach them. Markdown is documentation and is left out.
+fn unattributed_files(old: &dyn Tree, new: &dyn Tree, ids: &BTreeSet<String>, changed: &[String]) -> Vec<String> {
+    let mut attributed: BTreeSet<String> = BTreeSet::new();
+    attributed.insert("toolchains.toml".into());
+    for tree in [old, new] {
+        for id in ids {
+            if let Ok(r) = resolve_project(tree, id) {
+                attributed.extend(r.files.iter().cloned());
+                for (_, rr) in project_refs(&r) {
+                    attributed.extend(ref_files(old, &rr));
+                    attributed.extend(ref_files(new, &rr));
+                }
+            }
+        }
+    }
+    changed
+        .iter()
+        .filter(|f| !attributed.contains(*f) && !f.starts_with("presets/") && !f.to_ascii_lowercase().ends_with(".md"))
+        .cloned()
+        .collect()
+}
+
+/// Did any file a reference reaches change between the trees?
+fn ref_changed(old: &dyn Tree, new: &dyn Tree, r: &RecipeRef) -> bool {
+    let files: BTreeSet<String> = ref_files(old, r).into_iter().chain(ref_files(new, r)).collect();
+    files.iter().any(|f| old.read(f) != new.read(f))
+}
+
+fn ref_label(r: &RecipeRef) -> String {
+    if r.path.is_empty() {
+        "script:(레시피 저장소 전체)".into()
+    } else {
+        format!("script:{}{}", r.path, if r.dynamic { "/…" } else { "" })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolved, changed_kinds: &BTreeSet<String>, indirect: &[String], pd: &mut ProjectDiff) {
     let empty_steps = vec![];
     let old_steps = o.map(|r| &r.steps).unwrap_or(&empty_steps);
     let mut changed_steps: BTreeSet<String> = BTreeSet::new();
+    let new_refs = project_refs(n);
+    let old_refs = o.map(project_refs).unwrap_or_default();
+    // indirect changes reach this project when it references anything at all
+    let own_dir = format!("projects/{}/", n.id);
+    let reaching: Vec<&String> = if new_refs.is_empty() {
+        vec![]
+    } else {
+        indirect.iter().filter(|f| f.starts_with(&own_dir) || !f.starts_with("projects/")).collect()
+    };
 
     // settings
     if let Some(o) = o {
@@ -266,6 +324,31 @@ fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolv
                 }
             }
         }
+        // vars: a changed var changes every step whose strings use it
+        let changed_vars: Vec<&String> = o.vars.keys().chain(n.vars.keys()).filter(|k| o.vars.get(*k) != n.vars.get(*k)).collect();
+        if !changed_vars.is_empty() {
+            for (scope, t) in project_texts(n) {
+                if let Scope::Step(id) = scope {
+                    if changed_vars.iter().any(|k| t.contains(&format!("${{vars.{k}}}"))) {
+                        changed_steps.insert(id);
+                    }
+                }
+            }
+        }
+    }
+    // scripts reached from project-wide strings ([env], [workspace])
+    let project_scope: BTreeSet<&RecipeRef> = new_refs.iter().chain(old_refs.iter()).filter(|(s, _)| *s == Scope::Project).map(|(_, r)| r).collect();
+    for r in project_scope {
+        if ref_changed(old, new, r) {
+            pd.risks.insert(Risk::Exec);
+            pd.settings.push(FieldChange { field: ref_label(r), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
+        }
+    }
+    if !reaching.is_empty() && new_refs.iter().any(|(s, _)| *s == Scope::Project) {
+        for f in &reaching {
+            pd.risks.insert(Risk::Exec);
+            pd.settings.push(FieldChange { field: format!("script(간접):{f}"), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
+        }
     }
     let project_wide = pd.settings.iter().any(|f| !f.field.starts_with("params.") && !f.field.starts_with("fixture."));
 
@@ -281,19 +364,36 @@ fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolv
             Some(os) => {
                 let a = serde_json::to_value(&os.def).unwrap();
                 let b = serde_json::to_value(&s.def).unwrap();
-                for f in field_changes(&a, &b, "") {
+                // `default` is compared by its effect below (unset = the kind's default)
+                for f in field_changes(&a, &b, "").into_iter().filter(|f| f.field != "default") {
                     let risk = step_field_risk(&f);
                     sc.risks.insert(risk);
                     sc.fields.push(FieldChange { risk: Some(risk), ..f });
                 }
+                if os.is_default() != s.is_default() {
+                    // a test leaving the default run means it stops guarding every build
+                    let risk = if !s.is_default() && matches!(s.kind, Kind::Test | Kind::Scenario) { Risk::Weaken } else { Risk::Behavior };
+                    sc.risks.insert(risk);
+                    sc.fields.push(FieldChange { field: "default".into(), from: Value::Bool(os.is_default()), to: Value::Bool(s.is_default()), risk: Some(risk) });
+                }
             }
         }
-        // referenced scripts
-        for text in step_strings(&s.def) {
-            if let Some(p) = find_recipes_path(&text) {
-                if old.read(&p) != new.read(&p) && old_step.is_some() {
+        // referenced scripts: every reference of this step (and of its fixture), in
+        // either version of the step
+        if old_step.is_some() {
+            let scope = Scope::Step(s.id().to_string());
+            let refs: BTreeSet<&RecipeRef> = new_refs.iter().chain(old_refs.iter()).filter(|(sc_, _)| *sc_ == scope).map(|(_, r)| r).collect();
+            let has_refs = !refs.is_empty();
+            for r in refs {
+                if ref_changed(old, new, r) {
                     sc.risks.insert(Risk::Exec);
-                    sc.fields.push(FieldChange { field: format!("script:{p}"), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
+                    sc.fields.push(FieldChange { field: ref_label(r), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
+                }
+            }
+            if has_refs {
+                for f in &reaching {
+                    sc.risks.insert(Risk::Exec);
+                    sc.fields.push(FieldChange { field: format!("script(간접):{f}"), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
                 }
             }
         }
@@ -331,6 +431,9 @@ fn step_field_risk(f: &FieldChange) -> Risk {
     let top = f.field.split(['.', '[']).next().unwrap_or("");
     match top {
         "run" | "shell" | "cwd" | "env" => Risk::Exec,
+        // a judge script is a command like any other
+        "judge" if f.field == "judge.run" => Risk::Exec,
+        "judge" if f.field == "judge" && f.to.get("run").is_some_and(|r| !r.is_null()) => Risk::Exec,
         "judge" => {
             let weaker = match f.field.as_str() {
                 "judge.min_tests" => f.to.as_i64().unwrap_or(1) < f.from.as_i64().unwrap_or(1),
@@ -344,10 +447,12 @@ fn step_field_risk(f: &FieldChange) -> Risk {
                 Risk::Behavior
             }
         }
+        // inspection scripts run on the build machine too
+        "artifact" if inspects(&f.from) != inspects(&f.to) => Risk::Exec,
         "fail_on_output" => {
-            let a = f.from.as_array().map(|v| v.len()).unwrap_or(0);
-            let b = f.to.as_array().map(|v| v.len()).unwrap_or(0);
-            if b < a || f.to.is_null() {
+            // looser when any pattern that used to fail the step is gone
+            let set = |v: &Value| v.as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(str::to_string)).collect::<BTreeSet<String>>()).unwrap_or_default();
+            if set(&f.from).difference(&set(&f.to)).next().is_some() {
                 Risk::Weaken
             } else {
                 Risk::Behavior
@@ -356,6 +461,18 @@ fn step_field_risk(f: &FieldChange) -> Risk {
         "uncounted" if f.to.as_bool() == Some(true) => Risk::Weaken,
         _ => Risk::Behavior,
     }
+}
+
+/// The inspect lists of an `artifact` array, by artifact name.
+fn inspects(v: &Value) -> BTreeMap<String, Value> {
+    v.as_array()
+        .map(|a| {
+            a.iter()
+                .map(|x| (x.get("name").and_then(|n| n.as_str()).unwrap_or_default().to_string(), x.get("inspect").cloned().unwrap_or(Value::Null)))
+                .filter(|(_, i)| !i.is_null() && i.as_array().is_none_or(|a| !a.is_empty()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Leaf-level differences between two JSON values; `prefix` names the root.
@@ -462,5 +579,80 @@ mod tests {
     #[test]
     fn no_change() {
         assert!(semantic_diff(&base(), &base()).is_empty());
+    }
+
+    fn step_of<'a>(d: &'a SemanticDiff, p: &str, s: &str) -> Option<&'a StepChange> {
+        d.projects.iter().find(|x| x.id == p)?.steps.iter().find(|x| x.id == s)
+    }
+
+    #[test]
+    fn default_judge_and_fail_on_output() {
+        let old = base();
+        let mut new = base();
+        new.insert(
+            "projects/a/recipe.toml",
+            "schema = 1\n[toolchains]\nnode = { version = \"1.2.3\" }\n[[step]]\nid = \"t\"\nkind = \"test\"\ndefault = false\nrun = [\"x\"]\njudge = { type = \"junit\", reports = \"r.xml\", min_tests = 1 }\n",
+        );
+        let d = semantic_diff(&old, &new);
+        let t = step_of(&d, "a", "t").expect("default change listed");
+        assert!(t.risks.contains(&Risk::Weaken), "{t:?}");
+
+        let mut old2 = base();
+        old2.insert("projects/b/recipe.toml", "schema = 1\n[[step]]\nid = \"b1\"\nkind = \"build\"\nrun = [\"python\", \"${recipes}/scripts/x.py\"]\nfail_on_output = [\"skipped\"]\njudge = { type = \"script\", run = [\"j\"] }\n");
+        let mut new2 = old2.clone();
+        new2.insert("projects/b/recipe.toml", "schema = 1\n[[step]]\nid = \"b1\"\nkind = \"build\"\nrun = [\"python\", \"${recipes}/scripts/x.py\"]\nfail_on_output = [\"zzz\"]\njudge = { type = \"script\", run = [\"j2\"] }\n");
+        let d = semantic_diff(&old2, &new2);
+        let b = step_of(&d, "b", "b1").unwrap();
+        assert!(b.fields.iter().any(|f| f.field == "fail_on_output" && f.risk == Some(Risk::Weaken)), "{b:?}");
+        assert!(b.fields.iter().any(|f| f.field == "judge.run" && f.risk == Some(Risk::Exec)), "{b:?}");
+    }
+
+    #[test]
+    fn every_script_reference_counts() {
+        let mut old = base();
+        old.insert(
+            "projects/b/recipe.toml",
+            "schema = 1\n[[step]]\nid = \"b1\"\nkind = \"build\"\nrun = [\"python\", \"${recipes}/scripts/x.py\", '${recipes}\\scripts\\y.py']\n[[step]]\nid = \"b2\"\nkind = \"test\"\nrun = [\"t\"]\nuncounted = true\nfixture = \"svc\"\n[fixture.svc]\nup = [{ run = [\"pwsh\", \"${recipes}/scripts/up.ps1\"] }]\n",
+        );
+        old.insert("scripts/y.py", "1");
+        old.insert("scripts/up.ps1", "1");
+        old.insert("scripts/lib.py", "1");
+        // second reference (backslashes)
+        let mut new = old.clone();
+        new.insert("scripts/y.py", "2");
+        assert!(step_of(&semantic_diff(&old, &new), "b", "b1").is_some_and(|s| s.risks.contains(&Risk::Exec)));
+        // fixture script
+        let mut new = old.clone();
+        new.insert("scripts/up.ps1", "2");
+        assert!(step_of(&semantic_diff(&old, &new), "b", "b2").is_some_and(|s| s.risks.contains(&Risk::Exec)));
+        // a helper no recipe names: every step that references scripts is marked
+        let mut new = old.clone();
+        new.insert("scripts/lib.py", "2");
+        let d = semantic_diff(&old, &new);
+        let b1 = step_of(&d, "b", "b1").expect("indirect change reaches b1");
+        assert!(b1.fields.iter().any(|f| f.field == "script(간접):scripts/lib.py"), "{b1:?}");
+        // documentation alone touches nobody
+        let mut new = old.clone();
+        new.insert("scripts/README.md", "docs");
+        assert!(semantic_diff(&old, &new).projects.is_empty());
+    }
+
+    #[test]
+    fn vars_reach_non_default_steps_and_broken_project_toml_is_flagged() {
+        let mut old = base();
+        old.insert("projects/b/recipe.toml", "schema = 1\n[vars]\nkey = \"1\"\n[[step]]\nid = \"b1\"\nkind = \"build\"\nrun = [\"b\"]\n[[step]]\nid = \"pkg\"\nkind = \"package\"\nrun = [\"p\", \"${vars.key}\"]\n");
+        let mut new = old.clone();
+        new.insert("projects/b/recipe.toml", "schema = 1\n[vars]\nkey = \"2\"\n[[step]]\nid = \"b1\"\nkind = \"build\"\nrun = [\"b\"]\n[[step]]\nid = \"pkg\"\nkind = \"package\"\nrun = [\"p\", \"${vars.key}\"]\n");
+        let d = semantic_diff(&old, &new);
+        let b = d.projects.iter().find(|p| p.id == "b").unwrap();
+        assert!(b.changed_steps.contains(&"pkg".to_string()), "{b:?}");
+
+        let mut old = base();
+        old.insert("projects/a/project.toml", "schema = 1\nid = \"a\"\nrepo = ");
+        let mut new = old.clone();
+        new.insert("projects/a/project.toml", "schema = 1\nid = \"a\"\nrepo = \"https://evil\"\nallowed_refs = [\"*\"]\ndefault_ref = \"main\"\n");
+        let d = semantic_diff(&old, &new);
+        let a = d.projects.iter().find(|p| p.id == "a").unwrap();
+        assert!(a.project_toml_changed && a.risks.contains(&Risk::Permission), "{a:?}");
     }
 }

@@ -69,8 +69,13 @@ impl MemTree {
         Ok(t)
     }
 
-    /// Writes all files under `dir` (used by export and recipe checkouts).
+    /// Writes all files under `dir` (used by export and recipe checkouts). Refuses a
+    /// tree whose names collide on a case-insensitive file system — a later file would
+    /// silently replace a reviewed one.
     pub fn write_to(&self, dir: &Path) -> std::io::Result<()> {
+        if let Some((a, b)) = case_collision(self.files.keys().map(|s| s.as_str())) {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{a} and {b} are the same path on Windows")));
+        }
         for (path, data) in &self.files {
             if !is_safe_rel(path) {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("unsafe path {path:?}")));
@@ -116,12 +121,65 @@ pub fn normalize(p: &str) -> String {
     p.replace('\\', "/").trim_start_matches("./").to_string()
 }
 
-/// A relative path with no `..`, no root, no drive and no empty components.
+/// A relative path with no `..`, no root, no drive and no empty components, that names
+/// the same file on Windows as it does in git: no trailing dot or space, no reserved
+/// device name, no characters Windows refuses.
 pub fn is_safe_rel(p: &str) -> bool {
     if p.is_empty() || p.starts_with('/') || p.starts_with('\\') || p.contains(':') {
         return false;
     }
-    p.split(['/', '\\']).all(|c| !c.is_empty() && c != ".." && c != ".")
+    p.split(['/', '\\']).all(|c| !c.is_empty() && c != ".." && c != "." && portable_component(c))
+}
+
+fn portable_component(c: &str) -> bool {
+    if c.ends_with('.') || c.ends_with(' ') {
+        return false;
+    }
+    if c.chars().any(|ch| (ch as u32) < 0x20 || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*')) {
+        return false;
+    }
+    let stem = c.split('.').next().unwrap_or(c).trim_end().to_ascii_uppercase();
+    let reserved = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        || ((stem.starts_with("COM") || stem.starts_with("LPT")) && stem.len() == 4 && stem.as_bytes()[3].is_ascii_digit());
+    !reserved
+}
+
+/// Two paths (or a file and a directory) that are the same on a case-insensitive file
+/// system, if any.
+pub fn case_collision<'a>(paths: impl Iterator<Item = &'a str>) -> Option<(String, String)> {
+    let mut seen: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut dirs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut files = vec![];
+    for p in paths {
+        let n = normalize(p);
+        let low = n.to_lowercase();
+        if let Some(prev) = seen.get(&low) {
+            if *prev != n {
+                return Some((prev.clone(), n));
+            }
+        }
+        seen.insert(low.clone(), n.clone());
+        let mut acc = String::new();
+        for comp in n.split('/').collect::<Vec<_>>().split_last().map(|(_, d)| d.to_vec()).unwrap_or_default() {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(comp);
+            match dirs.get(&acc.to_lowercase()) {
+                Some(prev) if *prev != acc => return Some((prev.clone(), acc.clone())),
+                _ => {
+                    dirs.insert(acc.to_lowercase(), acc.clone());
+                }
+            }
+        }
+        files.push((low, n));
+    }
+    for (low, n) in files {
+        if let Some(d) = dirs.get(&low) {
+            return Some((n, format!("{d}/")));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -136,6 +194,33 @@ mod tests {
         assert!(!is_safe_rel("C:/x"));
         assert!(!is_safe_rel("/x"));
         assert!(!is_safe_rel("a//b"));
+        assert!(!is_safe_rel("scripts/judge.py."));
+        assert!(!is_safe_rel("scripts/judge.py "));
+        assert!(!is_safe_rel("scripts/NUL.txt"));
+        assert!(!is_safe_rel("com1/x"));
+        assert!(!is_safe_rel("a?b"));
+        assert!(is_safe_rel("scripts/console.py"));
+        assert!(is_safe_rel("com10/x"));
+    }
+
+    #[test]
+    fn collisions() {
+        assert!(case_collision(["scripts/Run.ps1", "scripts/run.ps1"].into_iter()).is_some());
+        assert!(case_collision(["Scripts/a", "scripts/b"].into_iter()).is_some());
+        assert!(case_collision(["a", "A/b"].into_iter()).is_some());
+        assert!(case_collision(["scripts/a", "scripts/b", "x"].into_iter()).is_none());
+        let mut t = MemTree::new();
+        t.insert("s/Run.ps1", "a");
+        t.insert("s/run.ps1", "b");
+        let d = tempfile_dir();
+        assert!(t.write_to(&d).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    fn tempfile_dir() -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("cimon-tree-{}-{}", std::process::id(), line!()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
     }
 
     #[test]

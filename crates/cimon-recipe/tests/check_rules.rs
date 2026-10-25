@@ -130,3 +130,55 @@ fn ranges_rejected() {
     let r = check_tree(&t);
     assert!(r.errors.iter().any(|d| d.message.contains("exact version required")), "{:#?}", r.errors);
 }
+
+#[test]
+fn param_without_default_and_path_rules() {
+    let mut t = examples();
+    replace(&mut t, "projects/example-app/recipe.toml", "default = \"http://10.0.2.2:8800\"\n", "");
+    replace(&mut t, "projects/example-app/recipe.toml", "run = [\"./gradlew.bat\", \":app:assembleDebug\"", "run = [\"./gradlew.bat\", \"-Purl=${param.backend_url}\", \":app:assembleDebug\"");
+    replace(&mut t, "projects/example-app/recipe.toml", "cwd = \"backend\"\ntimeout_min = 30\ntags = [\"rust\"]", "cwd = \"${ws}/../x\"\ntimeout_min = 30\ntags = [\"rust\"]");
+    replace(&mut t, "projects/example-app/recipe.toml", "cwd = \"backend\"\ntimeout_min = 30\ntags = [\"rust\", \"unit\"]", "cwd = \"./backend\"\ntimeout_min = 30\ntags = [\"rust\", \"unit\"]");
+    replace(&mut t, "projects/example-app/recipe.toml", "\":shared:allTests\", \"--console=plain\"]", "\":shared:allTests\", \"--console=plain\", \"${vars.gradle_dir\"]");
+    let r = check_tree(&t);
+    let has = |s: &str| r.errors.iter().any(|d| d.message.contains(s));
+    assert!(has("needs a default"), "{:#?}", r.errors);
+    assert!(has("cwd \"${ws}/../x\""), "{:#?}", r.errors);
+    assert!(!has("cwd \"./backend\""), "{:#?}", r.errors);
+    assert!(has("unterminated"), "{:#?}", r.errors);
+}
+
+#[test]
+fn layering_holes_are_errors() {
+    let mut t = examples();
+    let recipe = t.read_str("projects/example-app/recipe.toml").unwrap().to_string();
+    t.insert(
+        "projects/example-app/recipe.toml",
+        recipe.replacen("[vars]", "include = [\"extra.toml\"]\n\n[vars]", 1) + "\n[[step]]\nid = \"tset-backend\"\ndisabled = true\n",
+    );
+    t.insert("projects/example-app/extra.toml", "schema = 2\n[[step]]\nid = \"extra\"\nkind = \"build\"\nrun = [\"y\"]\n");
+    let r = check_tree(&t);
+    let has = |s: &str| r.errors.iter().any(|d| d.message.contains(s));
+    assert!(has("no earlier layer defines"), "{:#?}", r.errors);
+    assert!(has("unknown schema 2"), "{:#?}", r.errors);
+}
+
+#[test]
+fn windows_aliases_and_new_project_on_broken_preset() {
+    let mut t = examples();
+    t.insert("scripts/judge.py.", "x");
+    let r = check_tree(&t);
+    assert!(r.errors.iter().any(|d| d.message.contains("not valid on Windows")), "{:#?}", r.errors);
+
+    // a preset error reached by a new project is a new error for that project
+    let mut base = examples();
+    base.insert("presets/broken.toml", "schema = 1\n[[step]]\nid = \"p\"\nkind = \"build\"\nrun = [\"x\", \"${vars.nope}\"]\n");
+    let pt = base.read_str("projects/example-app/project.toml").unwrap().to_string();
+    base.insert("projects/a/project.toml", pt.replace("example-app", "a"));
+    base.insert("projects/a/recipe.toml", "schema = 1\nextends = [\"broken\"]\n");
+    let mut new = base.clone();
+    new.insert("projects/c/project.toml", pt.replace("example-app", "c"));
+    new.insert("projects/c/recipe.toml", "schema = 1\nextends = [\"broken\"]\n");
+    let (before, after) = (check_tree(&base), check_tree(&new));
+    let fresh = after.new_errors_since(&before);
+    assert!(fresh.iter().any(|d| d.project.as_deref() == Some("c")), "{fresh:#?}");
+}

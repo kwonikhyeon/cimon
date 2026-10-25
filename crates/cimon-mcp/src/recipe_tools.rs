@@ -57,7 +57,7 @@ pub(crate) fn definitions() -> Vec<Tool> {
         tool(
             "recipe_sync",
             "main 을 그 브랜치에 합친다. 충돌이면 충돌 파일마다 base·main·브랜치 내용을 돌려준다 — 해결한 내용을 resolutions 로 다시 보내면 병합 커밋을 만든다. 새 head 이므로 시도 실행을 다시 돌려야 한다.",
-            json!({"type": "object", "properties": {"branch": {"type": "string"}, "head": {"type": "string"}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}, "required": ["branch", "head"], "additionalProperties": false}),
+            json!({"type": "object", "properties": {"branch": {"type": "string"}, "head": {"type": "string"}, "main": {"type": "string", "description": "충돌 응답의 main — resolutions 와 함께 보낸다"}, "resolutions": {"type": "object", "additionalProperties": {"type": "string"}}}, "required": ["branch", "head"], "additionalProperties": false}),
         ),
         tool(
             "recipe_promote",
@@ -276,19 +276,21 @@ fn sync(app: &Arc<App>, user: &AuthUser, args: Value) -> ToolResult {
         branch: String,
         head: String,
         #[serde(default)]
+        main: Option<String>,
+        #[serde(default)]
         resolutions: HashMap<String, String>,
     }
     let a: A = parse(args)?;
-    let out = app.recipes.sync(&app.store, &user.name, &a.branch, &a.head, &a.resolutions).map_err(Rejection::from)?;
+    let out = app.recipes.sync(&app.store, &user.name, &a.branch, &a.head, a.main.as_deref(), &a.resolutions).map_err(Rejection::from)?;
     let mut v = match out {
         cimon_recipestore::SyncOutcome::UpToDate { head } => json!({ "result": "up_to_date", "head": head, "summary": format!("{} 은 이미 main 을 포함한다", a.branch) }),
         cimon_recipestore::SyncOutcome::Merged { commit } => {
             audit(app, user, "recipe_sync", None, Some(&commit), Some(a.branch.clone()));
             json!({ "result": "merged", "head": commit, "summary": format!("main 을 {} 에 합쳤다 → {} — 새 head 이므로 시도 실행을 다시 돌려라", a.branch, proposals::short(&commit)) })
         }
-        cimon_recipestore::SyncOutcome::Conflicts { files } => {
+        cimon_recipestore::SyncOutcome::Conflicts { main, files } => {
             let n = files.len();
-            json!({ "result": "conflicts", "files": files, "summary": format!("충돌 {n}개 — 파일마다 base·main·branch 내용을 보고 해결한 내용을 resolutions 로 다시 보내라") })
+            json!({ "result": "conflicts", "main": main, "files": files, "summary": format!("충돌 {n}개 — 파일마다 base·main·branch 내용을 보고 해결한 내용을 resolutions 로, 이 main 과 함께 다시 보내라") })
         }
     };
     with_backup_warnings(app, &mut v);

@@ -19,6 +19,18 @@ pub fn refs(s: &str) -> Vec<String> {
     out
 }
 
+/// True when `s` has a `${` with no closing `}` — static checks reject it.
+pub fn unterminated(s: &str) -> bool {
+    let mut rest = s;
+    while let Some(start) = rest.find("${") {
+        match rest[start + 2..].find('}') {
+            Some(end) => rest = &rest[start + 2 + end + 1..],
+            None => return true,
+        }
+    }
+    false
+}
+
 /// Replaces every `${name}` using `lookup`. An unknown or unterminated reference is an
 /// error — a recipe never runs with a literal `${x}` left in a command.
 pub fn expand(s: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Result<String, String> {
@@ -111,5 +123,8 @@ mod tests {
         assert!(expand("${nope}", &map_lookup(&m)).is_err());
         assert!(expand("${job.id", &map_lookup(&m)).is_err());
         assert_eq!(refs("a ${x} b ${y.z}"), vec!["x", "y.z"]);
+        assert!(unterminated("${vars.x"));
+        assert!(unterminated("${a} ${b"));
+        assert!(!unterminated("${a} $b {c}"));
     }
 }

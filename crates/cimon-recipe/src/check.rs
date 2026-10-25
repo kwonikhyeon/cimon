@@ -4,7 +4,7 @@
 use crate::catalog::{Catalog, CHECKSUM_SOURCES, INSTALLERS};
 use crate::model::*;
 use crate::resolve::{line_of, parse_file, project_path, recipe_path, resolve_project, step_diag, Resolved};
-use crate::tree::{is_safe_rel, Tree};
+use crate::tree::{case_collision, is_safe_rel, Tree};
 use crate::vars::{self, Known};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,10 +39,14 @@ impl Diag {
         self.severity == Severity::Error
     }
     /// Identity across commits — lines move when a file is edited, so they are left out.
-    pub fn key(&self) -> (String, String) {
-        (self.file.clone(), self.message.clone())
+    /// The project is part of it: the same preset error reached by a new project is a
+    /// new error for that project.
+    pub fn key(&self) -> DiagKey {
+        (self.project.clone(), self.file.clone(), self.message.clone())
     }
 }
+
+pub type DiagKey = (Option<String>, String, String);
 
 impl std::fmt::Display for Diag {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -75,12 +79,12 @@ impl Report {
     /// Errors in `self` that `base` did not have (design §6.3: only newly introduced
     /// errors block a save).
     pub fn new_errors_since(&self, base: &Report) -> Vec<Diag> {
-        let old: BTreeSet<(String, String)> = base.errors.iter().map(|d| d.key()).collect();
+        let old: BTreeSet<DiagKey> = base.errors.iter().map(|d| d.key()).collect();
         self.errors.iter().filter(|d| !old.contains(&d.key())).cloned().collect()
     }
     /// Errors that existed in `base` and are still here (reported as warnings on save).
     pub fn preexisting_errors(&self, base: &Report) -> Vec<Diag> {
-        let old: BTreeSet<(String, String)> = base.errors.iter().map(|d| d.key()).collect();
+        let old: BTreeSet<DiagKey> = base.errors.iter().map(|d| d.key()).collect();
         self.errors.iter().filter(|d| old.contains(&d.key())).cloned().collect()
     }
     pub fn errors_for_project(&self, id: &str) -> Vec<&Diag> {
@@ -113,6 +117,15 @@ pub fn check_tree(tree: &dyn Tree) -> Report {
             }
         },
     };
+    // names a Windows checkout would merge or refuse
+    for f in tree.files() {
+        if !is_safe_rel(f) {
+            report.push(Diag::error(f, None, "path is not valid on Windows (trailing dot or space, device name, or a character Windows refuses)"));
+        }
+    }
+    if let Some((a, b)) = case_collision(tree.files().into_iter()) {
+        report.push(Diag::error(&a, None, format!("{a} and {b} are the same path on Windows — a checkout would keep only one")));
+    }
     let projects = tree.project_ids();
     if let Some(c) = &catalog {
         check_catalog(tree, c, &projects, &mut report);
@@ -147,9 +160,12 @@ pub fn check_tree(tree: &dyn Tree) -> Report {
             }
             Ok(r) => {
                 let before = report.errors.len();
+                let before_w = report.warnings.len();
                 check_project(tree, catalog.as_ref(), &projects, &r, &mut report);
-                for d in report.errors.iter_mut().chain(report.warnings.iter_mut()) {
-                    if d.project.is_none() && d.file.starts_with(&format!("projects/{id}/")) {
+                // everything found while checking this project belongs to it — also
+                // what comes from a preset it extends
+                for d in report.errors[before..].iter_mut().chain(report.warnings[before_w..].iter_mut()) {
+                    if d.project.is_none() {
                         d.project = Some(id.clone());
                     }
                 }
@@ -370,6 +386,25 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
             cx.err_recipe(k, format!("[account_env] {k} = {v:?} needs the same name and scope in [isolate] — direct steps and scheduled tasks must see the same home"));
         }
     }
+    let no_artifacts_env = BTreeSet::new();
+    for (k, v) in r.env.iter().chain(r.clean_env.iter()) {
+        if !valid_env_name(k) {
+            cx.err_recipe(k, format!("env {k:?} is not a valid variable name"));
+        }
+        if vars::unterminated(v) {
+            cx.err_recipe(k, format!("env {k}: unterminated ${{…}} in {v:?}"));
+        }
+        for name in vars::refs(v) {
+            if name.starts_with("param.") || name.starts_with("artifact.") || name == "step.out" {
+                cx.err_recipe(k, format!("env {k}: ${{{name}}} is per step — set it in the step's env"));
+                continue;
+            }
+            if let Err(e) = vars::validate_ref(&name, &known(r, &no_artifacts_env, false)) {
+                cx.err_recipe(k, format!("env {k}: {e}"));
+            }
+        }
+        check_recipes_path(&mut cx, v, k);
+    }
     for k in ["CARGO_TARGET_DIR", "RUSTFLAGS"] {
         if r.env.contains_key(k) {
             cx.warn_recipe(k, format!("[env] sets {k} — cimon does not set it by default; make sure the project expects it"));
@@ -470,8 +505,20 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
             }
         }
         if let Some(cwd) = &d.cwd {
-            let expanded = vars::expand(cwd, &|n| n.strip_prefix("vars.").and_then(|k| r.vars.get(k).cloned())).unwrap_or_else(|_| cwd.clone());
-            if expanded != "${ws}" && !expanded.starts_with("${ws}") && !is_safe_rel(&expanded) && expanded != "." {
+            let expanded = crate::refs::expand_vars(cwd, &r.vars).replace('\\', "/");
+            let rel = match expanded.strip_prefix("${ws}") {
+                Some("") => Some(String::new()),
+                Some(rest) => rest.strip_prefix('/').map(str::to_string),
+                None => Some(expanded.clone()),
+            };
+            let rel = rel.map(|x| crate::tree::normalize(&x).trim_end_matches('/').to_string());
+            let ok = match &rel {
+                Some(x) if x.is_empty() || x == "." => true,
+                Some(x) if x.contains("${") => !x.split('/').any(|c| c == ".."),
+                Some(x) => is_safe_rel(x),
+                None => false,
+            };
+            if !ok {
                 cx.err_step(s, format!("cwd {cwd:?} must be a relative path inside the work tree"));
             }
         }
@@ -672,6 +719,9 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
             cx.warn_recipe(&needle, format!("fixture {name}: up runs an artifact built by this branch but on_up_failure is not set — a broken build would look like an infra problem"));
         }
         for t in texts {
+            if vars::unterminated(&t) {
+                cx.err_recipe(&needle, format!("fixture {name}: unterminated ${{…}} in {t:?}"));
+            }
             for v in vars::refs(&t) {
                 if let Some(a) = v.strip_prefix("artifact.") {
                     if !allowed.contains(a) {
@@ -728,6 +778,9 @@ pub(crate) fn known<'a>(r: &'a Resolved, artifacts: &'a BTreeSet<String>, allow_
 }
 
 fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_artifacts: &BTreeSet<String>, _producers: &BTreeMap<String, String>) {
+    if vars::unterminated(text) {
+        cx.err_step(s, format!("unterminated ${{…}} in {text:?}"));
+    }
     for v in vars::refs(text) {
         if let Some(a) = v.strip_prefix("artifact.") {
             if !fixture_artifacts.contains(a) {
@@ -736,41 +789,51 @@ fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_ar
             }
         }
         let k = known(cx.r, fixture_artifacts, false);
-        if let Err(e) = vars::validate_ref(&v, &k) {
-            cx.err_step(s, e);
+        match vars::validate_ref(&v, &k) {
+            Err(e) => cx.err_step(s, e),
+            Ok(Some(p)) => {
+                // a run without the parameter would have nothing to put there
+                if cx.r.params.get(&p).is_some_and(|d| d.default.is_none()) {
+                    cx.err_step(s, format!("${{param.{p}}} needs a default in [params.{p}] — without one a run that does not pass it has no value"));
+                }
+            }
+            Ok(None) => {}
         }
     }
     let origin = s.origin.clone();
     let needle = format!("\"{}\"", s.id());
-    if let Some(rest) = find_recipes_path(text) {
-        if !path_exists(cx.tree, &rest) {
-            let line = cx.tree.read_str(&origin).and_then(|t| line_of(t, &needle));
-            cx.report.push(Diag::error(&origin, line, format!("step {:?}: ${{recipes}}/{rest} does not exist in this recipe commit", s.id())));
-        }
+    for msg in recipes_path_problems(cx.tree, &crate::refs::expand_vars(text, &cx.r.vars)) {
+        let line = cx.tree.read_str(&origin).and_then(|t| line_of(t, &needle));
+        cx.report.push(Diag::error(&origin, line, format!("step {:?}: {msg}", s.id())));
     }
 }
 
 fn check_recipes_path(cx: &mut Ctx<'_>, text: &str, needle: &str) {
-    if let Some(rest) = find_recipes_path(text) {
-        if !path_exists(cx.tree, &rest) {
-            cx.err_recipe(needle, format!("${{recipes}}/{rest} does not exist in this recipe commit"));
+    for msg in recipes_path_problems(cx.tree, &crate::refs::expand_vars(text, &cx.r.vars)) {
+        cx.err_recipe(needle, msg);
+    }
+}
+
+/// Every `${recipes}` reference in `text` that leaves the repository or names nothing.
+fn recipes_path_problems(tree: &dyn Tree, text: &str) -> Vec<String> {
+    let mut out = vec![];
+    for r in crate::refs::recipe_refs(text) {
+        if r.path.is_empty() {
+            continue;
+        }
+        if !is_safe_rel(&r.path) {
+            out.push(format!("${{recipes}}/{} must stay inside the recipe repository", r.path));
+        } else if !path_exists(tree, &r.path) {
+            out.push(format!("${{recipes}}/{}{} does not exist in this recipe commit", r.path, if r.dynamic { "/…" } else { "" }));
         }
     }
+    out
 }
 
 /// A file, or a directory holding at least one file.
 pub fn path_exists(tree: &dyn Tree, p: &str) -> bool {
     let p = p.trim_end_matches('/');
     tree.exists(p) || tree.files().iter().any(|f| f.starts_with(&format!("{p}/")))
-}
-
-/// The repository path after `${recipes}/` in `text`, if any.
-pub fn find_recipes_path(text: &str) -> Option<String> {
-    let i = text.find("${recipes}/")?;
-    let rest = &text[i + "${recipes}/".len()..];
-    let end = rest.find(|c: char| c.is_whitespace() || c == '"' || c == '\'').unwrap_or(rest.len());
-    let p = rest[..end].replace('\\', "/");
-    (!p.is_empty() && !p.contains("${")).then_some(p)
 }
 
 /// Every string of a step that undergoes variable expansion.

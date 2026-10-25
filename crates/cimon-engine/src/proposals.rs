@@ -83,6 +83,12 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
     }
 
     let diff = semantic_diff(&*main_tree, &*head_tree);
+    // something to promote at all (review-ui §13: "변경 없음" cannot be promoted)
+    if diff.is_empty() {
+        list.push(Condition { name: "has_changes", state: "fail", detail: format!("head {} 가 main 과 같다 — 반영할 변경 없음", short(head)), overridable: false });
+    }
+    // steps a trial cannot run here are listed with the untestable changes
+    let mut untestable = vec![];
     // trial runs (design §6.5)
     if app.config.review.require_trial == cimon_core::config::RequireTrial::None {
         list.push(Condition { name: "trial", state: "na", detail: "[review].require_trial = none".into(), overridable: true });
@@ -94,15 +100,24 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
                 missing.push(format!("{}: 레시피를 해석하지 못했다 — {}", pd.id, pd.error.clone().unwrap_or_default()));
                 continue;
             }
+            let Ok(r) = cimon_recipe::resolve_project(&*head_tree, &pd.id) else {
+                missing.push(format!("{}: head 에서 레시피를 해석하지 못했다", pd.id));
+                continue;
+            };
             let mut required: Vec<String> = pd.changed_steps.clone();
             if pd.requires_default_run {
-                if let Ok(r) = cimon_recipe::resolve_project(&*head_tree, &pd.id) {
-                    if let Ok(plan) = select(&r, Tool::Run, &SelectRequest { capabilities: app.config.runner.capabilities.clone(), ..Default::default() }) {
+                match select(&r, Tool::Run, &SelectRequest { capabilities: app.config.runner.capabilities.clone(), ..Default::default() }) {
+                    Ok(plan) => {
                         for s in plan.step_ids() {
                             if !required.contains(&s) {
                                 required.push(s);
                             }
                         }
+                    }
+                    // a project-wide change with nothing to run by default is not "tried"
+                    Err(e) => {
+                        missing.push(format!("{}: 프로젝트 전체 설정이 바뀌었는데 기본 run 을 고르지 못했다 — {}", pd.id, e.message));
+                        continue;
                     }
                 }
             }
@@ -110,40 +125,58 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
                 ok.push(format!("{}: 돌릴 바뀐 단계 없음", pd.id));
                 continue;
             }
-            // excluded steps cannot be tried on this runner; they do not block
-            let r = cimon_recipe::resolve_project(&*head_tree, &pd.id).ok();
             let caps = &app.config.runner.capabilities;
+            let step_of = |s: &String| r.step(s);
+            let excluded: Vec<&String> = required.iter().filter(|s| step_of(s).is_some_and(|st| !st.def.needs.iter().all(|n| caps.contains(n)))).collect();
+            if !excluded.is_empty() {
+                untestable.push(format!(
+                    "{}: 바뀐 단계 {} 는 이 러너({})에서 돌 수 없다(needs) — 시도 실행으로 확인되지 않는다",
+                    pd.id,
+                    excluded.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                    app.config.runner.name
+                ));
+            }
+            let setup_changed = required.iter().any(|s| step_of(s).is_some_and(|st| st.kind == cimon_recipe::Kind::Setup));
             let runnable: Vec<String> = required
                 .iter()
-                .filter(|s| r.as_ref().and_then(|r| r.step(s)).is_none_or(|st| st.def.needs.iter().all(|n| caps.contains(n))))
-                .filter(|s| r.as_ref().and_then(|r| r.step(s)).is_none_or(|st| st.kind != cimon_recipe::Kind::Setup))
+                .filter(|s| !excluded.contains(s))
+                .filter(|s| step_of(s).is_none_or(|st| st.kind != cimon_recipe::Kind::Setup))
                 .cloned()
                 .collect();
-            if runnable.is_empty() {
-                ok.push(format!("{}: 바뀐 단계가 이 러너에서 돌 수 없다(제외) — 시도 실행 불가", pd.id));
+            if runnable.is_empty() && !setup_changed {
+                // only needs-excluded steps changed — reported as untestable above
                 continue;
             }
-            let jobs = app.store.trial_jobs(&pd.id, &p.branch, head).unwrap_or_default();
-            let latest = jobs.iter().find(|j| {
+            // setup runs in every job, so with only setup changed any trial at head covers it
+            let covers = |j: &&cimon_store::JobRow| {
                 let plan: Option<crate::jobs::JobPlan> = j.plan_json.as_deref().and_then(|s| serde_json::from_str(s).ok());
                 plan.is_some_and(|pl| runnable.iter().all(|s| pl.plan.runs(s)))
-            });
-            match latest {
+            };
+            let jobs = app.store.trial_jobs(&pd.id, &p.branch, head).unwrap_or_default();
+            let covering: Vec<&cimon_store::JobRow> = jobs.iter().filter(covers).collect();
+            let what = if runnable.is_empty() { "setup".to_string() } else { runnable.join(", ") };
+            match covering.first() {
                 None => missing.push(format!(
-                    "{}: head {} 로 돈 작업 중 바뀐 단계 {} 를 모두 포함한 것이 없다 — run(project=\"{}\", recipe_ref=\"{}\", steps=[{}])",
+                    "{}: head {} 로 돈 작업 중 바뀐 단계 {what} 를 모두 포함한 것이 없다 — run(project=\"{}\", recipe_ref=\"{}\"{})",
                     pd.id,
                     short(head),
-                    runnable.join(", "),
                     pd.id,
                     p.branch,
-                    runnable.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")
+                    if runnable.is_empty() { String::new() } else { format!(", steps=[{}]", runnable.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ")) }
                 )),
-                Some(j) => {
-                    let v = j.verdict.clone().unwrap_or_default();
-                    if v == "pass" || !app.config.review.trial_must_pass {
-                        ok.push(format!("{}: {} {v}", pd.id, job_label(j.id)));
-                    } else {
-                        missing.push(format!("{}: 가장 최근 시도 {} 가 {v}({}) — 재시도로 덮을 수 없다, 고치고 새 head 로", pd.id, job_label(j.id), j.failure_class.clone().unwrap_or_default()));
+                Some(latest) => {
+                    // any failure at this head counts — a passing retry does not cover it
+                    let failed = covering.iter().find(|j| j.verdict.as_deref() != Some("pass"));
+                    match failed {
+                        Some(f) if app.config.review.trial_must_pass => missing.push(format!(
+                            "{}: head {} 의 시도 {} 가 {}({}) — 재시도로 덮을 수 없다, 고치고 새 head 로",
+                            pd.id,
+                            short(head),
+                            job_label(f.id),
+                            f.verdict.clone().unwrap_or_default(),
+                            f.failure_class.clone().unwrap_or_default()
+                        )),
+                        _ => ok.push(format!("{}: {} {}", pd.id, job_label(latest.id), latest.verdict.clone().unwrap_or_default())),
                     }
                 }
             }
@@ -158,7 +191,9 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
     }
 
     // changes a trial cannot exercise (design §6.5)
-    let mut untestable = vec![];
+    if let Some(e) = &diff.error {
+        untestable.push(format!("의미 비교 불가: {e}"));
+    }
     for pd in &diff.projects {
         if pd.project_toml_changed {
             untestable.push(format!("{}: project.toml(저장소·허용 ref·형제) — 시도 실행은 main 의 것을 쓴다", pd.id));

@@ -27,7 +27,7 @@ fn setup() -> (tempfile::TempDir, RecipeStore, Store, String) {
 }
 
 fn change(path: &str, content: &str) -> Change {
-    Change { path: path.into(), content: Some(content.into()), delete: false }
+    Change { path: path.into(), content: Some(content.into()), delete: false, bytes: None }
 }
 
 #[test]
@@ -104,9 +104,12 @@ fn promote_fast_forward_only_with_head() {
     let e = rs.promote(&store, "admin", b.proposal_id, &b.commit, None, |_, _| Ok(())).unwrap_err();
     assert_eq!(e.code, "not_fast_forward");
     // sync without conflicts, then promote
-    let out = rs.sync(&store, "u", "recipe/b", &b.commit, &HashMap::new()).unwrap();
+    let out = rs.sync(&store, "u", "recipe/b", &b.commit, None, &HashMap::new()).unwrap();
     let SyncOutcome::Merged { commit } = out else { panic!("{out:?}") };
+    // a merge commit cannot be reverted (it would undo what came in from main)
     rs.promote(&store, "admin", b.proposal_id, &commit, None, |_, _| Ok(())).unwrap();
+    let e = rs.revert("admin", &commit, "merge 되돌리기 시도").unwrap_err();
+    assert!(e.message.contains("merge"), "{e}");
     let t = rs.tree(&rs.main_commit().unwrap()).unwrap();
     assert!(t.read("a.txt").is_some() && t.read("b.txt").is_some());
     // promoting again is refused, and the branch name can be reused
@@ -122,15 +125,19 @@ fn sync_conflicts_need_resolutions() {
     let a = rs.edit(&store, "u", "recipe/a", &main, "a", &[change("f.txt", "A\n")]).unwrap();
     let b = rs.edit(&store, "u", "recipe/b", &main, "b", &[change("f.txt", "B\n")]).unwrap();
     rs.promote(&store, "admin", a.proposal_id, &a.commit, None, |_, _| Ok(())).unwrap();
-    let out = rs.sync(&store, "u", "recipe/b", &b.commit, &HashMap::new()).unwrap();
-    let SyncOutcome::Conflicts { files } = out else { panic!("{out:?}") };
+    let out = rs.sync(&store, "u", "recipe/b", &b.commit, None, &HashMap::new()).unwrap();
+    let SyncOutcome::Conflicts { main: at, files } = out else { panic!("{out:?}") };
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].main.as_deref(), Some("A\n"));
     assert_eq!(files[0].branch.as_deref(), Some("B\n"));
     assert_eq!(files[0].base, None);
     let mut res = HashMap::new();
     res.insert("f.txt".to_string(), "AB\n".to_string());
-    let out = rs.sync(&store, "u", "recipe/b", &b.commit, &res).unwrap();
+    // resolutions without the main they were written against are refused
+    assert_eq!(rs.sync(&store, "u", "recipe/b", &b.commit, None, &res).unwrap_err().code, "invalid_param");
+    // and a symbolic head is not a pin
+    assert_eq!(rs.sync(&store, "u", "recipe/b", "recipe/b", Some(&at), &res).unwrap_err().code, "invalid_param");
+    let out = rs.sync(&store, "u", "recipe/b", &b.commit, Some(&at), &res).unwrap();
     let SyncOutcome::Merged { commit } = out else { panic!("{out:?}") };
     assert_eq!(rs.tree(&commit).unwrap().read_str("f.txt"), Some("AB\n"));
 }
@@ -202,4 +209,53 @@ fn resolve_and_show() {
     let co = rs.checkout(&main, &dir.path().join("co").join(&main)).unwrap();
     assert!(co.join("projects/demo/recipe.toml").exists());
     let _ = store;
+}
+
+#[test]
+fn windows_aliases_and_branch_case_are_refused() {
+    let (_dir, rs, store, main) = setup();
+    // a trailing dot names the same file as the reviewed one on NTFS
+    let e = rs.edit(&store, "u", "recipe/alias", &main, "x", &[change("scripts/judge.py.", "evil")]).unwrap_err();
+    assert_eq!(e.code, "recipe_invalid");
+    let e = rs.edit(&store, "u", "recipe/alias", &main, "x", &[change("scripts/NUL", "x")]).unwrap_err();
+    assert_eq!(e.code, "recipe_invalid");
+    rs.edit(&store, "u", "recipe/alias", &main, "x", &[change("scripts/Run.ps1", "a")]).unwrap();
+    let head = rs.branch_head("recipe/alias").unwrap();
+    let e = rs.edit(&store, "u", "recipe/alias", &head, "x", &[change("scripts/run.ps1", "b")]).unwrap_err();
+    assert!(e.message.contains("same path on Windows"), "{e}");
+    // branch names are lower-case only, pins are commit ids only
+    assert_eq!(rs.edit(&store, "u", "recipe/Alias", &main, "x", &[change("y", "1")]).unwrap_err().code, "trial_ref_not_allowed");
+    assert_eq!(rs.edit(&store, "u", "recipe/other", "main", "x", &[change("y", "1")]).unwrap_err().code, "invalid_param");
+}
+
+#[test]
+fn promote_intent_survives_and_revert_edges() {
+    let (dir, rs, store, main) = setup();
+    let a = rs.edit(&store, "u", "recipe/a", &main, "a", &[change("a.txt", "1")]).unwrap();
+    // intent recorded, then (as if the process died) main moved without mark_promoted
+    store.set_promote_intent(a.proposal_id, &a.commit, "admin-x", Some("급한 반영 — 시도 생략")).unwrap();
+    rs.git.update_ref(&rs.main_ref(), &a.commit, Some(&main), "test").unwrap();
+    rs.reconcile(&store).unwrap();
+    let p = store.proposal(a.proposal_id).unwrap().unwrap();
+    assert_eq!(p.status, "promoted");
+    assert_eq!(p.promoted_by.as_deref(), Some("admin-x"));
+    assert_eq!(p.override_reason.as_deref(), Some("급한 반영 — 시도 생략"));
+    // reverting twice: the second would be an empty commit
+    rs.revert("admin", &a.commit, "a.txt 를 되돌린다").unwrap();
+    let e = rs.revert("admin", &a.commit, "a.txt 를 다시 되돌린다").unwrap_err();
+    assert!(e.message.contains("already gone"), "{e}");
+    // a failed restore leaves nothing behind, so a retry is possible
+    let target = dir.path().join("restored");
+    assert!(RecipeStore::restore(&dir.path().join("missing.bundle"), &target).is_err());
+    assert!(!target.join("HEAD").exists());
+}
+
+#[test]
+fn import_branch_keeps_bytes() {
+    let (_dir, rs, store, _main) = setup();
+    let mut t = (*rs.tree(&rs.main_commit().unwrap()).unwrap()).clone();
+    let utf16: Vec<u8> = vec![0xFF, 0xFE, b'a', 0, b'b', 0];
+    t.files.insert("scripts/x.ps1".into(), utf16.clone());
+    let r = rs.import_branch(&store, "u", "recipe/bytes", &t, "utf-16 script").unwrap();
+    assert_eq!(rs.tree(&r.commit).unwrap().read("scripts/x.ps1"), Some(utf16.as_slice()));
 }

@@ -133,6 +133,9 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
         let p = format!("presets/{name}.toml");
         match parse_file::<RecipeFile>(tree, &p) {
             Ok(preset) => {
+                if preset.schema != 1 {
+                    diags.push(Diag::error(&p, Some(1), format!("unknown schema {}", preset.schema)));
+                }
                 for key in preset_violations(&preset) {
                     diags.push(Diag::error(&p, None, format!("a preset may not use {key}")));
                 }
@@ -166,6 +169,9 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
         files: vec![],
     };
 
+    // ids a layer disabled: an include may not bring them back (spec §10 — replacing
+    // only happens through extends)
+    let mut disabled_ids: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for (origin, layer) in &layers {
         out.vars.extend(layer.vars.clone());
         out.toolchains.extend(layer.toolchains.clone());
@@ -186,6 +192,9 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
             if !seen_here.insert(s.id.clone()) {
                 diags.push(step_diag(tree, origin, &s.id, format!("step {:?} is defined twice in this file", s.id)));
             }
+            if s.disabled {
+                disabled_ids.insert(s.id.clone());
+            }
             replace_step(&mut out.steps, s, origin, tree, &mut diags);
         }
         for (name, f) in &layer.fixture {
@@ -202,6 +211,9 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
         }
         match parse_file::<RecipeFile>(tree, &p) {
             Ok(frag) => {
+                if frag.schema != 1 {
+                    diags.push(Diag::error(&p, Some(1), format!("unknown schema {}", frag.schema)));
+                }
                 for key in fragment_violations(&frag) {
                     diags.push(Diag::error(&p, None, format!("an include may only hold step, fixture and params — found {key}")));
                 }
@@ -211,7 +223,12 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
                         diags.push(step_diag(tree, &p, &s.id, format!("step {:?} already exists — replacing only happens through extends", s.id)));
                         continue;
                     }
+                    if disabled_ids.contains(&s.id) {
+                        diags.push(step_diag(tree, &p, &s.id, format!("step {:?} is disabled in a layer above — an include cannot bring it back", s.id)));
+                        continue;
+                    }
                     if s.disabled {
+                        diags.push(step_diag(tree, &p, &s.id, format!("step {:?}: an include cannot disable steps — do it in recipe.toml", s.id)));
                         continue;
                     }
                     match s.kind {
@@ -252,8 +269,12 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
 fn replace_step(steps: &mut Vec<Step>, s: &StepDef, origin: &str, tree: &dyn Tree, diags: &mut Vec<Diag>) {
     let pos = steps.iter().position(|x| x.def.id == s.id);
     if s.disabled {
-        if let Some(i) = pos {
-            steps.remove(i);
+        match pos {
+            Some(i) => {
+                steps.remove(i);
+            }
+            // a typo would leave the preset step running
+            None => diags.push(step_diag(tree, origin, &s.id, format!("disabled = true names step {:?}, which no earlier layer defines", s.id))),
         }
         return;
     }

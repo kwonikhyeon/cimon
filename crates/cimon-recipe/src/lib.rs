@@ -7,6 +7,7 @@ pub mod catalog;
 pub mod check;
 pub mod diff;
 pub mod model;
+pub mod refs;
 pub mod resolve;
 pub mod select;
 pub mod tree;

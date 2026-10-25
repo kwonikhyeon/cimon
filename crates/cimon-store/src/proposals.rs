@@ -124,11 +124,38 @@ impl Store {
         Ok(())
     }
 
+    /// Records who is promoting `commit` and why, before `main` moves — so a crash
+    /// between the ref update and `mark_promoted` keeps the promoter and the override
+    /// reason (reconcile reuses them).
+    pub fn set_promote_intent(&self, id: i64, commit: &str, by: &str, override_reason: Option<&str>) -> Result<()> {
+        let n = self.conn().execute(
+            "UPDATE proposals SET promoted_commit = ?2, promoted_by = ?3, override_reason = ?4 WHERE id = ?1 AND status = 'open'",
+            params![id, commit, by, override_reason],
+        )?;
+        if n == 0 {
+            return Err(StoreError::Conflict(format!("proposal {id} is not open")));
+        }
+        Ok(())
+    }
+
+    pub fn clear_promote_intent(&self, id: i64) -> Result<()> {
+        self.conn().execute(
+            "UPDATE proposals SET promoted_commit = NULL, promoted_by = NULL, override_reason = NULL WHERE id = ?1 AND status = 'open'",
+            [id],
+        )?;
+        Ok(())
+    }
+
+    /// Marks a proposal promoted. When an intent for the same commit was recorded, its
+    /// promoter and reason win over `by`/`override_reason` (reconcile passes its own).
     pub fn mark_promoted(&self, id: i64, commit: &str, by: &str, override_reason: Option<&str>) -> Result<()> {
         let t = now();
         self.conn().execute(
-            "UPDATE proposals SET status = 'promoted', promoted_commit = ?2, promoted_by = ?3, promoted_at = ?4,
-               override_reason = ?5, updated_at = ?4 WHERE id = ?1 AND status = 'open'",
+            "UPDATE proposals SET status = 'promoted',
+               promoted_by = CASE WHEN promoted_commit = ?2 AND promoted_by IS NOT NULL THEN promoted_by ELSE ?3 END,
+               override_reason = CASE WHEN promoted_commit = ?2 AND promoted_by IS NOT NULL THEN override_reason ELSE ?5 END,
+               promoted_commit = ?2, promoted_at = ?4, updated_at = ?4
+             WHERE id = ?1 AND status = 'open'",
             params![id, commit, by, t, override_reason],
         )?;
         Ok(())

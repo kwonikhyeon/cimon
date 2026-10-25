@@ -148,22 +148,10 @@ pub fn resolve_for(app: &App, project: &str, recipe_ref: Option<&str>) -> Result
             project_key = format!("{project}@{}", &cimon_core::sha256_hex(r.project.repo.as_bytes())[..8]);
         }
     }
-    let mut files = r.files.clone();
-    files.extend(scripts_of(&r));
-    let sha = tree.digest(&files);
+    // every file that decides what the job runs — two jobs with the same sha must run
+    // the same thing (merging relies on it)
+    let sha = tree.digest(&cimon_recipe::refs::recipe_files(&*tree, &r));
     Ok((r, commit, sha, trial, project_key))
-}
-
-fn scripts_of(r: &Resolved) -> Vec<String> {
-    let mut v = vec![];
-    for s in &r.steps {
-        for t in cimon_recipe::check::step_strings(&s.def) {
-            if let Some(p) = cimon_recipe::check::find_recipes_path(&t) {
-                v.push(p);
-            }
-        }
-    }
-    v
 }
 
 /// Validation shared by `build`/`test`/`run`/`plan` — everything that can be refused

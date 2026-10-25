@@ -172,7 +172,7 @@ async fn not_auto_approved_needs_admin_then_trial_catalog_rule() {
     let edit = h
         .app
         .recipes
-        .edit(&h.app.store, "member-b", "recipe/cat", &main, "catalog url", &[cimon_recipestore::Change { path: "toolchains.toml".into(), content: Some(new_cat), delete: false }])
+        .edit(&h.app.store, "member-b", "recipe/cat", &main, "catalog url", &[cimon_recipestore::Change { path: "toolchains.toml".into(), content: Some(new_cat), delete: false, bytes: None }])
         .unwrap();
     let v = run_build(&c, json!({"project": "m3prov", "recipe_ref": "recipe/cat"})).await;
     assert_eq!(v["reason_code"], "toolchain_not_provisioned", "{v:#}");

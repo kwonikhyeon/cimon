@@ -182,7 +182,11 @@ async fn not_fast_forward_sync_override_untestable_close_revert() {
     let (v, err) = tool(&m, "recipe_revert", json!({"commit": target, "reason": "member cannot"})).await;
     assert!(err);
     assert_eq!(v["error"], "forbidden");
+    // main's tip is the sync merge: reverting it would undo what came in from main
     let (v, err) = tool(&a, "recipe_revert", json!({"commit": target, "reason": "test-two 출력이 로그 파서를 깨뜨렸다"})).await;
+    assert!(err);
+    assert!(v["message"].as_str().unwrap().contains("merge"), "{v}");
+    let (v, err) = tool(&a, "recipe_revert", json!({"commit": p2["commit"], "reason": "test-two 출력이 로그 파서를 깨뜨렸다"})).await;
     assert!(!err, "{v}");
     let h1 = h.app.recipes.history("main", None, 1).unwrap();
     assert!(h1[0].subject.starts_with("되돌리기"));

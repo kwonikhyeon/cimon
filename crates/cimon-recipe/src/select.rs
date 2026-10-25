@@ -260,7 +260,13 @@ pub fn select(r: &Resolved, tool: Tool, req: &SelectRequest) -> Result<Plan, Rej
     artifacts.retain(|a| producers.get(a).is_some_and(|p| remaining.contains(p)));
 
     // toolchains
-    let used_optional: BTreeSet<&str> = steps.iter().flat_map(|ps| r.step(&ps.id).unwrap().def.uses.iter().map(|s| s.as_str())).collect();
+    // setup steps always run, so the optional toolchains they use are needed too
+    let used_optional: BTreeSet<&str> = steps
+        .iter()
+        .map(|ps| ps.id.as_str())
+        .chain(setup.iter().map(|s| s.as_str()))
+        .flat_map(|id| r.step(id).unwrap().def.uses.iter().map(|s| s.as_str()))
+        .collect();
     let toolchains: Vec<String> =
         r.toolchains.iter().filter(|(k, t)| !t.optional || used_optional.contains(k.as_str())).map(|(k, _)| k.clone()).collect();
     let fixtures: Vec<String> = {
