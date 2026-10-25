@@ -1,0 +1,79 @@
+# 형식 예시 — 가상의 프로젝트(Rust 백엔드 + Gradle Android 앱). docs/recipe-spec.md.
+schema = 1
+description = "Rust 백엔드 + Android 앱"
+
+[vars]
+gradle_dir = "app"
+
+[toolchains]
+msvc        = { min = "17.11", components = ["Microsoft.VisualStudio.Component.VC.Tools.x86.x64"] }
+rust        = { version_file = "backend/rust-toolchain.toml" }
+jdk         = { version = "17.0.19+10" }
+android_sdk = { platforms = ["android-35"], build_tools = ["35.0.0"] }
+
+[workspace]
+keep = ["backend/target", "app/.gradle", "app/**/build"]
+clean_env = { GRADLE_OPTS = "-Dorg.gradle.caching=false" }
+
+[env]
+GRADLE_OPTS = "-Dorg.gradle.daemon=false"
+
+[params.backend_url]
+type = "string"
+pattern = '^https?://[A-Za-z0-9.-]+(:[0-9]+)?$'
+default = "http://10.0.2.2:8800"
+env = "APP_BACKEND_URL"
+applies_to = ["build-apk"]
+description = "debug APK 에 컴파일되는 백엔드 주소"
+
+[[step]]
+id = "build-backend"
+kind = "build"
+run = ["cargo", "build", "--workspace", "--locked"]
+cwd = "backend"
+timeout_min = 30
+tags = ["rust"]
+
+[[step]]
+id = "test-backend"
+kind = "test"
+run = ["cargo", "test", "--workspace", "--locked"]
+cwd = "backend"
+timeout_min = 30
+tags = ["rust", "unit"]
+judge = { type = "cargo-test", min_tests = 1 }
+
+[[step]]
+id = "build-apk"
+kind = "build"
+description = "Android debug APK"
+run = ["./gradlew.bat", ":app:assembleDebug", "--console=plain"]
+cwd = "${vars.gradle_dir}"
+timeout_min = 20
+tags = ["android"]
+
+  [[step.artifact]]
+  name = "app-debug.apk"
+  glob = "app/app/build/outputs/apk/debug/app-debug.apk"
+  expect = 1
+  default = false
+  inspect = ["apk-signer"]
+
+[[step]]
+id = "test-shared"
+kind = "test"
+run = ["./gradlew.bat", ":shared:allTests", "--console=plain"]
+cwd = "${vars.gradle_dir}"
+timeout_min = 20
+tags = ["kotlin", "unit"]
+judge = { type = "junit", reports = "app/shared/build/test-results/**/*.xml", min_tests = 1 }
+
+[[step]]
+id = "ui-test"
+kind = "test"
+description = "화면에 그리는 UI 테스트 — 화면 없는 러너에서는 제외되고 결과에 적힌다"
+run = ["./gradlew.bat", ":app:connectedUiTest", "--console=plain"]
+cwd = "${vars.gradle_dir}"
+timeout_min = 20
+tags = ["ui"]
+needs = ["display"]

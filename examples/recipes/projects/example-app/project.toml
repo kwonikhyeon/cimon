@@ -1,0 +1,7 @@
+schema = 1
+id = "example-app"
+display_name = "Example App"
+repo = "https://github.com/example-org/example-app.git"
+allowed_refs = ["main", "feature/**"]
+default_ref = "main"
+recipe_source = "central"
