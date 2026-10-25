@@ -19,7 +19,18 @@ pub type Result<T> = std::result::Result<T, WsError>;
 
 /// Runs git in `dir` (a work tree or a bare repository).
 pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let out = git_cmd(Some(dir)).args(args).output()?;
+    git_env(dir, args, &[])
+}
+
+/// Like [`git`] with extra environment (credentials for fetch go here, never on the
+/// command line).
+pub fn git_env(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String> {
+    let mut c = git_cmd(Some(dir));
+    c.args(args);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    let out = c.output()?;
     if !out.status.success() {
         return Err(WsError::Git { args: args.join(" "), stderr: String::from_utf8_lossy(&out.stderr).trim().to_string() });
     }
@@ -69,6 +80,11 @@ impl Mirror {
     /// tags. Only `refs/heads/*` and `refs/tags/*` are pruned — `refs/cimon/keep/*`
     /// stays (design §11.1).
     pub fn fetch(dir: &Path, url: &str) -> Result<Mirror> {
+        Self::fetch_with(dir, url, &[])
+    }
+
+    /// `fetch` with extra git environment, e.g. [`auth_env`] for private repositories.
+    pub fn fetch_with(dir: &Path, url: &str, env: &[(String, String)]) -> Result<Mirror> {
         if !dir.join("HEAD").exists() {
             std::fs::create_dir_all(dir)?;
             let out = git_cmd(None).args(["init", "--bare", "-q"]).arg(dir).output()?;
@@ -83,7 +99,7 @@ impl Mirror {
                 git(dir, &["remote", "set-url", "origin", url])?;
             }
         }
-        git(dir, &["fetch", "--quiet", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"])?;
+        git_env(dir, &["fetch", "--quiet", "--prune", "--no-tags", "origin", "+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*"], env)?;
         Ok(Mirror { dir: dir.to_path_buf() })
     }
 
@@ -169,6 +185,33 @@ impl Mirror {
     pub fn gc(&self) -> Result<()> {
         git(&self.dir, &["gc", "--quiet", "--prune=now"]).map(|_| ())
     }
+}
+
+/// Git environment that sends a GitHub token as an HTTP header for github.com only.
+/// Passed through `GIT_CONFIG_*` variables so it never appears in a process command
+/// line or a config file. Existing `GIT_CONFIG_COUNT` entries are kept.
+pub fn auth_env(token: &str) -> Vec<(String, String)> {
+    use std::fmt::Write;
+    let start: usize = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut b64 = String::new();
+    let raw = format!("x-access-token:{token}");
+    // minimal base64 (standard alphabet, padded)
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in raw.as_bytes().chunks(3) {
+        let n = chunk.iter().enumerate().fold(0u32, |acc, (i, b)| acc | (*b as u32) << (16 - 8 * i));
+        for i in 0..4 {
+            if i <= chunk.len() {
+                let _ = b64.write_char(T[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            } else {
+                b64.push('=');
+            }
+        }
+    }
+    vec![
+        ("GIT_CONFIG_COUNT".into(), (start + 1).to_string()),
+        (format!("GIT_CONFIG_KEY_{start}"), "http.https://github.com/.extraheader".into()),
+        (format!("GIT_CONFIG_VALUE_{start}"), format!("AUTHORIZATION: basic {b64}")),
+    ]
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,6 +401,14 @@ mod tests {
         assert_eq!(m.keeps(), vec!["slot-1"]);
         m.unkeep("slot-1");
         assert!(m.keeps().is_empty());
+    }
+
+    #[test]
+    fn auth_header_base64() {
+        let env = auth_env("abc");
+        let v = &env.iter().find(|(k, _)| k.starts_with("GIT_CONFIG_VALUE_")).unwrap().1;
+        // base64("x-access-token:abc")
+        assert_eq!(v, "AUTHORIZATION: basic eC1hY2Nlc3MtdG9rZW46YWJj");
     }
 
     #[test]

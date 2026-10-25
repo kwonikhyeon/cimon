@@ -11,7 +11,13 @@ use std::path::PathBuf;
 pub enum RecipeCmd {
     /// Static checks on a recipe folder (no server needed). Intake checks are reported
     /// as skipped.
-    Check { dir: PathBuf },
+    Check {
+        dir: Option<PathBuf>,
+        /// Check the server's recipe repository main instead of a folder (run with a
+        /// new cimon.exe before upgrading — design §16.6).
+        #[arg(long)]
+        main: bool,
+    },
     /// Print a project's resolved recipe (presets and includes layered).
     Show {
         project: String,
@@ -48,8 +54,16 @@ pub enum RecipeCmd {
 
 pub fn run(cmd: RecipeCmd, config: &Option<PathBuf>) -> Result<i32> {
     match cmd {
-        RecipeCmd::Check { dir } => {
-            let tree = MemTree::from_dir(&dir).with_context(|| format!("reading {}", dir.display()))?;
+        RecipeCmd::Check { dir, main } => {
+            let tree = match (dir, main) {
+                (Some(d), false) => MemTree::from_dir(&d).with_context(|| format!("reading {}", d.display()))?,
+                (None, true) => {
+                    let app = open(config)?;
+                    let c = app.recipes.require_main().map_err(|e| anyhow::anyhow!("{e}"))?;
+                    (*app.recipes.tree(&c).map_err(|e| anyhow::anyhow!("{e}"))?).clone()
+                }
+                _ => bail!("give a folder, or --main"),
+            };
             let report = check_tree(&tree);
             for d in &report.errors {
                 println!("error: {d}");

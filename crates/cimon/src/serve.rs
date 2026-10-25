@@ -13,6 +13,8 @@ pub async fn run(cfg: Config, shutdown: Option<CancellationToken>) -> Result<()>
     }
     let shutdown = shutdown.unwrap_or_default();
     let app = App::open(cfg).context("opening the job store")?;
+    // an upgrade drains, stops, replaces and starts: a started service takes jobs again
+    let _ = std::fs::remove_file(app.layout.draining_flag());
     let (addr, server) = start(app, shutdown.clone()).await?;
     tracing::info!("cimon listening on http://{addr}");
     let ctrl_c = shutdown.clone();

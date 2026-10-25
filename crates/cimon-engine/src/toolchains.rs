@@ -145,8 +145,8 @@ pub fn installer_ctx(app: &App) -> cimon_toolchain::Ctx {
     cimon_toolchain::Ctx {
         layout: app.layout.clone(),
         github_api: app.config.github.api_url.clone(),
-        rustup: app.config.bootstrap.rustup.clone().map(PathBuf::from),
-        uv: app.config.bootstrap.uv.clone().map(PathBuf::from),
+        rustup: app.config.bootstrap.rustup.clone().map(PathBuf::from).or_else(|| Some(app.layout.bootstrap().join("cargo").join("bin").join("rustup.exe")).filter(|p| p.exists())),
+        uv: app.config.bootstrap.uv.clone().map(PathBuf::from).or_else(|| Some(app.layout.bootstrap().join("uv").join("uv.exe")).filter(|p| p.exists())),
         account: app.build_account(),
         mirrors: app.layout.mirrors(),
         installed_by: "cimon".into(),
@@ -307,7 +307,7 @@ pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, Str
                 let version = match (&req.version, &req.version_file) {
                     (Some(v), _) => v.clone(),
                     (None, Some(f)) => {
-                        let m = cimon_workspace::Mirror::fetch(&app.layout.mirror(p), &r.project.repo).map_err(|e| format!("fetching {p}: {e}"))?;
+                        let m = cimon_workspace::Mirror::fetch_with(&app.layout.mirror(p), &r.project.repo, &crate::git_auth(app)).map_err(|e| format!("fetching {p}: {e}"))?;
                         let c = m.branch(&r.project.default_ref).ok_or_else(|| format!("{p}: {} not found", r.project.default_ref))?;
                         let bytes = m.show(&c, f).ok_or_else(|| format!("{p}: {f} not found on {}", r.project.default_ref))?;
                         crate::jobs::channel_of(&bytes)?

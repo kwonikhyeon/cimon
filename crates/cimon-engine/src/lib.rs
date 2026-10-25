@@ -121,6 +121,23 @@ pub fn health(app: &App) -> serde_json::Value {
     })
 }
 
+/// Git environment carrying the stored GitHub token (`cimon github-token`), if any.
+pub fn git_auth(app: &App) -> Vec<(String, String)> {
+    let p = app.layout.config_dir().join("github-token.dpapi");
+    let Ok(blob) = std::fs::read(&p) else { return vec![] };
+    #[cfg(windows)]
+    let token = cimon_runner::win::unprotect(&blob).ok().and_then(|b| String::from_utf8(b).ok());
+    #[cfg(not(windows))]
+    let token: Option<String> = String::from_utf8(blob).ok();
+    match token {
+        Some(t) if !t.trim().is_empty() => cimon_workspace::auth_env(t.trim()),
+        _ => {
+            tracing::error!("{} exists but cannot be decrypted — fetches go without credentials", p.display());
+            vec![]
+        }
+    }
+}
+
 /// Toolchain state for `plan` (design §7.2).
 pub fn provision_needs(app: &App, v: &recipes::Validated) -> serde_json::Value {
     toolchains::plan_view(app, v)

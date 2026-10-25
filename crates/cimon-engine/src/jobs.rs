@@ -232,7 +232,8 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     };
     let project = request.project.clone();
     let mirror_dir = app.layout.mirror(&job.project_key);
-    let mirror = match Mirror::fetch(&mirror_dir, &project.repo) {
+    let auth = crate::git_auth(app);
+    let mirror = match Mirror::fetch_with(&mirror_dir, &project.repo, &auth) {
         Ok(m) => m,
         Err(e) => return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "fetch_failed", &format!("git fetch {}: {e}", project.repo)),
     };
@@ -259,7 +260,7 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
             Ok(p) => p,
             Err(d) => return fail_intake(app, id, Verdict::Fail, FailureClass::Recipe, "sibling_invalid", &d.to_string()),
         };
-        let sm = match Mirror::fetch(&app.layout.mirror(&s.project), &sp.repo) {
+        let sm = match Mirror::fetch_with(&app.layout.mirror(&s.project), &sp.repo, &auth) {
             Ok(m) => m,
             Err(e) => return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "fetch_failed", &format!("sibling {}: {e}", s.project)),
         };

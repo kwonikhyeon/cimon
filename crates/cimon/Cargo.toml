@@ -28,6 +28,13 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+tracing-appender = "0.2"
+cimon-toolchain.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+windows-service.workspace = true
 
 [dev-dependencies]
 cimon-workspace.workspace = true

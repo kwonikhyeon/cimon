@@ -2,7 +2,10 @@
 
 use cimon::{init_tracing, serve};
 
+mod lsa;
+mod ops;
 mod recipe_cli;
+mod service;
 
 use anyhow::{bail, Context, Result};
 use cimon_core::{Config, Role};
@@ -33,6 +36,30 @@ enum Command {
         #[command(subcommand)]
         action: UserCmd,
     },
+    /// Admin, once: directories, ACLs, accounts, rights, service, bootstrap tools.
+    Setup {
+        /// Print what would be done without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check the machine (design §16.4); non-zero exit when something fails.
+    Doctor {
+        /// Also check GitHub access to every project.
+        #[arg(long)]
+        network: bool,
+    },
+    /// Refuse new jobs and wait for running ones (before an upgrade).
+    Drain {
+        #[arg(long)]
+        off: bool,
+        #[arg(long, default_value_t = 3600)]
+        wait: u64,
+    },
+    /// Store the GitHub read token (read from stdin) DPAPI-encrypted.
+    GithubToken,
+    /// Entry point used by the Windows service control manager.
+    #[command(hide = true)]
+    Service,
     /// Install toolchains that auto-approve does not (design §10.4).
     Provision {
         /// Every toolchain of this project (including optional ones).
@@ -112,6 +139,7 @@ fn main() -> Result<()> {
         Command::Serve => {
             init_tracing();
             let cfg = load_config(&cli.config)?;
+            let _guard = init_service_logging(&cimon_core::Layout::new(&cfg.paths.root).service_logs());
             let rt = tokio::runtime::Runtime::new()?;
             rt.block_on(serve::run(cfg, None))
         }
@@ -141,6 +169,25 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Setup { dry_run } => {
+            let path = config_path(&cli.config);
+            let cfg = load_config(&cli.config)?;
+            ops::setup(&path, &cfg, dry_run)
+        }
+        Command::Doctor { network } => {
+            let cfg = load_config(&cli.config)?;
+            let failed = ops::doctor(&cfg, network)?;
+            std::process::exit(if failed == 0 { 0 } else { 1 });
+        }
+        Command::Drain { off, wait } => {
+            let cfg = load_config(&cli.config)?;
+            ops::drain(&cfg, off, wait)
+        }
+        Command::GithubToken => {
+            let cfg = load_config(&cli.config)?;
+            ops::github_token(&cfg)
+        }
+        Command::Service => service::run(cli.config.clone()),
         Command::Provision { project, kind, version, recipe_ref, admin } => {
             let cfg = load_config(&cli.config)?;
             let app = cimon_engine::App::open(cfg)?;
@@ -174,3 +221,16 @@ fn main() -> Result<()> {
     }
 }
 
+
+/// Daily-rolled service log under `logs\cimon\` (design §16.4: kept 30 days).
+pub fn init_service_logging(dir: &std::path::Path) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+    let _ = std::fs::create_dir_all(dir);
+    let appender = tracing_appender::rolling::daily(dir, "cimon.log");
+    let (writer, guard) = tracing_appender::non_blocking(appender);
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber = tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info,rmcp=warn".into()))
+        .with(tracing_subscriber::fmt::layer().with_writer(writer).with_ansi(false))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr));
+    tracing::subscriber::set_global_default(subscriber).ok().map(|_| guard)
+}
