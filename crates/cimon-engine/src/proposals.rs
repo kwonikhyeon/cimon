@@ -266,3 +266,62 @@ pub fn view(app: &App, p: &ProposalRow) -> Value {
 pub fn short(c: &str) -> &str {
     &c[..c.len().min(7)]
 }
+
+/// Promotes `p` at `head` (design §6.5): admin only, conditions recomputed under the
+/// write lock, soft conditions only with a 10+ character reason, bundle backup after.
+/// Returns the new main and whether the reason was used to override something.
+pub fn promote(app: &App, user: &cimon_core::AuthUser, p: &ProposalRow, head: &str, reason: Option<&str>) -> Result<(String, bool), crate::recipes::Rejection> {
+    use crate::recipes::Rejection;
+    use cimon_recipestore::RsError;
+    if !user.is_admin() {
+        return Err(Rejection::new("forbidden", "recipe_promote is admin-only — ask an admin"));
+    }
+    let reason = reason.map(str::trim).filter(|r| !r.is_empty());
+    let mut used_override = false;
+    let promoted = app
+        .recipes
+        .promote(&app.store, &user.name, p.id, head, reason, |_main, head| {
+            let c = conditions(app, p, head).map_err(|e| RsError::new("promote_conditions_unmet", format!("could not compute conditions: {e}")))?;
+            let hard = c.hard_failures();
+            if !hard.is_empty() {
+                let code = if hard.iter().any(|x| x.name == "fast_forward") { "not_fast_forward" } else { "promote_conditions_unmet" };
+                return Err(RsError::new(code, hard.iter().map(|x| format!("{}: {}", x.name, x.detail)).collect::<Vec<_>>().join("; ")));
+            }
+            let soft = c.soft_failures();
+            if !soft.is_empty() {
+                match reason {
+                    Some(r) if r.chars().count() >= 10 => used_override = true,
+                    _ => {
+                        return Err(RsError::new(
+                            "promote_conditions_unmet",
+                            format!(
+                                "{} — run the trials, or give override_reason (10+ characters, recorded permanently)",
+                                soft.iter().map(|x| format!("{}: {}", x.name, x.detail)).collect::<Vec<_>>().join("; ")
+                            ),
+                        ))
+                    }
+                }
+            }
+            Ok(())
+        })
+        .map_err(Rejection::from)?;
+    if !used_override && reason.is_some() {
+        // the reason overrode nothing — do not record it as an override
+        let _ = app.store.tx(|tx| {
+            tx.execute("UPDATE proposals SET override_reason = NULL WHERE id = ?1", [p.id])?;
+            Ok(())
+        });
+    }
+    let _ = app.store.audit(cimon_store::AuditEntry {
+        user: &user.name,
+        action: "recipe_promote",
+        proposal_id: Some(p.id),
+        recipe_commit: Some(&promoted),
+        detail: if used_override { reason.map(str::to_string) } else { None },
+        ..Default::default()
+    });
+    if let Err(e) = crate::backup::backup_recipes(app, "promote") {
+        tracing::error!("backup after promote: {e}");
+    }
+    Ok((promoted, used_override))
+}

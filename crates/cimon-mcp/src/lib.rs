@@ -39,7 +39,7 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
     );
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp)
-        .layer(middleware::from_fn_with_state(app.clone(), require_token));
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_token));
     Router::new()
         .route("/healthz", get(healthz))
         .route("/artifacts/{job}/{name}", get(download))

@@ -16,6 +16,7 @@ cimon-core.workspace = true
 cimon-store.workspace = true
 cimon-engine.workspace = true
 cimon-mcp.workspace = true
+cimon-web.workspace = true
 cimon-recipe.workspace = true
 cimon-recipestore.workspace = true
 cimon-runner.workspace = true
@@ -40,5 +41,5 @@ windows-service.workspace = true
 cimon-workspace.workspace = true
 zip.workspace = true
 rmcp = { workspace = true, features = ["client", "transport-streamable-http-client-reqwest", "reqwest"] }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["cookies"] }
 tempfile.workspace = true

@@ -65,6 +65,11 @@ pub(crate) fn definitions() -> Vec<Tool> {
             json!({"type": "object", "properties": {"proposal": prop, "head": {"type": "string"}, "override_reason": {"type": "string"}}, "required": ["proposal", "head"], "additionalProperties": false}),
         ),
         tool(
+            "web_login",
+            "리뷰 화면 일회용 로그인 링크(기본 5분, 한 번만). 화면이 꺼져 있으면 recipe_proposal 로 보라고 답한다.",
+            json!({"type": "object", "properties": {}, "additionalProperties": false}),
+        ),
+        tool(
             "recipe_revert",
             "main 의 커밋 하나를 되돌린다(관리자, 급한 복구). 사유 필수, 이력에 영구히 남는다.",
             json!({"type": "object", "properties": {"commit": {"type": "string"}, "reason": {"type": "string"}}, "required": ["commit", "reason"], "additionalProperties": false}),
@@ -179,6 +184,13 @@ pub(crate) fn call(app: &Arc<App>, user: &AuthUser, name: &str, args: Value) -> 
             with_backup_warnings(app, &mut v);
             ok_structured(v)
         })(),
+        "web_login" => match cimon_web::login_link(app, &user.name) {
+            Ok(url) => {
+                audit(app, user, "web_login", None, None, None);
+                ok_structured(json!({ "url": url, "expires_minutes": app.config.web.login_code_minutes, "summary": format!("리뷰 화면 로그인 링크({}분, 한 번만): {url}", app.config.web.login_code_minutes) }))
+            }
+            Err(e) => Err(ToolError::new("web_disabled", e)),
+        },
         _ => return None,
     })
 }
@@ -295,50 +307,13 @@ fn promote(app: &Arc<App>, user: &AuthUser, args: Value) -> ToolResult {
     let a: A = parse(args)?;
     admin(user, "recipe_promote")?;
     let p = proposals::find(app, &a.proposal)?;
+    let (promoted, used_override) = proposals::promote(app, user, &p, &a.head, a.override_reason.as_deref())?;
     let reason = a.override_reason.clone().filter(|r| !r.trim().is_empty());
-    let mut used_override = false;
-    let promoted = app
-        .recipes
-        .promote(&app.store, &user.name, p.id, &a.head, reason.as_deref(), |_main, head| {
-            let c = proposals::conditions(app, &p, head).map_err(|e| cimon_recipestore::RsError::new("promote_conditions_unmet", format!("could not compute conditions: {e}")))?;
-            let hard = c.hard_failures();
-            if !hard.is_empty() {
-                let code = if hard.iter().any(|x| x.name == "fast_forward") { "not_fast_forward" } else { "promote_conditions_unmet" };
-                return Err(cimon_recipestore::RsError::new(code, hard.iter().map(|x| format!("{}: {}", x.name, x.detail)).collect::<Vec<_>>().join("; ")));
-            }
-            let soft = c.soft_failures();
-            if !soft.is_empty() {
-                match &reason {
-                    Some(r) if r.trim().chars().count() >= 10 => used_override = true,
-                    _ => {
-                        return Err(cimon_recipestore::RsError::new(
-                            "promote_conditions_unmet",
-                            format!(
-                                "{} — run the trials, or give override_reason (10+ characters, recorded permanently)",
-                                soft.iter().map(|x| format!("{}: {}", x.name, x.detail)).collect::<Vec<_>>().join("; ")
-                            ),
-                        ))
-                    }
-                }
-            }
-            Ok(())
-        })
-        .map_err(Rejection::from)?;
-    if !used_override {
-        // promoted without needing it: do not record a reason that overrode nothing
-        if reason.is_some() {
-            let _ = app.store.tx(|tx| {
-                tx.execute("UPDATE proposals SET override_reason = NULL WHERE id = ?1", [p.id])?;
-                Ok(())
-            });
-        }
-    }
-    audit(app, user, "recipe_promote", Some(p.id), Some(&promoted), if used_override { reason.clone() } else { None });
-    let backup = cimon_engine::backup::backup_recipes(app, "promote");
+    let backup_failed = app.store.backups("recipes").ok().and_then(|b| b.first().and_then(|r| r.error.clone()));
     let mut v = json!({
         "proposal": proposal_label(p.id),
         "main": promoted,
-        "override_reason": if used_override { reason.clone() } else { None },
+        "override_reason": if used_override { reason } else { None },
         "summary": format!(
             "{} 를 main 에 반영했다({}){} — 다음 작업부터 쓰인다",
             proposal_label(p.id),
@@ -346,7 +321,7 @@ fn promote(app: &Arc<App>, user: &AuthUser, args: Value) -> ToolResult {
             if used_override { " — 조건을 사유와 함께 덮어씀" } else { "" }
         ),
     });
-    if let Err(e) = backup {
+    if let Some(e) = backup_failed {
         v["backup_error"] = json!(e);
     }
     with_backup_warnings(app, &mut v);

@@ -46,7 +46,10 @@ pub async fn start(
         engine_stop.cancel();
     });
     cimon_engine::start(&app)?;
-    let router = cimon_mcp::router(app.clone(), shutdown.clone());
+    let mut router = cimon_mcp::router(app.clone(), shutdown.clone());
+    if app.config.web.enabled {
+        router = router.merge(cimon_web::router(app.clone()));
+    }
     let sd = shutdown.clone();
     let handle = tokio::spawn(async move {
         axum::serve(listener, router).with_graceful_shutdown(async move { sd.cancelled_owned().await }).await
