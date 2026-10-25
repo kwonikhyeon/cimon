@@ -39,7 +39,63 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp)
         .layer(middleware::from_fn_with_state(app.clone(), require_token));
-    Router::new().route("/healthz", get(healthz)).with_state(app.clone()).merge(mcp_routes)
+    Router::new()
+        .route("/healthz", get(healthz))
+        .route("/artifacts/{job}/{name}", get(download))
+        .with_state(app.clone())
+        .merge(mcp_routes)
+}
+
+#[derive(serde::Deserialize)]
+struct LinkQuery {
+    t: Option<String>,
+}
+
+/// `GET /artifacts/j<id>/<name>?t=<token>` (design §12.3): HMAC link token, `410 Gone`
+/// after retention, `Range` support.
+async fn download(
+    State(app): State<Arc<App>>,
+    axum::extract::Path((job, name)): axum::extract::Path<(String, String)>,
+    axum::extract::Query(q): axum::extract::Query<LinkQuery>,
+    req: Request<Body>,
+) -> Response {
+    let Some(id) = cimon_core::parse_job_label(&job) else {
+        return (StatusCode::NOT_FOUND, "no such job").into_response();
+    };
+    let key = cimon_engine::artifacts::link_key(&app);
+    if let Err(e) = cimon_engine::artifacts::verify_token(&key, id, &name, q.t.as_deref().unwrap_or("")) {
+        return (StatusCode::FORBIDDEN, e).into_response();
+    }
+    let row = match app.store.artifact(id, &name) {
+        Ok(Some(r)) => r,
+        Ok(None) => return (StatusCode::NOT_FOUND, "no such artifact").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    if let Some(when) = row.deleted_at.clone() {
+        return (StatusCode::GONE, format!("{} 의 산출물은 {when} 에 만료돼 지웠다", cimon_core::job_label(id))).into_response();
+    }
+    let path = std::path::PathBuf::from(&row.path);
+    if !path.starts_with(app.layout.artifacts()) || !path.is_file() {
+        return (StatusCode::GONE, format!("{} 의 산출물 {name} 이 더 이상 없다", cimon_core::job_label(id))).into_response();
+    }
+    let file_name = row
+        .inspect_json
+        .as_deref()
+        .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+        .and_then(|v| v.get("file_name").and_then(|f| f.as_str()).map(str::to_string))
+        .unwrap_or_else(|| name.clone());
+    let _ = app.store.audit(cimon_store::AuditEntry { user: "link", action: "download", job_id: Some(id), detail: Some(name.clone()), ..Default::default() });
+    use tower::ServiceExt;
+    let mut resp = match tower_http::services::ServeFile::new(&path).oneshot(req).await {
+        Ok(r) => r.into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let safe: String = file_name.chars().filter(|c| c.is_ascii_graphic() && *c != '"' && *c != '\\').collect();
+    if let Ok(v) = http::HeaderValue::from_str(&format!("attachment; filename=\"{safe}\"")) {
+        resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+    }
+    resp.headers_mut().insert("x-content-sha256", http::HeaderValue::from_str(&row.sha256).unwrap());
+    resp
 }
 
 /// Rejects requests without a valid user token with HTTP 401 before rmcp sees them,

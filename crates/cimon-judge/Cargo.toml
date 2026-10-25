@@ -5,3 +5,18 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+cimon-core.workspace = true
+cimon-runner.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+regex.workspace = true
+quick-xml.workspace = true
+walkdir.workspace = true
+globset.workspace = true
+sha2.workspace = true
+hex.workspace = true
+x509-parser.workspace = true
+pelite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

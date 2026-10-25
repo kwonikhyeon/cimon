@@ -33,6 +33,12 @@ enum Command {
         #[command(subcommand)]
         action: UserCmd,
     },
+    #[command(name = "__exec", hide = true)]
+    Exec { spec: PathBuf },
+    #[command(name = "__sweep", hide = true)]
+    Sweep,
+    #[command(name = "__account-env", hide = true)]
+    AccountEnv { args: Vec<String> },
     /// Recipe repository: check, show, import, export, restore.
     Recipe {
         #[command(subcommand)]
@@ -116,6 +122,9 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::Exec { spec } => std::process::exit(cimon_runner::exec::child_exec_main(&spec)),
+        Command::Sweep => std::process::exit(cimon_runner::sweep_main()),
+        Command::AccountEnv { args } => std::process::exit(cimon_runner::account_env_main(&args)),
         Command::Recipe { action } => {
             let code = recipe_cli::run(action, &cli.config)?;
             std::process::exit(code);

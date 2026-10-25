@@ -36,6 +36,14 @@ pub async fn start(
     if !addr.ip().is_loopback() {
         anyhow::bail!("[server].bind must be a loopback address — tailscale serve is the only way in (design §15.3), got {addr}");
     }
+    // the engine's workers stop with the HTTP server
+    let engine_stop = app.engine.shutdown.clone();
+    let sd2 = shutdown.clone();
+    tokio::spawn(async move {
+        sd2.cancelled().await;
+        engine_stop.cancel();
+    });
+    cimon_engine::start(&app)?;
     let router = cimon_mcp::router(app.clone(), shutdown.clone());
     let sd = shutdown.clone();
     let handle = tokio::spawn(async move {

@@ -18,6 +18,7 @@ cimon-engine.workspace = true
 cimon-mcp.workspace = true
 cimon-recipe.workspace = true
 cimon-recipestore.workspace = true
+cimon-runner.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

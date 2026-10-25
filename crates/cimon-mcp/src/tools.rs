@@ -42,6 +42,12 @@ impl ToolError {
     }
 }
 
+impl From<cimon_store::StoreError> for ToolError {
+    fn from(e: cimon_store::StoreError) -> Self {
+        ToolError::new("store_error", e.to_string())
+    }
+}
+
 impl From<Rejection> for ToolError {
     fn from(r: Rejection) -> Self {
         ToolError { code: r.code, message: r.message, details: r.details }
@@ -78,6 +84,10 @@ fn run_args_schema(with_tool: bool) -> Value {
     json!({"type": "object", "properties": props, "required": if with_tool { json!(["project", "tool"]) } else { json!(["project"]) }, "additionalProperties": false})
 }
 
+fn job_schema() -> Value {
+    json!({"type": "object", "properties": {"job": {"type": "string", "description": "j000123 또는 task id"}}, "required": ["job"], "additionalProperties": false})
+}
+
 pub(crate) fn definitions(_app: &App) -> Vec<Tool> {
     let empty = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     vec![
@@ -88,6 +98,18 @@ pub(crate) fn definitions(_app: &App) -> Vec<Tool> {
             json!({"type": "object", "properties": {"project": {"type": "string"}, "recipe_ref": {"type": "string"}}, "required": ["project"], "additionalProperties": false}),
         ),
         tool("plan", "build/test/run 이 무엇을 할지 실행 없이(프로젝트를 fetch 하지 않는다).", run_args_schema(true)),
+        tool("build", "build·package 단계를 돌린다(task). 기본은 default = true 인 build. 끝나면 판정·요약·산출물 링크.", run_args_schema(false)),
+        tool("test", "test·scenario 단계를 돌린다(task). 기본은 default = true 인 test. 필요한 빌드는 after 로 따라온다.", run_args_schema(false)),
+        tool("run", "build·package·test·scenario 를 한 작업으로(task). 기본은 기본 build + 기본 test.", run_args_schema(false)),
+        tool("job_status", "작업의 상태·판정·요약·경고. job 은 j000123 또는 task id.", job_schema()),
+        tool(
+            "job_log",
+            "단계 로그의 끝 N 줄 또는 패턴 검색. step 을 빼면 단계 목록.",
+            json!({"type": "object", "properties": {"job": {"type": "string"}, "step": {"type": "string"}, "tail": {"type": "integer", "minimum": 1, "maximum": 2000}, "grep": {"type": "string"}}, "required": ["job"], "additionalProperties": false}),
+        ),
+        tool("artifacts", "작업의 산출물 목록과 새로 발급한 다운로드 링크(1시간).", job_schema()),
+        tool("cancel_job", "작업 취소 요청 — 바로 돌아오고, 정리가 끝나면 job_status 가 cancelled.", job_schema()),
+        tool("queue", "접수·대기·실행 중 작업.", empty.clone()),
         tool(
             "recipe_show",
             "레시피 저장소의 파일 하나 또는 디렉터리 목록(ref 기준, 기본 main). 결과의 commit 을 recipe_edit 의 base 로 쓴다.",
@@ -115,13 +137,20 @@ pub(crate) async fn call(app: &Arc<App>, ctx: &CallCtx, name: &str, args: Value)
     let app2 = app.clone();
     let user = ctx.user.clone();
     let name_owned = name.to_string();
+    if matches!(name, "build" | "test" | "run") {
+        let tool = cimon_core::Tool::parse(name).unwrap();
+        let supports = ctx.supports_tasks;
+        return tokio::task::spawn_blocking(move || start_job(&app2, &user, tool, args, supports))
+            .await
+            .unwrap_or_else(|e| Err(ToolError::new("internal_error", e.to_string())));
+    }
     // Recipe and store work is blocking (git, SQLite); keep it off the async workers.
     tokio::task::spawn_blocking(move || call_blocking(&app2, &user, &name_owned, args))
         .await
         .unwrap_or_else(|e| Err(ToolError::new("internal_error", e.to_string())))
 }
 
-fn call_blocking(app: &Arc<App>, _user: &cimon_core::AuthUser, name: &str, args: Value) -> ToolResult {
+fn call_blocking(app: &Arc<App>, user: &cimon_core::AuthUser, name: &str, args: Value) -> ToolResult {
     match name {
         "list_projects" => ok_structured(recipes::list_projects(app)?),
         "describe_project" => {
@@ -231,11 +260,148 @@ fn call_blocking(app: &Arc<App>, _user: &cimon_core::AuthUser, name: &str, args:
             with_backup_warnings(app, &mut v);
             ok_structured(v)
         }
+        "job_status" => {
+            let job = find_job(app, &args)?;
+            let task = task_arg(&args);
+            ok_structured(if job.state.is_terminal() && job.result_json.is_some() {
+                cimon_engine::result::view(app, &job, task.as_deref())
+            } else {
+                cimon_engine::result::progress(app, &job)
+            })
+        }
+        "job_log" => job_log(app, args),
+        "artifacts" => {
+            let job = find_job(app, &args)?;
+            let list = cimon_engine::artifacts::listing(app, &job);
+            let n = list.len();
+            let note = if n == 0 { " (요청한 산출물이 없거나 아직 수집 전)" } else { "" };
+            ok_structured(json!({
+                "job_id": cimon_core::job_label(job.id),
+                "artifacts": list,
+                "summary": format!("{} — 산출물 {n}개{note}", cimon_core::job_label(job.id)),
+                "download_hint": "Invoke-WebRequest <url> -OutFile <path>; (Get-FileHash <path>).Hash 를 sha256 과 대조",
+            }))
+        }
+        "cancel_job" => {
+            let job = find_job(app, &args)?;
+            let msg = cimon_engine::jobs::cancel(app, job.id, &user.name)?;
+            ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "summary": msg }))
+        }
+        "queue" => {
+            use cimon_core::JobState::*;
+            let jobs = app.store.jobs_in_states(&[Running, Collecting, Cancelling, Ready, Provisioning, Intake])?;
+            let list: Vec<Value> = jobs
+                .iter()
+                .map(|j| {
+                    json!({"job_id": cimon_core::job_label(j.id), "state": j.state.as_str(), "project": j.project, "tool": j.tool,
+                           "ref": j.ref_, "by": j.created_by, "status": j.status_message, "created_at": j.created_at})
+                })
+                .collect();
+            let n = list.len();
+            ok_structured(json!({ "jobs": list, "summary": format!("진행 중·대기 작업 {n}개") }))
+        }
         other => Err(ToolError::new("unknown_tool", format!("unknown tool {other:?}"))),
     }
 }
 
+fn task_arg(args: &Value) -> Option<String> {
+    args.get("job").and_then(|v| v.as_str()).filter(|s| s.starts_with("t_")).map(str::to_string)
+}
+
+/// `job` argument: `j000123`, `123` or a task id.
+fn find_job(app: &App, args: &Value) -> Result<cimon_store::JobRow, ToolError> {
+    let key = args.get("job").and_then(|v| v.as_str()).ok_or_else(|| ToolError::new("invalid_param", "job is required"))?;
+    let id = if key.starts_with("t_") {
+        app.store.task(key)?.map(|t| t.job_id).ok_or_else(|| ToolError::new("unknown_job", format!("unknown or expired task {key}")))?
+    } else {
+        cimon_core::parse_job_label(key).ok_or_else(|| ToolError::new("invalid_param", format!("{key:?} is not a job id (j000123) or task id")))?
+    };
+    app.store
+        .job(id)?
+        .ok_or_else(|| ToolError::new("unknown_job", format!("{} does not exist or its record expired (records are kept 30 days)", cimon_core::job_label(id))))
+}
+
+fn job_log(app: &App, args: Value) -> ToolResult {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct A {
+        #[allow(dead_code)]
+        job: String,
+        #[serde(default)]
+        step: Option<String>,
+        #[serde(default)]
+        tail: Option<usize>,
+        #[serde(default)]
+        grep: Option<String>,
+    }
+    let a: A = parse(args.clone())?;
+    let job = find_job(app, &args)?;
+    let steps = app.store.steps(job.id)?;
+    let Some(step) = a.step else {
+        let list: Vec<Value> = steps.iter().map(|s| json!({"step": s.step_id, "result": s.result})).collect();
+        return ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "steps": list, "summary": "step 을 주면 그 단계의 로그를 보여 준다" }));
+    };
+    if !steps.iter().any(|s| s.step_id == step) {
+        return Err(ToolError::new("unknown_step", format!("{} has no step {step:?}", cimon_core::job_label(job.id))));
+    }
+    let path = app.layout.step_log(job.id, &step);
+    let text = match std::fs::read(&path) {
+        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+        Err(_) => {
+            let expired = cimon_core::parse_time(&job.expires_at).is_some_and(|t| t < chrono::Utc::now());
+            let why = if expired { format!("its log expired on {}", job.expires_at) } else { "it did not run".to_string() };
+            return Err(ToolError::new("log_unavailable", format!("no log for {step} — {why}")));
+        }
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let selected: Vec<String> = match &a.grep {
+        Some(pat) => {
+            let re = regex::Regex::new(pat).map_err(|e| ToolError::new("invalid_param", format!("grep: {e}")))?;
+            lines.iter().enumerate().filter(|(_, l)| re.is_match(l)).take(200).map(|(i, l)| format!("{}: {}", i + 1, l)).collect()
+        }
+        None => {
+            let n = a.tail.unwrap_or(100).min(2000);
+            lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
+        }
+    };
+    let mut body = selected.join("\n");
+    if body.len() > 7000 {
+        let mut cut = body.len() - 7000;
+        while !body.is_char_boundary(cut) {
+            cut += 1;
+        }
+        body = format!("…\n{}", &body[cut..]);
+    }
+    let summary = format!("{} {step} — {}줄 중 {}줄", cimon_core::job_label(job.id), lines.len(), selected.len());
+    ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "step": step, "lines": lines.len(), "log": body, "summary": summary }))
+}
+
+/// `build` / `test` / `run`: validate, commit, answer with a task (design §7.5).
+fn start_job(app: &Arc<App>, user: &cimon_core::AuthUser, tool: cimon_core::Tool, args: Value, supports_tasks: bool) -> ToolResult {
+    let a: RunArgs = parse(args)?;
+    if a.tool.is_some() {
+        return Err(ToolError::new("invalid_param", "tool is only for plan"));
+    }
+    let created = cimon_engine::jobs::create(app, &user.name, tool, a, supports_tasks)?;
+    if !supports_tasks {
+        let label = cimon_core::job_label(created.job_id);
+        let hours = app.config.queue.max_queue_hours;
+        return ok_structured(json!({
+            "job_id": label,
+            "done": false,
+            "accepted": true,
+            "summary": format!("{label} 접수 — 아직 끝나지 않았다. job_status 로 확인하라. 시작 전 작업은 {hours}시간까지 기다린다"),
+        }));
+    }
+    let task = Task::new(created.task_id, rmcp::model::TaskStatus::Working, created.created_at.clone(), created.created_at)
+        .with_status_message(created.status)
+        .with_ttl_ms(cimon_engine::jobs::TTL_MS)
+        .with_poll_interval_ms(cimon_engine::jobs::POLL_INTERVAL_MS);
+    Ok(ToolOutcome::Task(task))
+}
+
 /// Every `recipe_*` result carries backup warnings (design §16.5).
+
 pub(crate) fn with_backup_warnings(app: &App, v: &mut Value) {
     let w = cimon_engine::backup::warnings(app);
     if !w.is_empty() {
@@ -260,10 +426,71 @@ pub(crate) fn ok_structured(value: Value) -> ToolResult {
     Ok(ToolOutcome::Result(r))
 }
 
-pub(crate) fn get_task(_app: &Arc<App>, task_id: &str) -> Result<DetailedTask, ToolError> {
-    Err(ToolError::new("unknown_task", format!("unknown or expired task {task_id}")))
+/// `tasks/get` (design §7.5): every field present, `statusMessage` on every answer.
+pub(crate) fn get_task(app: &Arc<App>, task_id: &str) -> Result<DetailedTask, ToolError> {
+    use cimon_core::JobState::*;
+    use rmcp::model::{TaskPayload, TaskStatus};
+    let t = app.store.task(task_id)?.ok_or_else(|| ToolError::new("unknown_task", format!("unknown or expired task {task_id}")))?;
+    let _ = app.store.touch_task(task_id);
+    let mut job = app.store.require_job(t.job_id)?;
+    // a merged job's tasks were moved; follow defensively anyway
+    for _ in 0..5 {
+        match job.merged_into {
+            Some(into) if job.state == Merged => job = app.store.require_job(into)?,
+            _ => break,
+        }
+    }
+    let base = |status: TaskStatus, msg: String| {
+        Task::new(task_id.to_string(), status, t.created_at.clone(), job.last_updated_at.clone())
+            .with_status_message(msg)
+            .with_ttl_ms(cimon_engine::jobs::TTL_MS)
+            .with_poll_interval_ms(cimon_engine::jobs::POLL_INTERVAL_MS)
+    };
+    if t.detached_at.is_some() {
+        let msg = t.detached_reason.clone().unwrap_or_else(|| "task 를 뗐다".into());
+        return Ok(DetailedTask::new(base(TaskStatus::Cancelled, msg), TaskPayload::Cancelled));
+    }
+    let status_msg = job.status_message.clone().filter(|m| !m.is_empty()).unwrap_or_else(|| job.state.as_str().to_string());
+    Ok(match job.state {
+        Intake | Provisioning | Ready | Running | Collecting | Cancelling | Merged => DetailedTask::new(base(TaskStatus::Working, status_msg), TaskPayload::Working),
+        Cancelled | QueueTimeout => DetailedTask::new(base(TaskStatus::Cancelled, status_msg), TaskPayload::Cancelled),
+        Done | Interrupted => {
+            let view = cimon_engine::result::view(app, &job, Some(task_id));
+            let result = completion_result(&view);
+            let obj = match serde_json::to_value(&result).unwrap_or_default() {
+                Value::Object(m) => m,
+                _ => Default::default(),
+            };
+            DetailedTask::new(base(TaskStatus::Completed, status_msg), TaskPayload::Completed { result: obj })
+        }
+    })
 }
 
-pub(crate) fn cancel_task(_app: &Arc<App>, _user: &cimon_core::AuthUser, task_id: &str) -> Result<(), ToolError> {
-    Err(ToolError::new("unknown_task", format!("unknown or expired task {task_id}")))
+/// The `CallToolResult` a finished task carries: structured result, the summary as
+/// text, artifact `resource_link`s; `isError` unless the verdict is pass.
+pub(crate) fn completion_result(view: &Value) -> CallToolResult {
+    let pass = view.get("verdict").and_then(|v| v.as_str()) == Some("pass");
+    let summary = view.get("summary").and_then(|s| s.as_str()).unwrap_or("").to_string();
+    let mut r = if pass { CallToolResult::structured(view.clone()) } else { CallToolResult::structured_error(view.clone()) };
+    let mut content = vec![ContentBlock::text(summary)];
+    if let Some(arts) = view.get("artifacts").and_then(|a| a.as_array()) {
+        for a in arts {
+            if let (Some(url), Some(name)) = (a.get("url").and_then(|u| u.as_str()), a.get("name").and_then(|n| n.as_str())) {
+                let sha = a.get("sha256").and_then(|s| s.as_str()).unwrap_or("");
+                if let Ok(res) = serde_json::from_value::<rmcp::model::Resource>(
+                    json!({"uri": url, "name": name, "mimeType": "application/octet-stream", "description": format!("sha256 {sha}")}),
+                ) {
+                    content.push(ContentBlock::resource_link(res));
+                }
+            }
+        }
+    }
+    r.content = content;
+    r
 }
+
+pub(crate) fn cancel_task(app: &Arc<App>, user: &cimon_core::AuthUser, task_id: &str) -> Result<(), ToolError> {
+    cimon_engine::jobs::detach_task(app, task_id, &user.name)?;
+    Ok(())
+}
+

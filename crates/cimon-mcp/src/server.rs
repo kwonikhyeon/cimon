@@ -25,7 +25,6 @@ pub(crate) struct CallCtx {
     pub user: cimon_core::AuthUser,
     pub tailnet_login: Option<String>,
     pub supports_tasks: bool,
-    pub client_info: Option<String>,
 }
 
 impl ServerHandler for CimonMcp {
@@ -69,7 +68,6 @@ impl ServerHandler for CimonMcp {
             user,
             tailnet_login: crate::tailnet_login(parts),
             supports_tasks: context.client_capabilities().is_some_and(|c| c.supports_tasks()),
-            client_info: None,
         };
         let args = serde_json::Value::Object(request.arguments.clone().unwrap_or_default());
         let app = self.app.clone();

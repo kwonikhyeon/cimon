@@ -121,7 +121,8 @@ pub fn select(r: &Resolved, tool: Tool, req: &SelectRequest) -> Result<Plan, Rej
             picked.insert(p.clone());
         }
     }
-    if req.steps.is_empty() && req.tags.is_empty() && req.artifacts.as_ref().is_none_or(|a| a.is_empty()) {
+    // defaults apply whenever no steps or tags were named; artifacts only add producers
+    if req.steps.is_empty() && req.tags.is_empty() {
         for s in &r.steps {
             if kinds.contains(&s.kind) && s.is_default() {
                 picked.insert(s.id().to_string());
