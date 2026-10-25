@@ -1,6 +1,7 @@
 //! MCP endpoint (`POST /mcp`, revision 2026-07-28 + Tasks extension) and its HTTP
 //! plumbing: bearer-token auth in front of rmcp, identity-header audit, `/healthz`.
 
+pub mod recipe_tools;
 pub mod server;
 pub mod tools;
 

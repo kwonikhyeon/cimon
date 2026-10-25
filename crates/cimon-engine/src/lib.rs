@@ -6,6 +6,7 @@ pub mod backup;
 pub mod fixtures;
 pub mod janitor;
 pub mod jobs;
+pub mod proposals;
 pub mod recipes;
 pub mod result;
 pub mod run;

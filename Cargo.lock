@@ -435,6 +435,7 @@ dependencies = [
  "chrono",
  "cimon-core",
  "cimon-engine",
+ "cimon-recipestore",
  "cimon-store",
  "http",
  "regex",

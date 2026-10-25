@@ -110,6 +110,10 @@ pub(crate) fn definitions(_app: &App) -> Vec<Tool> {
         tool("artifacts", "작업의 산출물 목록과 새로 발급한 다운로드 링크(1시간).", job_schema()),
         tool("cancel_job", "작업 취소 요청 — 바로 돌아오고, 정리가 끝나면 job_status 가 cancelled.", job_schema()),
         tool("queue", "접수·대기·실행 중 작업.", empty.clone()),
+    ]
+    .into_iter()
+    .chain(crate::recipe_tools::definitions())
+    .chain([
         tool(
             "recipe_show",
             "레시피 저장소의 파일 하나 또는 디렉터리 목록(ref 기준, 기본 main). 결과의 commit 을 recipe_edit 의 base 로 쓴다.",
@@ -130,7 +134,8 @@ pub(crate) fn definitions(_app: &App) -> Vec<Tool> {
             "두 ref 의 파일 차이(unified diff).",
             json!({"type": "object", "properties": {"from": {"type": "string"}, "to": {"type": "string"}, "path": {"type": "string"}}, "required": ["from", "to"], "additionalProperties": false}),
         ),
-    ]
+    ])
+    .collect()
 }
 
 pub(crate) async fn call(app: &Arc<App>, ctx: &CallCtx, name: &str, args: Value) -> ToolResult {
@@ -300,7 +305,10 @@ fn call_blocking(app: &Arc<App>, user: &cimon_core::AuthUser, name: &str, args: 
             let n = list.len();
             ok_structured(json!({ "jobs": list, "summary": format!("진행 중·대기 작업 {n}개") }))
         }
-        other => Err(ToolError::new("unknown_tool", format!("unknown tool {other:?}"))),
+        other => match crate::recipe_tools::call(app, user, other, args) {
+            Some(r) => r,
+            None => Err(ToolError::new("unknown_tool", format!("unknown tool {other:?}"))),
+        },
     }
 }
 
