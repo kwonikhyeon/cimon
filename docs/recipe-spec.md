@@ -9,7 +9,7 @@
 
 cimon 이 프로젝트를 빌드·테스트하는 방법은 **전부 데이터(TOML)로** 적는다. 새 프로젝트를 추가하거나 테스트를 고칠 때 서비스 코드를 고치거나 다시 배포하지 않는다.
 
-레시피는 **레시피 저장소**(`cimon.toml [recipes].repo`)에 둔다.
+레시피는 cimon 이 빌드 머신 안에 갖는 **레시피 저장소**(git, `cimon.toml [recipes].store`)에 둔다. 외부 원격은 없고, 사람은 cimon 의 MCP 도구(`recipe_show`·`recipe_edit` …)나 관리자 명령(`cimon recipe import/export`)으로 읽고 고친다(design §6.4). 저장소 안의 배치:
 
 | 파일 | 내용 |
 |---|---|
@@ -36,14 +36,14 @@ cimon 이 프로젝트를 빌드·테스트하는 방법은 **전부 데이터(T
 
 ### 2.1 레시피 저장소
 
-서비스는 레시피 저장소를 bare mirror 로 받아 두고 **git 에서 직접** 읽는다. 서비스가 설치된 폴더의 파일은 읽지 않는다.
+서비스는 빌드 머신 안의 레시피 저장소(bare git)를 **git 에서 직접** 읽는다. 서비스가 설치된 폴더의 파일은 읽지 않는다.
 
-- 기본 ref 는 `cimon.toml [recipes].default_ref`(보통 `main`). 서비스가 주기적으로 fetch 한다(기본 60초). fetch 가 계속 실패하면 결과에 「레시피가 묵음」 이 실린다(design §6.4).
-- `main` 에 merge 되면 **다음 작업부터** 반영된다. 서비스 재시작은 필요 없다.
+- 기본 브랜치는 `main`(`cimon.toml [recipes].default_branch`). 관리자가 `recipe_promote` 로 반영하면 **다음 작업부터** 쓰인다. 서비스 재시작은 필요 없다.
+- **모든 변경은 검사를 통과한 커밋이다.** `recipe_edit`·`import` 는 저장 전에 §15 의 검사를 그 브랜치 전체에 돌리고, 실패하면 저장하지 않는다.
 - 작업은 레시피 커밋을 고정하고 결과에 적는다.
-- **시도 실행**: 도구 호출에 `recipe_ref` 를 주면 그 ref 의 `recipe.toml`·include·프리셋·카탈로그·스크립트로 돈다. `cimon.toml [recipes].trial_refs`(예: `recipe/*`)에 맞는 ref 만 받는다. 결과에 `trial: true`.
-  - **이미 등록된 프로젝트의 `project.toml` 은 시도 실행에서도 기본 ref 의 것을 쓴다.** 시도 ref 가 저장소 주소·허용 ref·형제 저장소를 바꾸지 못한다.
-  - 시도 ref 에만 있는 새 프로젝트는 `repo` 가 `cimon.toml [recipes].allowed_repo_prefixes` 에 맞을 때만 받는다.
+- **시도 실행**: 도구 호출에 `recipe_ref` 로 `recipe/<설명>` 브랜치를 주면 그 브랜치의 `recipe.toml`·include·프리셋·카탈로그·스크립트로 돈다. 결과에 `trial: true`.
+  - **이미 등록된 프로젝트의 `project.toml` 은 시도 실행에서도 `main` 의 것을 쓴다.** 시도 브랜치가 저장소 주소·허용 ref·형제 저장소를 바꾸지 못한다.
+  - 시도 브랜치에만 있는 새 프로젝트는 `repo` 가 `cimon.toml [recipes].allowed_repo_prefixes` 에 맞을 때만 받는다.
 
 ### 2.2 `recipe_source`
 
@@ -51,7 +51,7 @@ cimon 이 프로젝트를 빌드·테스트하는 방법은 **전부 데이터(T
 
 | 값 | `recipe.toml` 을 읽는 곳 | 상태 |
 |---|---|---|
-| `"central"`(기본) | 레시피 저장소 `projects/<id>/recipe.toml` | 1단계 |
+| `"central"`(기본) | 레시피 저장소 `projects/<id>/recipe.toml`(`main` 또는 시도 브랜치) | 1단계 |
 | `"project"` | 빌드하는 ref 의 `.cimon/recipe.toml` | **2단계** — 형식만 정의 |
 
 - `"project"` 여도 **`project.toml` 은 레시피 저장소에만** 있다.
@@ -472,7 +472,7 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 
 ## 15. 검증 — 무엇이 오류인가
 
-`cimon recipe check`(로컬)와 서비스가 같은 검사를 한다.
+같은 검사를 세 곳에서 한다: `recipe_edit`·`cimon recipe import` 의 저장 전(실패하면 저장 안 함), 도구 호출의 입력 검증, 내보낸 폴더에 대한 로컬 `cimon recipe check`.
 
 | 검사 | 예 |
 |---|---|

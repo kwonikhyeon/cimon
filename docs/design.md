@@ -12,7 +12,7 @@
 | [recipe-spec.md](recipe-spec.md) | 레시피 파일 형식(정본) |
 | [`examples/recipes/`](../examples/recipes/) | 형식 예시이자 레시피 검사기의 시험 입력 |
 
-**이 저장소는 어떤 프로젝트를 빌드하는지 모른다.** 실제 프로젝트의 레시피·툴체인 카탈로그·프로젝트별 사실과 결정·레시피를 고치는 절차는 **레시피 저장소**(`cimon.toml [recipes].repo`, 사내 비공개)에 있다.
+**이 저장소는 어떤 프로젝트를 빌드하는지 모른다.** 실제 프로젝트의 레시피·툴체인 카탈로그·프로젝트별 사실과 결정은 **cimon 이 빌드 머신 안에 직접 갖는 레시피 저장소**(`D:\cimon\recipes.git`)에 있다. GitHub 등 외부에 올리지 않는다. 사람은 MCP 도구로 고친다(§6.4).
 
 ---
 
@@ -70,16 +70,19 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
 
 **장면 2 — 테스트 고치기**
 
-1. 레시피 저장소에 `recipe/<설명>` 브랜치, `recipe.toml` 에 `[[step]]` 하나 추가, push.
-2. `test(project="example-app", recipe_ref="recipe/<설명>", steps=["<새 단계>"])` → `trial: true` 로 돈다.
-3. 통과하면 merge — 다음 작업부터 모두에게 반영. 서비스 재시작 없음.
+> 「example-app 에 공유 모듈 desktopTest 만 도는 테스트를 추가하고 돌려 봐」
+
+1. Claude → `recipe_show(path="projects/example-app/recipe.toml")` 로 지금 레시피를 읽는다.
+2. Claude → `recipe_edit(branch="recipe/add-desktop-test", path=…, content=…, base=<읽은 커밋>, message="desktopTest 단계 추가")`. cimon 은 **저장 전에 레시피 검사**를 돌리고, 통과하면 그 브랜치에 커밋한다(작성자 = 토큰 사용자). 깨진 레시피는 저장되지 않는다.
+3. `test(project="example-app", recipe_ref="recipe/add-desktop-test", steps=["test-shared-desktop"])` → `trial: true` 로 돈다.
+4. 통과하면 관리자가 `recipe_promote(branch="recipe/add-desktop-test")` — `main` 에 반영, 다음 작업부터 모두에게. 서비스 재시작 없음.
 
 **장면 3 — 새 프로젝트**
 
 1. 관리자가 GitHub 토큰에 저장소를 추가.
-2. 레시피 저장소에 `project.toml`·`recipe.toml` 을 쓴 브랜치를 push → `plan` → `build`·`test` 로 시도 → merge.
+2. Claude 가 프로젝트 저장소를 읽어 초안을 쓰고, `recipe_edit` 로 `recipe/add-<id>` 브랜치에 `project.toml`·`recipe.toml` 을 만든다 → `plan` → `build`·`test` 로 시도 → 관리자가 `recipe_promote`.
 
-절차의 자세한 내용은 레시피 저장소의 안내서에 있다.
+레시피를 고치는 자세한 절차는 레시피 저장소 안의 안내서(`docs/recipe-guide.md`)에 있다.
 
 ---
 
@@ -95,16 +98,16 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
  +--------------------+  POST /mcp    | cimon.exe (service account "cimon")            |
                       GET /artifacts  |   MCP endpoint        Artifact HTTP            |
                                       |   Job store (SQLite)  Intake workers (2)       |
-                                      |   Recipe loader       Runner (1) -- spawns as  |
+                                      |   Recipe store (git)  Runner (1) -- spawns as  |
                                       |   Toolchain manager   Workspace manager        |
-                                      |   Janitor                                      |
+                                      |   Janitor             D:\cimon\recipes.git     |
                                       |        |                                       |
                                       |        v  build account "cimon-build"          |
                                       |   child processes in a Job Object              |
                                       +------------------------------------------------+
                                              | git fetch (read-only token)
                                              v
-                                  GitHub: project repos + recipe repo
+                                       GitHub: project repos
 ```
 
 접속 경로는 **Tailscale 하나**다(§15.3). 서버는 `127.0.0.1` 에만 바인딩하고, 빌드 머신의 `tailscale serve` 가 tailnet 안에 HTTPS 로 내보낸다.
@@ -113,7 +116,7 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
 |---|---|---|
 | MCP 엔드포인트 | 도구 목록·호출, task 응답, `tasks/get`·`tasks/cancel` | 없음 — 작업 저장소에서 읽는다 |
 | 아티팩트 HTTP | 산출물 다운로드, 링크 토큰 검증 | `artifacts\` |
-| 레시피 로더 | 레시피 저장소 mirror(또는 프로젝트 ref)에서 읽어 검증·겹치기·선택. fetch 성공 시각 추적 | 메모리 캐시(커밋별) |
+| 레시피 저장소 | 빌드 머신 안의 git 저장소. 읽기(검증·겹치기·선택), 편집 도구(검사 후 커밋), 반영·되돌리기, 가져오기·내보내기 | `recipes.git`, 메모리 캐시(커밋별) |
 | 작업 저장소 | 작업·task·단계·산출물·툴체인 사용·warm 상태·감사 로그 | `state\cimon.db`(SQLite, WAL) |
 | 접수 작업자 | fetch → 커밋 고정 → 레시피 → 계획 → 툴체인. 러너를 쓰지 않는다(동시 2) | 작업 저장소 |
 | 러너 | 워크스페이스 → 단계 → 수집. **빌드 계정으로** 자식 프로세스를 띄운다(동시 1) | `logs\`, `homes\`, `tmp\` |
@@ -121,14 +124,14 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
 | 워크스페이스 관리자 | bare mirror, warm 슬롯·clean 트리(독립 클론), 형제 트리 | `mirrors\`, `ws\` |
 | 정리기 | 만료 산출물·로그·홈 삭제, 캐시·warm 트리 크기 관리, 디스크 하한 감시, 빌드 계정 잔류 프로세스 정리 | — |
 
-### 4.1 두 저장소
+### 4.1 코드와 레시피
 
-| 저장소 | 내용 | 공개 범위 |
+| | 내용 | 어디에 |
 |---|---|---|
-| `cimon` | 서비스 코드, 이 설계, 레시피 형식 명세, 형식 예시 | 프로젝트 정보가 없으므로 공개해도 된다 |
-| 레시피 저장소 | `toolchains.toml`, `presets/`, `projects/<id>/`, 판정·검사 스크립트, 프로젝트별 노트, 레시피 안내서 | 사내 비공개 |
+| `cimon` 저장소 | 서비스 코드, 이 설계, 레시피 형식 명세, 형식 예시 | GitHub. 프로젝트 정보가 없으므로 공개해도 된다 |
+| 레시피 저장소 | `toolchains.toml`, `presets/`, `projects/<id>/`, 판정·검사 스크립트, 프로젝트별 노트, 레시피 안내서 | **빌드 머신 안** `D:\cimon\recipes.git`. 외부에 올리지 않는다. 매일 백업(§16.4) |
 
-서비스는 레시피 저장소를 다른 프로젝트처럼 bare mirror 로 받아 git 에서 직접 읽는다(§6.2).
+레시피 저장소는 평범한 git 저장소다 — 커밋으로 버전을 고정하고, 브랜치로 시도 실행을 하고, 이력으로 누가 무엇을 바꿨는지 남긴다. 다만 GitHub 같은 원격이 없고, 사람은 cimon 의 MCP 도구로 읽고 고친다(§6.4). 처음 내용은 사내 레시피 폴더에서 `cimon recipe import` 로 들여온다.
 
 ### 4.2 코드 구조
 
@@ -139,18 +142,19 @@ cimon/
   Cargo.toml                 워크스페이스
   crates/
     cimon-recipe/            레시피 파싱·검증·겹치기·선택. 순수 — 네트워크·프로세스 없음
+    cimon-recipestore/       빌드 머신 안 레시피 git 저장소: 읽기·편집 커밋·반영·되돌리기·가져오기·내보내기
     cimon-store/             SQLite 작업 저장소(rusqlite), 스키마 마이그레이션
     cimon-toolchain/         카탈로그, installer 구현(archive·github-release·rustup·uv·script·base)
     cimon-workspace/         git mirror·독립 클론·warm 슬롯
     cimon-runner/            빌드 계정 토큰, Job Object, 환경 구성, 단계 실행, fixture, 사전 정리, 수집
     cimon-judge/             판정기(exit·cargo-test·junit·script), 검사(apk-signer·pe-version·script)
     cimon-mcp/               rmcp 서버 처리기, 도구 정의, task↔작업 대응
-    cimon/                   바이너리: serve · doctor · setup · token · provision · recipe check/show
+    cimon/                   바이너리: serve · doctor · setup · token · provision · recipe check/show/import/export
   examples/recipes/          형식 예시(레시피 검사기의 시험 입력)
   docs/
 ```
 
-`cimon-recipe` 를 순수하게 두는 이유: 팀원이 자기 PC 에서 `cimon recipe check <레시피 저장소 경로>` 로 레시피를 검사할 수 있어야 한다. 서비스와 같은 코드로 같은 결론을 낸다.
+`cimon-recipe` 를 순수하게 두는 이유: `recipe_edit` 이 저장 전에 돌리는 검사와, 팀원이 자기 PC 에서 내보낸 레시피에 돌리는 `cimon recipe check <경로>` 가 같은 코드로 같은 결론을 내야 한다.
 
 ---
 
@@ -164,8 +168,9 @@ D:\cimon\                          서비스      빌드
   config\cimon.toml                rw          -        설정
   config\link.key                  rw          -        산출물 링크 서명 키
   mirrors\<project>.git            rw          r        bare mirror(독립 클론의 alternates)
-  mirrors\_recipes.git             rw          r        레시피 저장소
-  recipes\<commit>\                rw          r        고정한 커밋의 레시피 저장소 체크아웃(${recipes} — 판정·검사 스크립트)
+  recipes.git                      rw          -        레시피 저장소(bare git) — 원본
+  recipes\<commit>\                rw          r        고정한 커밋의 레시피 체크아웃(${recipes} — 판정·검사 스크립트)
+  backup\                          rw          -        작업 저장소·레시피 저장소 백업(§16.4)
   ws\<project>\warm-<n>\           rw          rw       증분 빌드용 독립 클론(프로젝트당 warm_slots 개)
   ws\<project>\j<id>\              rw          rw       clean 작업용 일회 클론
   ws\<project>\<sibling>\          rw          rw       「beside」 형제 트리(§11)
@@ -206,27 +211,48 @@ D:\cimon\                          서비스      빌드
 
 ### 6.2 어디서 읽나
 
-- **중앙 레시피**(`recipe_source = "central"`, 기본): 레시피 저장소를 `mirrors\_recipes.git` 로 받아 git 에서 직접 읽는다(기본 ref `main`, 60초마다 fetch). 서비스 설치 폴더의 파일은 읽지 않는다.
+- **중앙 레시피**(`recipe_source = "central"`, 기본): 빌드 머신 안 레시피 저장소(`recipes.git`)의 `main` 에서 읽는다. 같은 머신의 git 이라 fetch 도, 묵을 일도 없다. `main` 이 움직이면(`recipe_promote`) 다음 작업부터 반영된다.
 - **프로젝트 레시피**(`recipe_source = "project"`): 빌드하는 ref 의 `.cimon/recipe.toml`. **형식은 정의하되 구현은 2단계**다 — 1단계에는 쓰는 프로젝트가 없다.
-- **시도 실행**: `recipe_ref` 가 `trial_refs`(기본 `recipe/*`)에 맞으면 그 ref 의 `recipe.toml`·include·프리셋·카탈로그로 돈다. 결과에 `trial: true`. **이미 등록된 프로젝트의 `project.toml` 은 시도 실행에서도 기본 ref 의 것을 쓴다**(원칙 7). 시도 ref 에만 있는 새 프로젝트는 `repo` 가 `cimon.toml [recipes].allowed_repo_prefixes` 에 맞을 때만 받는다.
+- **시도 실행**: `recipe_ref` 로 레시피 저장소의 `recipe/*` 브랜치를 주면 그 브랜치의 `recipe.toml`·include·프리셋·카탈로그·스크립트로 돈다. 결과에 `trial: true`. **이미 등록된 프로젝트의 `project.toml` 은 시도 실행에서도 `main` 의 것을 쓴다**(원칙 7). 시도 브랜치에만 있는 새 프로젝트는 `repo` 가 `cimon.toml [recipes].allowed_repo_prefixes` 에 맞을 때만 받는다.
 - 작업은 레시피 커밋·sha256 을 고정하고 결과에 적는다.
 
 ### 6.3 언제 검증하나
 
 | 출처 | 입력 검증 시점 | 이유 |
 |---|---|---|
-| 중앙 | **task 를 만들기 전** — 캐시된 레시피(또는 `recipe_ref` 를 fetch 한 것)로. **검증에 쓴 레시피 커밋을 작업에 고정**한다 | 모르는 단계·파라미터는 즉시 거절해야 한다. 레시피 저장소는 작아서 fetch 가 빠르다. 고정하지 않으면 대기하는 동안 단계 이름이 바뀐 레시피로 돌게 된다 |
+| 중앙 | **task 를 만들기 전** — `main`(또는 `recipe_ref` 브랜치)의 현재 커밋으로. **검증에 쓴 레시피 커밋을 작업에 고정**한다 | 모르는 단계·파라미터는 즉시 거절해야 한다. 같은 머신의 git 이라 즉시 읽힌다. 고정하지 않으면 대기하는 동안 단계 이름이 바뀐 레시피로 돌게 된다 |
 | 프로젝트(2단계) | task 를 만든 뒤 **접수 단계에서** — 프로젝트를 fetch 하고 `git show` 로 읽어서. 러너를 잡기 전이다 | 큰 저장소 fetch 를 응답 전에 하지 않는다 |
 
-레시피가 깨져 있으면 그 프로젝트의 작업만 거절되고, 다른 프로젝트는 영향받지 않는다. 거절 메시지에 파일·줄·키가 담긴다.
+`recipe_edit` 이 저장 전에 검사하므로 `main` 의 레시피가 깨질 일은 드물다. 그래도 깨져 있으면(가져오기·되돌리기 등) 그 프로젝트의 작업만 거절되고, 다른 프로젝트는 영향받지 않는다. 거절 메시지에 파일·줄·키가 담긴다.
 
-### 6.4 레시피가 묵으면 알린다
+### 6.4 레시피 편집 — MCP 도구
 
-레시피 저장소 fetch 가 조용히 실패하면(토큰 만료·네트워크) `main` 에 merge 한 변경이 반영되지 않은 채 작업이 계속 돈다.
+레시피 저장소는 외부 원격이 없으므로, 읽고 고치는 길은 cimon 의 도구뿐이다.
 
-- 마지막 fetch 성공 시각을 기록한다. 10분 넘게 실패하면 모든 결과·`statusMessage`·`/healthz` 에 「레시피가 N분 묵음 — 마지막 성공 <시각>, 커밋 <sha>」 를 싣는다.
-- `recipe_ref` 시도 실행은 그 ref 를 fetch 하지 못하면 **거절**한다(묵은 것으로 돌지 않는다).
-- `cimon doctor` 는 GitHub 토큰 만료 14일 전부터 경고한다.
+| 도구 | 하는 일 | 권한 |
+|---|---|---|
+| `recipe_show` | 파일 하나(또는 디렉터리 목록)를 브랜치·커밋 기준으로 읽는다. 겹친 결과는 `describe_project` | 팀원 |
+| `recipe_edit` | 파일 하나를 만들거나 바꾸거나 지운다. **저장 전에 그 브랜치 전체에 레시피 검사**를 돌려 통과할 때만 커밋한다 | `recipe/*` 브랜치: 팀원. `main`: 관리자 |
+| `recipe_diff` | 두 브랜치·커밋의 차이 | 팀원 |
+| `recipe_history` | 파일·브랜치의 커밋 이력(작성자·시각·메시지) | 팀원 |
+| `recipe_promote` | `recipe/*` 브랜치를 `main` 에 반영(fast-forward, 안 되면 거절하고 다시 맞추라고 알린다). 반영 전에 `main` 기준으로 다시 검사 | 관리자 |
+| `recipe_revert` | `main` 의 커밋 하나를 되돌리는 커밋을 만든다 | 관리자 |
+
+규칙:
+
+- **커밋 작성자는 토큰 사용자**다. 메시지는 필수. 감사 로그에도 남는다.
+- **동시 편집**: `recipe_edit` 은 `base`(편집자가 읽은 커밋)를 받는다. 그 브랜치가 그 사이 움직였으면 `recipe_conflict` 로 거절하고 최신 커밋을 알려 준다. 덮어쓰지 않는다.
+- **검사에 실패하면 저장하지 않는다.** 오류를 파일·줄·키로 돌려준다. 깨진 레시피가 브랜치에 들어가지 않는다.
+- 시도 브랜치는 `recipe/<설명>`. 반영되거나 30일 동안 안 쓰이면 정리기가 지운다(이력은 `main` 에 남은 것만).
+- 신뢰 수준: 시도 브랜치를 고칠 수 있는 사람은 시도 실행으로 빌드 머신에서 명령을 돌릴 수 있다 — 팀원 전체에게 그 권한이 있다는 전제다(§15.2). `main` 반영은 관리자가 diff 를 보고 한다.
+
+사람이 편집기로 고치고 싶으면:
+
+- `cimon recipe export <폴더> [--branch <b>]` — 레시피를 폴더로 꺼낸다(빌드 머신의 관리자 명령, 또는 팀원이 `recipe_show` 로 받아 로컬에 둔다).
+- 로컬에서 `cimon recipe check <폴더>`.
+- `cimon recipe import <폴더> --branch recipe/<설명> --message "…"` — 폴더 내용을 그 브랜치의 새 커밋으로(검사 후). 관리자 명령.
+
+처음 내용도 `cimon recipe import` 로 들여온다.
 
 ---
 
@@ -265,6 +291,7 @@ D:\cimon\                          서비스      빌드
 | `artifacts` | | 산출물 목록 + **새로 발급한** 다운로드 링크 |
 | `cancel_job` | | 작업 취소 — 그 작업을 따르는 모든 요청에서(§7.5) |
 | `queue` | | 접수·대기·실행 중 작업 |
+| `recipe_show` · `recipe_edit` · `recipe_diff` · `recipe_history` · `recipe_promote` · `recipe_revert` | | 레시피 저장소 읽기·편집(§6.4) |
 | `scaffold_recipe` | **●** | 저장소를 읽어 레시피 초안을 만든다(등록하지 않는다, 저장소 코드를 실행하지 않는다). **2단계** |
 
 `run` 이 기본형이고 `build`·`test` 는 고를 수 있는 종류를 좁힌 줄임이다. 툴체인 설치는 MCP 도구가 아니라 관리자 CLI `cimon provision` 이다(§10.4).
@@ -291,7 +318,7 @@ D:\cimon\                          서비스      빌드
 |---|---|---|
 | `project` | 필수 | `list_projects` 의 id |
 | `ref` | 프로젝트 `default_ref` | 브랜치 이름 또는 커밋 SHA. 허용 목록 밖이면 거절 |
-| `recipe_ref` | 레시피 저장소 기본 ref | 시도 실행(§6.2) |
+| `recipe_ref` | `main` | 레시피 저장소의 `recipe/*` 브랜치 — 시도 실행(§6.2) |
 | `steps` · `tags` | 아래 표 | 둘을 함께 주면 **합집합**(recipe-spec §14) |
 | `artifacts` | 선택된 단계의 `default = true` 산출물 | 이름 목록. `[]` 면 수집 안 함. 이름을 대면 그 생산 단계가 **도구의 후보 종류와 상관없이** 들어간다 |
 | `params` | 각 `default` | 선언된 것만. **선택된 어느 단계에도 적용되지 않는 파라미터를 명시하면 거절**한다(`param_not_applicable`) — 값이 무시된 채 결과에 적히는 것을 막는다 |
@@ -327,7 +354,7 @@ D:\cimon\                          서비스      빌드
   "commit": "3f2a91c…",
   "trial": false,
   "deduplicated": false,
-  "recipe": { "source": "central", "commit": "a1b2c3d…", "sha256": "…", "stale_minutes": 0 },
+  "recipe": { "source": "central", "ref": "main", "commit": "a1b2c3d…", "sha256": "…" },
   "workspace": { "mode": "warm", "slot": 1 },
   "params": { "backend_url": "http://192.168.0.20:8800" },
   "excluded": [],
@@ -353,7 +380,7 @@ D:\cimon\                          서비스      빌드
 
 - `toolchains` 값은 예시다. 실제 값은 작업마다 실행해서 읽은 버전이다.
 - **Claude 가 알아야 할 것은 전부 `structuredContent` 에** — 요약도 `summary` 로. Agent SDK 문서는 `structuredContent` 가 있으면 `content` 텍스트를 Claude 에 넘기지 않는다고 한다(원격 서버도 그런지는 확인 안 함). 같은 요약을 `content` 텍스트에도 싣는다.
-- 실패면 `summary` 첫 줄에 실패 분류·실패한 단계·**첫 에러 줄**, `excluded` 가 있으면 그 수, 레시피가 묵었으면 그 사실을 적는다.
+- 실패면 `summary` 첫 줄에 실패 분류·실패한 단계·**첫 에러 줄**, `excluded` 가 있으면 그 수를 적는다.
 - 산출물은 `resource_link` 블록으로도 싣는다(Claude 에게는 이름·URI 한 줄 — 자동으로 받아지지 않는다).
 
 ### 7.5 요청(task)과 작업의 대응
@@ -414,9 +441,11 @@ task 를 만들기 전에 거절하는 경우. `isError: true` 일반 결과로 
 | `unauthorized` | 토큰 없음·틀림 | (HTTP 401) |
 | `unknown_project` | | `프로젝트 "eb" 가 없다. list_projects: …` |
 | `ref_not_allowed` | 허용 목록 밖 | `"release/x" 는 허용 ref 가 아니다: main, feature/*, fix/*` |
-| `recipe_invalid` | 레시피 오류 | `recipe.toml:42: step "test-shared": unknown key "timeot_min"` |
-| `recipe_ref_unavailable` | 시도 ref 를 fetch 하지 못함 | `recipe/x 를 가져오지 못했다 — 묵은 레시피로 돌지 않는다` |
-| `trial_ref_not_allowed` | `trial_refs` 밖 | |
+| `recipe_invalid` | 레시피 오류(호출 검증, 또는 `recipe_edit` 저장 전 검사) | `recipe.toml:42: step "test-shared": unknown key "timeot_min"` |
+| `unknown_recipe_ref` | 없는 시도 브랜치 | `recipe/x 가 없다 — recipe_history 로 브랜치를 확인하라` |
+| `trial_ref_not_allowed` | `recipe/*` 밖 | |
+| `recipe_conflict` | `recipe_edit` 의 `base` 이후 브랜치가 움직임 | `recipe/x 는 그 사이 a1b2c3d 로 바뀌었다 — 다시 읽고 고쳐라` |
+| `forbidden` | 팀원이 `main` 편집·반영·되돌리기 | `main 반영은 관리자만 — recipe/* 브랜치에서 고치고 recipe_promote 를 요청하라` |
 | `unknown_step` · `wrong_kind` · `unknown_tag` · `unknown_artifact` | | `"test-shared" 는 test 단계다 — test 나 run 으로 부르라` |
 | `unknown_param` · `invalid_param` · `param_not_applicable` | | `backend_url 은 선택된 단계(package)에 적용되지 않는다 — build-apk 에만 쓰인다` |
 | `needs_unavailable` | 능력이 없는 단계를 이름으로 고름 | `"ui-test" 는 display 가 필요하다 — 이 러너에는 없다` |
@@ -826,18 +855,17 @@ CREATE TABLE warm_state (
   PRIMARY KEY (project, slot, step_id)
 );
 
-CREATE TABLE recipe_source_status (              -- 레시피가 묵었는지(§6.4)
-  ref TEXT PRIMARY KEY, last_ok_at TEXT, last_ok_commit TEXT, last_error TEXT, last_error_at TEXT
-);
-
 CREATE TABLE users (
-  name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, disabled_at TEXT
+  name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL UNIQUE,
+  role TEXT NOT NULL DEFAULT 'member',           -- member | admin — 레시피 main 반영·되돌리기는 admin(§6.4)
+  created_at TEXT NOT NULL, disabled_at TEXT
 );
 
 CREATE TABLE audit (
   id INTEGER PRIMARY KEY, at TEXT NOT NULL, user TEXT NOT NULL,
   action TEXT NOT NULL,                          -- call:<tool> | cancel | download | provision
-  job_id INTEGER, tailnet_login TEXT, detail TEXT
+                                                 -- | recipe_edit | recipe_promote | recipe_revert | recipe_import
+  job_id INTEGER, recipe_commit TEXT, tailnet_login TEXT, detail TEXT
 );
 ```
 
@@ -866,12 +894,11 @@ service = "cimon"
 build = "cimon-build"
 
 [recipes]
-repo = "https://github.com/<org>/<recipe-repo>.git"
-default_ref = "main"
-trial_refs = ["recipe/*"]
-refresh_seconds = 60
-stale_warn_minutes = 10
-allowed_repo_prefixes = ["https://github.com/<org>/"]   # 시도 ref 의 새 프로젝트가 가리킬 수 있는 저장소
+store = 'D:\cimon\recipes.git'                     # 빌드 머신 안 레시피 저장소(bare git). 외부 원격 없음
+default_branch = "main"
+trial_prefix = "recipe/"
+trial_branch_idle_days = 30                        # 반영 안 된 시도 브랜치 정리
+allowed_repo_prefixes = ["https://github.com/<org>/"]   # 시도 브랜치의 새 프로젝트가 가리킬 수 있는 저장소
 
 [runner]
 name = "cimon-01"
@@ -932,8 +959,9 @@ log_max_mb_per_step = 200
 |---|---|
 | 아무나 빌드를 건다 | 사용자별 Bearer 토큰(`cimon token create <이름>`), DB 에는 해시. 모든 호출을 감사 로그에 |
 | 허용하지 않은 저장소·브랜치를 짓는다 | `project.toml` 의 `allowed_refs`. 밖이면 즉시 거절 |
-| 브랜치·시도 ref 가 권한을 넓힌다 | 등록된 프로젝트의 `project.toml` 은 언제나 레시피 저장소 기본 ref 에서 읽는다. 시도 ref 의 새 프로젝트는 `allowed_repo_prefixes` 안의 저장소만 |
-| 레시피 저장소에 push 할 수 있는 사람 | 시도 실행 = 빌드 머신에서 명령을 돌릴 수 있는 사람이다. 레시피 저장소 쓰기 권한을 팀으로 한정, `main` 보호 |
+| 브랜치·시도 브랜치가 권한을 넓힌다 | 등록된 프로젝트의 `project.toml` 은 언제나 레시피 저장소 `main` 에서 읽는다. 시도 브랜치의 새 프로젝트는 `allowed_repo_prefixes` 안의 저장소만 |
+| 레시피를 고칠 수 있는 사람 | 레시피 = 빌드 머신에서 실행되는 명령이다. 시도 브랜치(`recipe/*`)는 팀원 누구나 고치고 시도 실행할 수 있다 — 토큰을 가진 팀원 전체를 그만큼 믿는다는 전제다. `main` 반영·되돌리기는 관리자(`users.role = admin`)만, diff 를 보고. 모든 편집은 작성자와 함께 커밋·감사 로그에 남는다 |
+| 레시피 저장소가 사라진다 | 외부 원격이 없으므로 매일 `git bundle` 백업(§16.4). 레시피 저장소는 빌드 계정이 읽지 못한다 — 체크아웃(`recipes\<commit>\`)만 읽기 전용으로 |
 | 빌드 스크립트가 cimon 을 해친다 | 빌드 계정 분리와 디렉터리 권한(§15.1) |
 | 빌드 스크립트가 다른 프로젝트를 오염시킨다 | 캐시를 프로젝트별로(`caches\<project>\`). 내려받을 때만 체크섬을 보는 패키지 캐시를 공유하면, 한 브랜치가 풀어 둔 소스를 다른 프로젝트 빌드가 그대로 쓰게 된다 |
 | 빌드 스크립트가 비밀을 훔친다 | 서명 키·릴리스 키·배포 자격 증명을 두지 않는다. 빌드 계정에는 기본적으로 GitHub 자격 증명도 없다(§11.6) |
@@ -1044,19 +1072,23 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 
 ### 16.4 관측 · 정리 · 백업
 
-- `GET /healthz` — 큐 길이, 실행 중 작업, 디스크 여유, 레시피 커밋과 묵은 시간. tailnet 주소로 열어 Tailscale 경로까지 한 번에 본다.
-- `cimon doctor` — base 툴체인, 두 계정과 권한, 디스크, git 자격 증명(만료 14일 전 경고), 레시피 검증, Tailscale(연결, `serve` 대상, Funnel 꺼짐).
+- `GET /healthz` — 큐 길이, 실행 중 작업, 디스크 여유, 레시피 `main` 커밋, 마지막 백업 시각. tailnet 주소로 열어 Tailscale 경로까지 한 번에 본다.
+- `cimon doctor` — base 툴체인, 두 계정과 권한, 디스크, GitHub 자격 증명(만료 14일 전 경고), 레시피 저장소(`git fsck` + `main` 검사), 마지막 백업이 하루를 넘겼는지, Tailscale(연결, `serve` 대상, Funnel 꺼짐).
 - 정리기(1시간마다, 그리고 디스크 하한에 닿을 때):
   1. 만료 산출물·로그·홈 삭제(작업 레코드는 `records_days` 까지)
   2. 안 쓰는 툴체인 삭제(§10.5)
   3. 프로젝트별 캐시가 `cache_max_gb_per_project` 를 넘으면 오래 안 쓴 항목부터
   4. 그래도 하한 아래면 가장 오래 안 쓴 warm 슬롯을 지운다(다음 작업은 cold)
   5. 그래도 하한 아래면 새 작업 거절(`disk_low`)
-- 백업: 하루 한 번 `VACUUM INTO 'backup\cimon-<날짜>.db'`(파일 복사가 아니라 — WAL 모드에서 복사하면 깨질 수 있다). 7개 보관.
+- 백업(하루 한 번, 각 14개 보관):
+  - 작업 저장소: `VACUUM INTO 'backup\cimon-<날짜>.db'`(파일 복사가 아니라 — WAL 모드에서 복사하면 깨질 수 있다).
+  - **레시피 저장소: `git bundle create backup\recipes-<날짜>.bundle --all`.** 외부 원격이 없으므로 이것이 유일한 사본이다. 백업 폴더는 빌드 머신 밖(사내 파일 서버 등)으로도 복사한다 — 어디로 보낼지는 확인 필요(§19.1).
+  - 복구: `cimon recipe restore <bundle>` — 번들에서 `recipes.git` 을 다시 만든다.
+  - 백업이 실패하면 `/healthz`·`doctor` 에 드러난다.
 
 ### 16.5 허브 업그레이드
 
-드레인: 새 작업을 거절하고(`draining`), 실행 중인 작업이 끝나면 멈춘다. 레시피 변경에는 필요 없다 — 레시피는 git 에서 읽는다.
+드레인: 새 작업을 거절하고(`draining`), 실행 중인 작업이 끝나면 멈춘다. 레시피 변경에는 필요 없다 — 레시피는 레시피 저장소에서 작업마다 읽는다.
 
 ---
 
@@ -1064,7 +1096,9 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 
 | 확장 | 지금 준비된 것 | 할 일 |
 |---|---|---|
-| 새 프로젝트 | 레시피·프리셋·카탈로그, 시도 실행 | 레시피 저장소에 추가 |
+| 새 프로젝트 | 레시피·프리셋·카탈로그, 시도 실행, `recipe_edit` | 레시피 저장소에 추가 |
+| 레시피 리뷰 화면 | `recipe_diff`·`recipe_history` | tailnet 안 읽기 전용 웹 화면에 diff·반영 버튼 |
+| 레시피 저장소의 외부 사본 | 평범한 git 저장소 | 원하면 사내 비공개 원격으로 단방향 push(백업 겸용). 1단계는 번들 백업만 |
 | 레시피 초안 자동 생성 | `scaffold_recipe` 도구 정의 | 구현(저장소 코드를 실행하지 않고 표지 파일만 읽는다, `allowed_repo_prefixes` 안만) |
 | 프로젝트 레시피(`recipe_source = "project"`) | 형식·검증 시점 정의 | 구현 |
 | 화면이 있는 러너 | 단계의 `needs = ["display"]`, 러너 `capabilities` | 대화형 세션에서 도는 러너 에이전트 — 레시피 변경 없이 그 단계가 돈다 |
@@ -1084,13 +1118,14 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | 단계 | 내용 | 끝났다고 보는 기준 |
 |---|---|---|
 | M0 | MCP 서버 뼈대(rmcp, `server/discover`) + 인증 + `list_projects` + Tailscale `serve` | 사무실 밖 팀원 PC 에서 tailnet 주소로 도구 목록이 보인다. tailnet 밖 기기에서는 접속이 안 된다. 토큰 없이 부르면 401. Funnel 을 켜면 서비스가 시작을 거부한다 |
-| M1 | `cimon-recipe` + `recipe check/show` + `describe_project`·`plan` | `examples/recipes/` 와 레시피 저장소가 검사를 통과한다. 오타 난 키·모르는 `after`·범위 버전·`nothing_to_run`·`param_not_applicable` 이 파일·줄과 함께 거절된다 |
+| M1 | 레시피 저장소(`recipes.git`, `recipe import/export/show`) + `cimon-recipe` + `recipe check` + `describe_project`·`plan` | 사내 레시피 폴더를 `import` 하면 `main` 커밋이 생기고 `describe_project` 가 그 커밋으로 답한다. `examples/recipes/` 와 레시피가 검사를 통과한다. 오타 난 키·모르는 `after`·범위 버전·`nothing_to_run`·`param_not_applicable` 이 파일·줄과 함께 거절되고, **검사에 실패한 폴더는 `import` 되지 않는다** |
 | M2 | 작업 저장소 + 접수/대기/실행 + 두 계정 + Job Object + task 대응(`build`·`test`·`run`) | task 로 돌고 `/tasks` 에 진행이 보인다. 5분을 넘는 작업이 끝까지 간다. 같은 요청 두 번 → 작업 하나에 task 둘, 하나를 `tasks/cancel` 해도 다른 쪽은 결과를 받는다. **빌드 단계가 `state\cimon.db`·`artifacts\` 에 쓰려 하면 실패한다.** 빌드 계정으로 띄운 예약 작업 프로세스가 작업 뒤에 남지 않는다 |
 | M3 | 툴체인 관리자 + `cimon provision` | 빈 머신에서 레시피 저장소 전 프로젝트 provision 이 끝난다. 체크섬이 틀린 파일은 설치되지 않는다. auto_approve 밖 도구가 없으면 `inconclusive`/`environment` 와 명령이 나온다 |
 | M4 | 워크스페이스(mirror·독립 클론·warm 슬롯·clean·형제) + 레시피 저장소 프로젝트 build·test | 모든 프로젝트 기본 build·test 가 `pass`. 일부러 깨뜨린 브랜치는 `fail`/`code` 와 첫 에러 줄. setup 을 중간에 취소한 뒤 다음 작업이 cold 로 시작한다. 레시피 저장소 노트의 음성 대조 시험(형제 저장소를 없애면 실패 등)이 실패한다 |
-| M5 | 산출물(사전 정리·수집·검사·HTTP) | 받은 파일 sha256 이 결과와 같다. 옛 버전이 쌓인 폴더에서도 새 것 하나만 잡힌다 |
-| M6 | fixture + `script` 판정기 + 시나리오 | 시나리오가 판정을 낸다. 관측 창을 줄이면 `inconclusive`/`unobserved`. fixture 의 서비스가 기동 중 죽으면 `fail`/`code` 와 서비스 이름. 취소해도 스택이 남지 않는다 |
-| M7 | 운영 — 정리기·드레인·doctor·감사·백업·레시피 묵음 알림 | 7일 지난 산출물이 `410`. 레시피 fetch 를 막으면 10분 뒤 결과에 묵음이 실린다. 디스크를 채우면 정리기가 먼저 돈다 |
+| M5 | 레시피 편집 도구(`recipe_edit`·`diff`·`history`·`promote`·`revert`) + 역할(member·admin) | Claude 가 `recipe/*` 브랜치에 단계를 추가하고 시도 실행한 뒤 관리자가 반영하면 다음 작업이 새 레시피로 돈다. **깨진 레시피는 저장되지 않는다**, 낡은 `base` 로 고치면 `recipe_conflict`, 팀원이 `main` 을 고치면 `forbidden` |
+| M6 | 산출물(사전 정리·수집·검사·HTTP) | 받은 파일 sha256 이 결과와 같다. 옛 버전이 쌓인 폴더에서도 새 것 하나만 잡힌다 |
+| M7 | fixture + `script` 판정기 + 시나리오 | 시나리오가 판정을 낸다. 관측 창을 줄이면 `inconclusive`/`unobserved`. fixture 의 서비스가 기동 중 죽으면 `fail`/`code` 와 서비스 이름. 취소해도 스택이 남지 않는다 |
+| M8 | 운영 — 정리기·드레인·doctor·감사·백업(작업 저장소 + 레시피 번들)·복구 | 7일 지난 산출물이 `410`. 레시피 저장소를 지우고 어제 번들로 `restore` 하면 그 시점 `main` 으로 돌아온다. 디스크를 채우면 정리기가 먼저 돈다 |
 
 ---
 
@@ -1103,6 +1138,8 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | 빌드 계정으로 자식 프로세스를 띄울 때 서비스 계정에 필요한 권한 | M2 | `CreateProcessAsUser` 의 권한 요구 |
 | `serve` 가 넘기는 Host 헤더 값 | M0 | `allowed_hosts` |
 | 빌드 계정 아웃바운드 방화벽 허용 목록 | M2 | 패키지 레지스트리 도메인 — 레시피 저장소 노트에서 모은다 |
+| 레시피 저장소 git 구현 | M1 | `git2` 크레이트(libgit2) 또는 git CLI 호출 |
+| 백업 번들을 보낼 빌드 머신 밖 위치 | 팀 | 레시피 저장소의 유일한 외부 사본이 된다 |
 | tailnet 관리자 · 요금제 인원 · tailnet 이름, 기본 규칙 유무 | 팀 | §15.3 |
 | 사무실 방화벽의 UDP(직접 연결) | 팀 | §15.3 |
 | 빌드 머신 확보 · Visual Studio 라이선스 | 팀 | §16.2 |
@@ -1122,7 +1159,9 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | 2026-10-26 | task 와 작업은 다대일, 취소는 task 단위로 뗀다 | 병합이 다른 사람의 작업을 대신 취소하게 만들지 않기 위해 |
 | 2026-10-26 | 시작 전 작업은 기본 유지, 안전판은 12시간·사용자당 5개 | 결과는 서버가 갖는다(원칙 5) |
 | 2026-10-26 | 한 작업 안의 단계는 차례로, warm 슬롯은 프로젝트당 기본 1 | 1단계 단순함 |
-| 2026-10-26 | **서비스 저장소와 레시피 저장소를 나눈다** | 원격 빌드 서비스는 프로젝트를 몰라야 한다. 프로젝트 정보(고객사 포함)는 사내 레시피 저장소에만 |
+| 2026-10-26 | **서비스 저장소와 레시피 저장소를 나눈다** | 원격 빌드 서비스는 프로젝트를 몰라야 한다. 프로젝트 정보(고객사 포함)는 레시피 저장소에만 |
+| 2026-10-26 | **레시피 저장소는 빌드 머신 안의 git, 편집은 MCP 도구** — GitHub 등 외부 저장소에 올리지 않는다 | 저장소를 하나 더 관리하지 않는다. git 이라 버전 고정·시도 브랜치·이력은 그대로. 대가: PR 리뷰 화면이 없고(`recipe_diff` 로 대신), 유일한 사본이라 번들 백업이 필수 |
+| 2026-10-26 | 레시피 `main` 반영·되돌리기는 관리자만, 시도 브랜치는 팀원 누구나 | 레시피 = 빌드 머신 명령. 이전의 「저장소 push 권한 + main 보호」 와 같은 신뢰 수준 |
 | 2026-10-26 | 프로젝트별 결과 판정은 `script` 판정기로 레시피 저장소에 | 특정 프로젝트의 결과 형식을 아는 코드를 서비스에 넣지 않는다 |
 | 2026-10-26 | 빌드 계정 분리 | 빌드 스크립트가 서비스 상태·다른 작업의 산출물을 바꾸지 못하게 |
 | 2026-10-26 | 실패 분류(`failure_class`) | 「다시 돌릴까」 와 「코드를 고칠까」 를 사람이 추측하지 않게 |
