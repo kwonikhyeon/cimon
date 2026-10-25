@@ -33,6 +33,21 @@ enum Command {
         #[command(subcommand)]
         action: UserCmd,
     },
+    /// Install toolchains that auto-approve does not (design §10.4).
+    Provision {
+        /// Every toolchain of this project (including optional ones).
+        project: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        version: Option<String>,
+        /// Install from this trial branch's catalog entry, after reviewing it.
+        #[arg(long = "recipe-ref")]
+        recipe_ref: Option<String>,
+        /// Recorded in the audit log.
+        #[arg(long, default_value_t = whoami())]
+        admin: String,
+    },
     #[command(name = "__exec", hide = true)]
     Exec { spec: PathBuf },
     #[command(name = "__sweep", hide = true)]
@@ -70,6 +85,10 @@ enum UserCmd {
         #[arg(value_parser = ["admin", "member"])]
         role: String,
     },
+}
+
+fn whoami() -> String {
+    std::env::var("USERNAME").unwrap_or_else(|_| "admin".into())
 }
 
 pub fn config_path(cli: &Option<PathBuf>) -> PathBuf {
@@ -121,6 +140,18 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Provision { project, kind, version, recipe_ref, admin } => {
+            let cfg = load_config(&cli.config)?;
+            let app = cimon_engine::App::open(cfg)?;
+            let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, admin })
+                .map_err(|e| anyhow::anyhow!(e))?;
+            let mut failed = false;
+            for l in &lines {
+                println!("{}	{}	{}", l.kind, l.version, l.outcome);
+                failed |= !l.ok;
+            }
+            std::process::exit(if failed { 1 } else { 0 });
         }
         Command::Exec { spec } => std::process::exit(cimon_runner::exec::child_exec_main(&spec)),
         Command::Sweep => std::process::exit(cimon_runner::sweep_main()),

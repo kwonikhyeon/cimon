@@ -266,3 +266,99 @@ pub fn new_executables(ctx: &JobCtx<'_>) -> Vec<String> {
     }
     out
 }
+
+/// One line of `cimon provision` output.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProvisionLine {
+    pub kind: String,
+    pub version: String,
+    pub outcome: String,
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProvisionArgs {
+    pub project: Option<String>,
+    pub kind: Option<String>,
+    pub version: Option<String>,
+    /// Install from a trial branch's catalog entry after review (design §10.4).
+    pub recipe_ref: Option<String>,
+    pub admin: String,
+}
+
+/// `cimon provision` (design §10.4): installs what auto-approve does not, from
+/// `main`'s catalog — or, with `--recipe-ref`, from a reviewed trial entry.
+pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, String> {
+    let main = app.recipes.require_main().map_err(|e| e.to_string())?;
+    let source_ref = a.recipe_ref.clone().unwrap_or_else(|| app.config.recipes.default_branch.clone());
+    let commit = app.recipes.resolve(&source_ref).map_err(|e| e.to_string())?;
+    let tree = app.recipes.tree(&commit).map_err(|e| e.to_string())?;
+    let cat = Catalog::parse(tree.read_str_or_empty("toolchains.toml"))?;
+    let _ = main;
+    // (kind, version, requirement)
+    let mut wanted: Vec<(String, String, cimon_recipe::model::ToolchainReq)> = vec![];
+    match (&a.project, &a.kind) {
+        (Some(p), kind) => {
+            let r = cimon_recipe::resolve_project(&*tree, p).map_err(|d| d.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("; "))?;
+            for (k, req) in &r.toolchains {
+                if kind.as_ref().is_some_and(|x| x != k) {
+                    continue;
+                }
+                let version = match (&req.version, &req.version_file) {
+                    (Some(v), _) => v.clone(),
+                    (None, Some(f)) => {
+                        let m = cimon_workspace::Mirror::fetch(&app.layout.mirror(p), &r.project.repo).map_err(|e| format!("fetching {p}: {e}"))?;
+                        let c = m.branch(&r.project.default_ref).ok_or_else(|| format!("{p}: {} not found", r.project.default_ref))?;
+                        let bytes = m.show(&c, f).ok_or_else(|| format!("{p}: {f} not found on {}", r.project.default_ref))?;
+                        crate::jobs::channel_of(&bytes)?
+                    }
+                    (None, None) => String::new(),
+                };
+                wanted.push((k.clone(), version, req.clone()));
+            }
+        }
+        (None, Some(k)) => {
+            let v = a.version.clone().ok_or("--kind needs --version (or give a project)")?;
+            wanted.push((k.clone(), v, Default::default()));
+        }
+        (None, None) => return Err("give a project, or --kind with --version".into()),
+    }
+    let mut out = vec![];
+    for (kind, version, req) in wanted {
+        let Some(def) = cat.kinds.get(&kind) else {
+            out.push(ProvisionLine { kind: kind.clone(), version, outcome: "not in the catalog".into(), ok: false });
+            continue;
+        };
+        if def.is_base() {
+            let line = match cimon_toolchain::base::check(app_base(app), &kind, def, &req) {
+                Ok(f) => ProvisionLine { kind, version: f.version, outcome: "base — present".into(), ok: true },
+                Err(e) => ProvisionLine { kind, version, outcome: format!("base — MISSING: {e}{}", def.hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default()), ok: false },
+            };
+            out.push(line);
+            continue;
+        }
+        let entry = cat.hash(&kind).unwrap_or_default().to_string();
+        let vkey = cimon_toolchain::version_key(def, &version, &req);
+        if app.store.install(&kind, &vkey, &entry).ok().flatten().is_some_and(|i| std::path::Path::new(&i.root).exists()) {
+            out.push(ProvisionLine { kind, version: vkey, outcome: "already installed".into(), ok: true });
+            continue;
+        }
+        let mut ctx = installer_ctx(app);
+        ctx.installed_by = a.admin.clone();
+        match cimon_toolchain::install(&ctx, &kind, def, &entry, &version, &req, &source_ref) {
+            Ok(inst) => {
+                let _ = app.store.upsert_install(&inst);
+                let _ = app.store.audit(cimon_store::AuditEntry {
+                    user: &a.admin,
+                    action: "provision",
+                    recipe_commit: Some(&commit),
+                    detail: Some(format!("{kind} {vkey} from {source_ref} ({})", &entry[..8.min(entry.len())])),
+                    ..Default::default()
+                });
+                out.push(ProvisionLine { kind, version: vkey, outcome: format!("installed from {source_ref}"), ok: true });
+            }
+            Err(e) => out.push(ProvisionLine { kind, version: vkey, outcome: format!("FAILED: {}", e.message), ok: false }),
+        }
+    }
+    Ok(out)
+}

@@ -401,6 +401,11 @@ fn read_version_file(mirror: &Mirror, commit: &str, path: &str, tracked: &[Strin
     Ok(v)
 }
 
+/// The channel of a `rust-toolchain.toml` / `rust-toolchain` file.
+pub fn channel_of(bytes: &[u8]) -> Result<String, String> {
+    parse_toolchain_channel(bytes)
+}
+
 fn parse_toolchain_channel(bytes: &[u8]) -> Result<String, String> {
     let text = String::from_utf8_lossy(bytes);
     if text.lines().any(|l| l.trim_start().starts_with('[')) {
