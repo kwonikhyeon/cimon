@@ -269,6 +269,17 @@ fn daily_backups(app: &App) {
             let lock = app.engine.mirror_lock(&key);
             let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(m) = cimon_workspace::Mirror::open(&e.path()) {
+                // keep refs of jobs that are gone or finished (an intake that failed
+                // between pinning a sibling and recording it) would protect commits forever
+                for k in m.keeps() {
+                    let id = k.strip_prefix('j').and_then(|r| r.trim_end_matches("-sibling").parse::<i64>().ok());
+                    if let Some(id) = id {
+                        let live = app.store.job(id).ok().flatten().is_some_and(|j| !j.state.is_terminal());
+                        if !live {
+                            m.unkeep(&k);
+                        }
+                    }
+                }
                 let stamp = e.path().join("cimon-last-gc");
                 let fresh = std::fs::metadata(&stamp).ok().and_then(|m| m.modified().ok()).is_some_and(|m| m.elapsed().map(|d| d.as_secs() < 86400).unwrap_or(true));
                 if !fresh {

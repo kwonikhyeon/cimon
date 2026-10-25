@@ -147,13 +147,25 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
                 // only needs-excluded steps changed — reported as untestable above
                 continue;
             }
-            // setup runs in every job, so with only setup changed any trial at head covers it
-            let covers = |j: &&cimon_store::JobRow| {
-                let plan: Option<crate::jobs::JobPlan> = j.plan_json.as_deref().and_then(|s| serde_json::from_str(s).ok());
-                plan.is_some_and(|pl| runnable.iter().all(|s| pl.plan.runs(s)))
-            };
+            let changed_setup: Vec<&String> = required.iter().filter(|s| step_of(s).is_some_and(|st| st.kind == cimon_recipe::Kind::Setup)).collect();
+            let plan_of = |j: &cimon_store::JobRow| -> Option<crate::jobs::JobPlan> { j.plan_json.as_deref().and_then(|s| serde_json::from_str(s).ok()) };
             let jobs = app.store.trial_jobs(&pd.id, &p.branch, head).unwrap_or_default();
-            let covering: Vec<&cimon_store::JobRow> = jobs.iter().filter(covers).collect();
+            // every trial at head that ran any changed step (setup runs in all of them)
+            // counts for failures — a later, wider run that passes does not cover it
+            let relevant: Vec<&cimon_store::JobRow> = jobs
+                .iter()
+                .filter(|j| setup_changed || plan_of(j).is_some_and(|pl| runnable.iter().any(|s| pl.plan.runs(s))))
+                .collect();
+            // a covering trial ran every changed step, and a changed setup really ran
+            // (not "skipped" because a warm slot matched)
+            let setup_ran = |j: &cimon_store::JobRow| {
+                changed_setup.is_empty() || app.store.steps(j.id).is_ok_and(|ss| changed_setup.iter().all(|sid| ss.iter().any(|s| &s.step_id == *sid && s.result == "pass")))
+            };
+            let covering: Vec<&cimon_store::JobRow> = relevant
+                .iter()
+                .copied()
+                .filter(|j| plan_of(j).is_some_and(|pl| runnable.iter().all(|s| pl.plan.runs(s))) && setup_ran(j))
+                .collect();
             let what = if runnable.is_empty() { "setup".to_string() } else { runnable.join(", ") };
             match covering.first() {
                 None => missing.push(format!(
@@ -166,7 +178,7 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
                 )),
                 Some(latest) => {
                     // any failure at this head counts — a passing retry does not cover it
-                    let failed = covering.iter().find(|j| j.verdict.as_deref() != Some("pass"));
+                    let failed = relevant.iter().find(|j| j.verdict.as_deref() != Some("pass"));
                     match failed {
                         Some(f) if app.config.review.trial_must_pass => missing.push(format!(
                             "{}: head {} 의 시도 {} 가 {}({}) — 재시도로 덮을 수 없다, 고치고 새 head 로",

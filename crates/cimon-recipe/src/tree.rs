@@ -135,6 +135,10 @@ fn portable_component(c: &str) -> bool {
     if c.ends_with('.') || c.ends_with(' ') {
         return false;
     }
+    // `run_te~1.ps1` can be the 8.3 short name of `run_tests.ps1` on NTFS
+    if c.as_bytes().windows(2).any(|w| w[0] == b'~' && w[1].is_ascii_digit()) {
+        return false;
+    }
     if c.chars().any(|ch| (ch as u32) < 0x20 || matches!(ch, '<' | '>' | '"' | '|' | '?' | '*')) {
         return false;
     }
@@ -201,6 +205,8 @@ mod tests {
         assert!(!is_safe_rel("a?b"));
         assert!(is_safe_rel("scripts/console.py"));
         assert!(is_safe_rel("com10/x"));
+        assert!(!is_safe_rel("scripts/run_te~1.ps1"));
+        assert!(is_safe_rel("scripts/a~b.ps1"));
     }
 
     #[test]

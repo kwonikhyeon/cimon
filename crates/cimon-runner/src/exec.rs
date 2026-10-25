@@ -183,6 +183,8 @@ const LINE_LIMIT: usize = 1 << 20;
 fn decode(raw: &[u8]) -> String {
     match std::str::from_utf8(raw) {
         Ok(s) => s.to_string(),
+        // only cut short at the end (a long line cut for matching): still UTF-8
+        Err(e) if e.error_len().is_none() => String::from_utf8_lossy(raw).into_owned(),
         Err(_) => {
             #[cfg(windows)]
             if let Some(s) = crate::win::decode_oem(raw) {
@@ -241,15 +243,28 @@ fn join_pumps(pumps: Vec<std::thread::JoinHandle<()>>) {
     while pumps.iter().any(|p| !p.is_finished()) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
+    // CancelSynchronousIo only hits a read in progress: keep cancelling until the
+    // pumps are out (bounded), then join whatever finished
     #[cfg(windows)]
-    for p in &pumps {
-        if !p.is_finished() {
-            use std::os::windows::io::AsRawHandle;
-            crate::win::cancel_thread_io(p.as_raw_handle() as _);
+    {
+        let until = Instant::now() + Duration::from_secs(5);
+        while pumps.iter().any(|p| !p.is_finished()) && Instant::now() < until {
+            for p in &pumps {
+                if !p.is_finished() {
+                    use std::os::windows::io::AsRawHandle;
+                    crate::win::cancel_thread_io(p.as_raw_handle() as _);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
         }
     }
     for p in pumps {
-        let _ = p.join();
+        if p.is_finished() {
+            let _ = p.join();
+        } else {
+            // still blocked: leave the thread (it holds only its pipe) rather than hang
+            tracing::warn!("an output reader did not stop — a pipe write end leaked into another process");
+        }
     }
 }
 

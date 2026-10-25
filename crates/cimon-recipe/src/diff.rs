@@ -141,7 +141,7 @@ pub fn semantic_diff(old: &dyn Tree, new: &dyn Tree) -> SemanticDiff {
     }
 
     let ids: BTreeSet<String> = old.project_ids().into_iter().chain(new.project_ids()).collect();
-    let indirect = unattributed_files(old, new, &ids, &out.files);
+    let changed_files = out.files.clone();
     for id in ids {
         let o = resolve_project(old, &id).ok();
         let n = resolve_project(new, &id);
@@ -171,7 +171,7 @@ pub fn semantic_diff(old: &dyn Tree, new: &dyn Tree) -> SemanticDiff {
                 continue;
             }
         };
-        diff_project(old, new, o.as_ref(), &n, &changed_kinds, &indirect, &mut pd);
+        diff_project(old, new, o.as_ref(), &n, &changed_kinds, &changed_files, &mut pd);
         let pt = format!("projects/{id}/project.toml");
         if in_old && old.read(&pt) != new.read(&pt) {
             match (parse_project(old, &id), parse_project(new, &id)) {
@@ -215,31 +215,6 @@ fn touches(files: &[String], id: &str, _r: Option<&Resolved>) -> bool {
     files.iter().any(|f| f.starts_with(&format!("projects/{id}/")))
 }
 
-/// Changed files no recipe reads directly: not the catalog, a preset, a project's own
-/// recipe files, or a file a `${recipes}` reference reaches. A referenced script can
-/// still load them (a helper module), so they count against the projects that could
-/// reach them. Markdown is documentation and is left out.
-fn unattributed_files(old: &dyn Tree, new: &dyn Tree, ids: &BTreeSet<String>, changed: &[String]) -> Vec<String> {
-    let mut attributed: BTreeSet<String> = BTreeSet::new();
-    attributed.insert("toolchains.toml".into());
-    for tree in [old, new] {
-        for id in ids {
-            if let Ok(r) = resolve_project(tree, id) {
-                attributed.extend(r.files.iter().cloned());
-                for (_, rr) in project_refs(&r) {
-                    attributed.extend(ref_files(old, &rr));
-                    attributed.extend(ref_files(new, &rr));
-                }
-            }
-        }
-    }
-    changed
-        .iter()
-        .filter(|f| !attributed.contains(*f) && !f.starts_with("presets/") && !f.to_ascii_lowercase().ends_with(".md"))
-        .cloned()
-        .collect()
-}
-
 /// Did any file a reference reaches change between the trees?
 fn ref_changed(old: &dyn Tree, new: &dyn Tree, r: &RecipeRef) -> bool {
     let files: BTreeSet<String> = ref_files(old, r).into_iter().chain(ref_files(new, r)).collect();
@@ -255,18 +230,33 @@ fn ref_label(r: &RecipeRef) -> String {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolved, changed_kinds: &BTreeSet<String>, indirect: &[String], pd: &mut ProjectDiff) {
+fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolved, changed_kinds: &BTreeSet<String>, changed: &[String], pd: &mut ProjectDiff) {
     let empty_steps = vec![];
     let old_steps = o.map(|r| &r.steps).unwrap_or(&empty_steps);
     let mut changed_steps: BTreeSet<String> = BTreeSet::new();
     let new_refs = project_refs(n);
     let old_refs = o.map(project_refs).unwrap_or_default();
-    // indirect changes reach this project when it references anything at all
+    // Changed files this project does not read directly — not its recipe files, not a
+    // file its own references reach — but that a script it runs can still load (a
+    // helper module). Decided per project: another project naming the same file does
+    // not make it "seen" here. Other projects' directories, presets, the catalog and
+    // Markdown are left out.
     let own_dir = format!("projects/{}/", n.id);
+    let mut direct: BTreeSet<String> = n.files.iter().cloned().collect();
+    direct.extend(o.map(|r| r.files.clone()).unwrap_or_default());
+    for (_, rr) in new_refs.iter().chain(old_refs.iter()) {
+        direct.extend(ref_files(old, rr));
+        direct.extend(ref_files(new, rr));
+    }
     let reaching: Vec<&String> = if new_refs.is_empty() {
         vec![]
     } else {
-        indirect.iter().filter(|f| f.starts_with(&own_dir) || !f.starts_with("projects/")).collect()
+        changed
+            .iter()
+            .filter(|f| !direct.contains(*f))
+            .filter(|f| f.starts_with(&own_dir) || !f.starts_with("projects/"))
+            .filter(|f| !f.starts_with("presets/") && f.as_str() != "toolchains.toml" && !f.to_ascii_lowercase().ends_with(".md"))
+            .collect()
     };
 
     // settings
@@ -635,6 +625,14 @@ mod tests {
         let mut new = old.clone();
         new.insert("scripts/README.md", "docs");
         assert!(semantic_diff(&old, &new).projects.is_empty());
+        // another project naming the helper directly does not hide it from b
+        let mut old2 = old.clone();
+        old2.insert("projects/a/recipe.toml", "schema = 1\n[toolchains]\nnode = { version = \"1.2.3\" }\n[[step]]\nid = \"t\"\nkind = \"test\"\nrun = [\"python\", \"${recipes}/scripts/lib.py\"]\nuncounted = true\n");
+        let mut new2 = old2.clone();
+        new2.insert("scripts/lib.py", "2");
+        let d = semantic_diff(&old2, &new2);
+        assert!(step_of(&d, "b", "b1").is_some(), "b still affected: {d:?}");
+        assert!(step_of(&d, "a", "t").is_some(), "a affected directly");
     }
 
     #[test]

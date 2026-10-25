@@ -246,7 +246,12 @@ fn run_argv(ctx: &JobCtx<'_>, name: &str, what: &str, argv: &[String], timeout: 
     let out_dir = ctx.app.layout.step_out(ctx.job.id, &format!("fixture-{name}"));
     let _ = std::fs::create_dir_all(&out_dir);
     if let Some(user) = &ctx.build_user {
-        cimon_runner::grant_modify(&out_dir, user)?;
+        // teardown must run even if the grant fails — the fixture would outlive the job
+        if let Err(e) = cimon_runner::grant_modify(&out_dir, user) {
+            if !cleanup {
+                return Err(e);
+            }
+        }
     }
     let lookup = ctx.lookup("fixture", &out_dir);
     let argv: Vec<String> = argv.iter().map(|a| cimon_recipe::vars::expand(a, &lookup)).collect::<Result<_, _>>()?;

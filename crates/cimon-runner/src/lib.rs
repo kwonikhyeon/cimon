@@ -40,9 +40,21 @@ pub const USER_VARS: &[&str] = &["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALA
 /// Sets `key` in an environment map the way Windows sees it: names are compared
 /// without case, so a later layer's `npm_config_cache` replaces an earlier
 /// `NPM_CONFIG_CACHE` instead of both reaching the child in byte order.
+/// The spelling already in the map is kept (`PATH` stays `PATH` when a recipe writes
+/// `Path`), because the runner itself looks keys up by their usual spelling.
 pub fn env_set(env: &mut BTreeMap<String, String>, key: &str, value: String) {
-    env.retain(|k, _| !k.eq_ignore_ascii_case(key));
-    env.insert(key.to_string(), value);
+    let existing: Vec<String> = env.keys().filter(|k| k.eq_ignore_ascii_case(key)).cloned().collect();
+    match existing.split_first() {
+        Some((keep, extra)) => {
+            for k in extra {
+                env.remove(k);
+            }
+            env.insert(keep.clone(), value);
+        }
+        None => {
+            env.insert(key.to_string(), value);
+        }
+    }
 }
 
 /// Layers 1–2 plus the system part of PATH.
@@ -53,9 +65,6 @@ pub fn base_env(profile_dir: Option<&Path>, user_name: Option<&str>) -> BTreeMap
             env.insert(k.to_string(), v);
         }
     }
-    // cmd and CreateProcess look in the current directory first; with this set a
-    // script calling `cargo` cannot pick up a cargo.exe committed to the work tree
-    env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
     // English tool messages, so error patterns match (a recipe's [env] may override)
     env.insert("VSLANG".into(), "1033".into());
     env.insert("DOTNET_CLI_UI_LANGUAGE".into(), "en".into());
@@ -231,15 +240,20 @@ fn sweep_processes(rep: &mut SweepReport) {
             return;
         }
     };
-    // spare this process and its ancestors (the __exec helper that started it)
+    // spare this process and its build-account ancestors (the __exec helper); the walk
+    // stops at the first ancestor of another user, so a reused parent id cannot spare
+    // an unrelated process
     let parent: std::collections::HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.parent)).collect();
     let mut spare = std::collections::HashSet::new();
     let mut cur = std::process::id();
-    while cur != 0 && spare.insert(cur) {
+    while cur != 0 && (cur == std::process::id() || win::owned_by(cur, &sid)) && spare.insert(cur) {
         cur = parent.get(&cur).copied().unwrap_or(0);
     }
+    // the console host of a spared process goes with it
+    let consoles: Vec<u32> = procs.iter().filter(|p| p.name.eq_ignore_ascii_case("conhost.exe") && spare.contains(&p.parent)).map(|p| p.pid).collect();
+    spare.extend(consoles);
     for p in &procs {
-        if p.pid == 0 || spare.contains(&p.pid) || matches!(p.name.to_lowercase().as_str(), "conhost.exe" | "dllhost.exe" | "sihost.exe" | "taskhostw.exe") {
+        if p.pid == 0 || spare.contains(&p.pid) {
             continue;
         }
         match win::terminate_if_owned(p.pid, &sid) {
@@ -338,6 +352,61 @@ pub fn open_within(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
+/// The first link, junction or other reparse point under `dir` (not following any).
+pub fn find_reparse_point(dir: &Path) -> Option<PathBuf> {
+    fn walk(d: &Path) -> Option<PathBuf> {
+        for e in std::fs::read_dir(d).ok()?.flatten() {
+            let p = e.path();
+            let m = std::fs::symlink_metadata(&p).ok()?;
+            if is_reparse(&m) {
+                return Some(p);
+            }
+            if m.is_dir() {
+                if let Some(x) = walk(&p) {
+                    return Some(x);
+                }
+            }
+        }
+        None
+    }
+    walk(dir)
+}
+
+fn is_reparse(m: &std::fs::Metadata) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return true;
+        }
+    }
+    m.file_type().is_symlink()
+}
+
+/// Copies `src` to a new `dst` as plain directories and files written by this process,
+/// refusing any reparse point (link, junction) on the way.
+pub fn copy_tree_no_links(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
+    for e in std::fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))? {
+        let e = e.map_err(|e| e.to_string())?;
+        let from = e.path();
+        let m = std::fs::symlink_metadata(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+        if is_reparse(&m) {
+            return Err(format!("{} is a link or junction — refused", from.display()));
+        }
+        let to = dst.join(e.file_name());
+        if m.is_dir() {
+            copy_tree_no_links(&from, &to)?;
+        } else if m.is_file() {
+            let mut r = std::fs::File::open(&from).map_err(|e| format!("{}: {e}", from.display()))?;
+            let mut w = std::fs::File::create(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+            std::io::copy(&mut r, &mut w).map_err(|e| format!("{}: {e}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
 /// Gives `user` modify rights on `dir` and below (a step's `${step.out}` in the logs
 /// tree, which is otherwise service-only).
 pub fn grant_modify(dir: &Path, user: &str) -> Result<(), String> {
@@ -374,6 +443,35 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_set_keeps_spelling_and_copy_refuses_junctions() {
+        let mut env = BTreeMap::new();
+        env.insert("PATH".to_string(), "a".to_string());
+        env_set(&mut env, "Path", "b".into());
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.get("PATH").map(|s| s.as_str()), Some("b"));
+        env_set(&mut env, "TEMP", "t".into());
+        assert_eq!(env.get("TEMP").map(|s| s.as_str()), Some("t"));
+
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("src");
+        std::fs::create_dir_all(src.join("bin")).unwrap();
+        std::fs::write(src.join("bin/tool.exe"), "x").unwrap();
+        copy_tree_no_links(&src, &d.path().join("dst")).unwrap();
+        assert!(d.path().join("dst/bin/tool.exe").is_file());
+        assert!(find_reparse_point(&src).is_none());
+        #[cfg(windows)]
+        {
+            let outside = d.path().join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            let ok = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(src.join("j")).arg(&outside).output().map(|o| o.status.success()).unwrap_or(false);
+            if ok {
+                assert!(find_reparse_point(&src).is_some());
+                assert!(copy_tree_no_links(&src, &d.path().join("dst2")).is_err());
+            }
+        }
+    }
 
     #[test]
     fn open_within_refuses_links_out() {

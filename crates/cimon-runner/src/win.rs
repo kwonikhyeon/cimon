@@ -2,7 +2,7 @@
 //! and profile, DPAPI for the stored build-account password.
 
 #![cfg(windows)]
-#![allow(clippy::missing_safety_doc)]
+#![allow(clippy::missing_safety_doc, clippy::not_unsafe_ptr_arg_deref)] // HANDLEs are opaque kernel handles, never dereferenced
 
 use std::ffi::OsStr;
 use std::os::windows::ffi::OsStrExt;
@@ -461,6 +461,25 @@ pub fn current_user_sid() -> Option<Vec<u8>> {
         }
         let tok = Handle(tok);
         token_user_sid(tok.0)
+    }
+}
+
+/// Does `pid` run as `sid`?
+pub fn owned_by(pid: u32, sid: &[u8]) -> bool {
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return false;
+        }
+        let h = Handle(h);
+        let mut tok: HANDLE = null_mut();
+        if OpenProcessToken(h.0, TOKEN_QUERY, &mut tok) == 0 {
+            return false;
+        }
+        let tok = Handle(tok);
+        token_user_sid(tok.0).as_deref() == Some(sid)
     }
 }
 

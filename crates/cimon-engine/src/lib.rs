@@ -39,9 +39,7 @@ pub struct Engine {
     pub janitor: Notify,
     /// One lock per mirror: intake fetches/reads and GC never overlap.
     pub mirror_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// Held while anything runs as the build account (a job on the runner, an install
-    /// script or probe during intake): a job's start/end sweep terminates every
-    /// build-account process, so the two must not overlap.
+    /// In-process half of [`App::build_guard`].
     pub build_lock: Mutex<()>,
 }
 
@@ -49,6 +47,12 @@ impl Engine {
     pub fn mirror_lock(&self, key: &str) -> Arc<Mutex<()>> {
         self.mirror_locks.lock().unwrap().entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
     }
+}
+
+/// See [`App::build_guard`].
+pub struct BuildGuard<'a> {
+    _local: std::sync::MutexGuard<'a, ()>,
+    _file: Option<std::fs::File>,
 }
 
 pub struct App {
@@ -78,6 +82,44 @@ impl App {
             build_lock: Mutex::new(()),
         };
         Ok(Arc::new(App { config, layout, store, recipes, engine }))
+    }
+
+    /// Held around a job's sweep (which terminates every build-account process) and
+    /// around an install script or probe run as the build account, so a sweep never
+    /// kills an install. It spans processes — `cimon provision` runs beside the service
+    /// — through an exclusively opened file in `state\`. None in single-account mode,
+    /// where there is no sweep.
+    pub fn build_guard(&self) -> Option<BuildGuard<'_>> {
+        if self.config.accounts.single_account() {
+            return None;
+        }
+        let local = self.engine.build_lock.lock().unwrap_or_else(|p| p.into_inner());
+        let path = self.layout.state_dir().join("build-account.lock");
+        let mut warned = false;
+        loop {
+            let mut o = std::fs::OpenOptions::new();
+            o.write(true).create(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                o.share_mode(0);
+            }
+            match o.open(&path) {
+                Ok(f) => return Some(BuildGuard { _local: local, _file: Some(f) }),
+                // ERROR_SHARING_VIOLATION: the other process holds it
+                Err(e) if e.raw_os_error() == Some(32) => {
+                    if !warned {
+                        tracing::info!("waiting for the build-account lock ({})", path.display());
+                        warned = true;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+                Err(e) => {
+                    tracing::error!("build-account lock {}: {e} — continuing with the in-process lock only", path.display());
+                    return Some(BuildGuard { _local: local, _file: None });
+                }
+            }
+        }
     }
 
     pub fn build_account(&self) -> Option<Arc<cimon_runner::BuildAccount>> {

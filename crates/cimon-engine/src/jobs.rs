@@ -313,6 +313,11 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     if let Err(e) = mirror.keep(&format!("j{id}"), &commit) {
         return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "git_error", &format!("keep ref: {e}"));
     }
+    // a cancel or timeout that finished the job meanwhile would leave the ref behind
+    if abandon_if_unwanted(app, id) {
+        mirror.unkeep(&format!("j{id}"));
+        return;
+    }
 
     // siblings (from main's registration)
     let mut siblings = vec![];
@@ -610,6 +615,15 @@ pub fn tick(app: &App) {
 /// Restart recovery (design §8.4).
 pub fn recover(app: &App) -> Vec<String> {
     let mut notes = vec![];
+    // a cancel requested before the restart is honoured first (intake would otherwise
+    // refuse to move the job and leave it to the queue timeout)
+    if let Ok(jobs) = app.store.jobs_in_states(PRE_START) {
+        for j in jobs.into_iter().filter(|j| j.cancel_requested_by.is_some()) {
+            let by = j.cancel_requested_by.clone().unwrap_or_default();
+            finish_simple_if(app, j.id, Some(PRE_START), JobState::Cancelled, None, None, None, &format!("{by} 가 취소함(서비스 재시작 뒤)"));
+            notes.push(format!("{} cancelled (requested before the restart)", job_label(j.id)));
+        }
+    }
     if let Ok(jobs) = app.store.jobs_in_states(&[JobState::Running, JobState::Collecting, JobState::Cancelling]) {
         for j in jobs {
             if let Some(slot) = j.workspace_slot {

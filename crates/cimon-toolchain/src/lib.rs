@@ -194,15 +194,12 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
                 }
                 let ps = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
                 // the script runs as the build account and writes {root}: write access to
-                // this install's staging dir only, taken back before the probe
+                // this install's staging dir only. Its output is never moved into place —
+                // the service copies it (below), so the toolchain is owned by the service
                 if let Some(a) = &ctx.account {
                     cimon_runner::grant_modify(&staging, &a.name).map_err(err)?;
                 }
-                let r = run_build(ctx, &ps, &args, &staging, BTreeMap::new(), Duration::from_secs(1800));
-                if build_mode {
-                    cimon_runner::reset_acl(&staging).map_err(err)?;
-                }
-                r?;
+                run_build(ctx, &ps, &args, &staging, BTreeMap::new(), Duration::from_secs(1800))?;
             }
             other => return Err(err(format!("unknown installer {other}"))),
         }
@@ -217,6 +214,37 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
     };
     if let Err(e) = res {
         return Err(fail(e));
+    }
+    // What a script wrote as the build account stays the build account's (an owner can
+    // rewrite its ACL), and it may hold links or junctions. The service copies it into
+    // the final folder — copies it owns, inheriting the read-only grant — refusing any
+    // reparse point, and probes the copy.
+    if def.installer == "script" && build_mode {
+        if final_dir.exists() {
+            remove_dir(&final_dir).map_err(|e| fail(err(format!("{}: {e}", final_dir.display()))))?;
+        }
+        if let Err(e) = cimon_runner::copy_tree_no_links(&root, &final_dir) {
+            let _ = remove_dir(&final_dir);
+            return Err(fail(err(format!("{e} — not installed"))));
+        }
+        let lay = layout_of(ctx, kind, def, version, &final_dir, req);
+        if let Err(e) = probe(ctx, def, version, &final_dir, &lay) {
+            let _ = remove_dir(&final_dir);
+            return Err(fail(e));
+        }
+        let _ = remove_dir(&staging);
+        let t = now();
+        return Ok(ToolchainInstall {
+            kind: kind.into(),
+            version: vkey,
+            entry_sha256: entry.into(),
+            root: final_dir.to_string_lossy().into(),
+            checksum,
+            source_ref: Some(source_ref.into()),
+            installed_by: ctx.installed_by.clone(),
+            installed_at: t.clone(),
+            last_used_at: t,
+        });
     }
     // probe before it is used (as the build account)
     let lay = layout_of(ctx, kind, def, version, &root, req);
@@ -237,9 +265,11 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
         final_dir.clone()
     };
     // a move keeps the old ACL: re-inherit, so the shared toolchain is read-only for
-    // build steps (design §15.1)
+    // build steps (design §15.1). Only the service wrote this tree; `icacls /reset /T`
+    // follows junctions, so a tree holding one is refused rather than reset.
     if build_mode && def.installer != "rustup" {
-        if let Err(e) = cimon_runner::reset_acl(&installed_root) {
+        let check = cimon_runner::find_reparse_point(&installed_root).map_or(Ok(()), |p| Err(format!("{} is a link or junction", p.display())));
+        if let Err(e) = check.and_then(|_| cimon_runner::reset_acl(&installed_root)) {
             let _ = remove_dir(&installed_root);
             let _ = remove_dir(&staging);
             return Err(err(format!("{e} — not installed")));

@@ -534,8 +534,11 @@ impl RecipeStore {
             let _ = store.clear_promote_intent(p.id);
             return Err(e.into());
         }
-        let _ = store.mark_promoted(p.id, &current, user, override_reason);
-        let _ = self.git.delete_ref(&refname, &current);
+        // the branch goes only once the record says promoted — otherwise reconcile would
+        // find no branch and close the proposal instead
+        if store.mark_promoted(p.id, &current, user, override_reason).is_ok() {
+            let _ = self.git.delete_ref(&refname, &current);
+        }
         Ok(current)
     }
 
@@ -624,6 +627,12 @@ impl RecipeStore {
                     notes.push(format!("{} marked promoted ({})", cimon_core::proposal_label(p.id), short(&head)));
                 }
                 Some(_) => {}
+                // the branch is gone but a recorded promote intent is in main: promoted
+                None if p.promoted_commit.as_deref().is_some_and(|c| main.as_deref().is_some_and(|m| self.git.is_ancestor(c, m))) => {
+                    let c = p.promoted_commit.clone().unwrap_or_default();
+                    store.mark_promoted(p.id, &c, "cimon(reconcile)", None)?;
+                    notes.push(format!("{} marked promoted ({}, recorded before the restart)", cimon_core::proposal_label(p.id), short(&c)));
+                }
                 None => {
                     store.mark_closed(p.id, "cimon(reconcile)", Some("브랜치 없음"))?;
                     notes.push(format!("{} closed — its branch is gone", cimon_core::proposal_label(p.id)));

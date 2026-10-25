@@ -362,48 +362,71 @@ fn job_log(app: &App, args: Value) -> ToolResult {
         }
     };
     // a step log can be 200 MB: grep streams it, tail reads only the end
-    let (selected, total): (Vec<String>, String) = match &a.grep {
+    let (selected, total): (Vec<String>, Option<usize>) = match &a.grep {
         Some(pat) => {
             if pat.len() > 1000 {
                 return Err(ToolError::new("invalid_param", "grep pattern is longer than 1000 characters"));
             }
             let re = regex::Regex::new(pat).map_err(|e| ToolError::new("invalid_param", format!("grep: {e}")))?;
-            use std::io::BufRead;
+            use std::io::Read;
             let mut out = vec![];
             let mut n = 0usize;
-            let mut buf = vec![];
-            let mut r = std::io::BufReader::new(file);
+            let mut cur: Vec<u8> = vec![];
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut r = file;
+            // lines are matched on their first 64 KB; memory stays bounded however long
+            let consider = |line: &[u8], n: usize, out: &mut Vec<String>| {
+                let line = String::from_utf8_lossy(line);
+                let line = line.trim_end_matches(['\r', '\n']);
+                if out.len() < 200 && re.is_match(line) {
+                    out.push(format!("{n}: {line}"));
+                }
+            };
             loop {
-                buf.clear();
-                match r.read_until(b'\n', &mut buf) {
+                let k = match r.read(&mut chunk) {
                     Ok(0) | Err(_) => break,
-                    Ok(_) => {
+                    Ok(k) => k,
+                };
+                for &b in &chunk[..k] {
+                    if b == b'\n' {
                         n += 1;
-                        let line = String::from_utf8_lossy(&buf);
-                        let line = line.trim_end_matches(['\r', '\n']);
-                        if out.len() < 200 && re.is_match(line) {
-                            out.push(format!("{n}: {line}"));
-                        }
+                        consider(&cur, n, &mut out);
+                        cur.clear();
+                    } else if cur.len() < 64 * 1024 {
+                        cur.push(b);
                     }
                 }
             }
-            (out, format!("{n}"))
+            if !cur.is_empty() {
+                n += 1;
+                consider(&cur, n, &mut out);
+            }
+            (out, Some(n))
         }
         None => {
             use std::io::{Read, Seek, SeekFrom};
             let n = a.tail.unwrap_or(100).min(2000);
             let mut f = file;
             let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-            let window = (n as u64 * 2048).min(len);
-            let _ = f.seek(SeekFrom::Start(len - window));
-            let mut bytes = vec![];
-            let _ = f.take(window).read_to_end(&mut bytes);
+            // read back from the end until n lines are whole (at most 16 MB)
+            let mut window = (n as u64 * 256).clamp(4096, 16 << 20).min(len);
+            let bytes = loop {
+                let _ = f.seek(SeekFrom::Start(len - window));
+                let mut b = vec![];
+                let _ = (&mut f).take(window).read_to_end(&mut b);
+                let newlines = b.iter().filter(|c| **c == b'\n').count();
+                if window == len || newlines > n || window >= 16 << 20 {
+                    break b;
+                }
+                window = (window * 4).min(len).min(16 << 20);
+            };
             let text = String::from_utf8_lossy(&bytes).into_owned();
             let mut lines: Vec<&str> = text.lines().collect();
-            if window < len && !lines.is_empty() {
-                lines.remove(0); // the first line of the window is probably cut
+            if window < len && lines.len() > 1 {
+                lines.remove(0); // the first line of the window is cut
             }
-            (lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect(), if window < len { "?".into() } else { lines.len().to_string() })
+            let total = if window == len { Some(lines.len()) } else { None };
+            (lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect(), total)
         }
     };
     let mut body = selected.join("\n");
@@ -414,7 +437,10 @@ fn job_log(app: &App, args: Value) -> ToolResult {
         }
         body = format!("…\n{}", &body[cut..]);
     }
-    let summary = format!("{} {step} — {total}줄 중 {}줄", cimon_core::job_label(job.id), selected.len());
+    let summary = match total {
+        Some(t) => format!("{} {step} — {t}줄 중 {}줄", cimon_core::job_label(job.id), selected.len()),
+        None => format!("{} {step} — 끝 {}줄", cimon_core::job_label(job.id), selected.len()),
+    };
     ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "step": step, "lines": total, "log": body, "summary": summary }))
 }
 
@@ -443,7 +469,6 @@ fn start_job(app: &Arc<App>, user: &cimon_core::AuthUser, tool: cimon_core::Tool
 }
 
 /// Every `recipe_*` result carries backup warnings (design §16.5).
-
 pub(crate) fn with_backup_warnings(app: &App, v: &mut Value) {
     let w = cimon_engine::backup::warnings(app);
     if !w.is_empty() {

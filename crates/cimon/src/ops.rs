@@ -136,6 +136,10 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
             for d in [layout.ws(), layout.root.join("caches"), layout.root.join("homes"), layout.root.join("tmp")] {
                 cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)M")])?;
             }
+            // an older setup granted these; take the grant back on upgrade
+            for d in [layout.logs(), layout.toolchain_staging()] {
+                cmd("icacls", &[&d.to_string_lossy(), "/remove:g", &b])?;
+            }
             for d in [layout.mirrors(), layout.toolchains(), layout.recipe_checkouts(), layout.artifacts()] {
                 cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)RX")])?;
             }

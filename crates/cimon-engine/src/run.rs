@@ -31,6 +31,9 @@ pub async fn runner_loop(app: Arc<App>) {
             continue;
         };
         let guard = app.engine.runner_lock.lock().await;
+        if app.engine.shutdown.is_cancelled() {
+            return;
+        }
         let flag = Arc::new(AtomicBool::new(false));
         app.engine.running.lock().unwrap().insert(job.id, flag.clone());
         let a = app.clone();
@@ -125,6 +128,10 @@ pub struct JobCtx<'a> {
 }
 
 pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
+    // a stopping service starts nothing new (the job stays ready for the next start)
+    if app.engine.shutdown.is_cancelled() {
+        return;
+    }
     // compare-and-set: a cancel or queue timeout that landed first wins
     if !app.store.transition(id, &[JobState::Ready], JobState::Running, "작업 공간 준비").unwrap_or(false) {
         if let Ok(Some(j)) = app.store.job(id) {
@@ -135,8 +142,6 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         return;
     }
     let Ok(job) = app.store.require_job(id) else { return };
-    // the job's sweeps would kill an install running as the build account in intake
-    let _build_guard = app.engine.build_lock.lock().unwrap_or_else(|p| p.into_inner());
     let started = Instant::now();
     let request: JobRequest = serde_json::from_str(&job.request_json).unwrap();
     let plan: JobPlan = serde_json::from_str(job.plan_json.as_deref().unwrap_or("{}")).unwrap_or_default();
@@ -225,7 +230,10 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
 
     crate::fixtures::account_env(&mut ctx, false);
     let user_cancel = app.store.job(id).ok().flatten().is_some_and(|j| j.cancel_requested_by.is_some());
-    if app.engine.shutdown.is_cancelled() && !user_cancel {
+    let shutdown = app.engine.shutdown.is_cancelled();
+    // interrupted only if the stop actually cut a step short
+    let cut_short = records.iter().any(|r| r.outcome.as_ref().is_some_and(|o| o.reason == "cancelled"));
+    if shutdown && !user_cancel && cut_short {
         // the service is stopping: nobody cancelled this job, it was interrupted
         if build.is_some() {
             sweep(app, &mut ctx.warnings, "서비스 중지");
@@ -237,7 +245,8 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         cleanup(app, &job, slot, request.args.clean, &plan, &resolved);
         return;
     }
-    let cancelled = cancel.load(Ordering::SeqCst) || user_cancel;
+    // the flag is also set by a service stop; that alone is not a cancel
+    let cancelled = user_cancel || (cancel.load(Ordering::SeqCst) && !shutdown);
     let _ = app.store.transition(id, &[JobState::Running], JobState::Collecting, "결과 정리");
     if build.is_some() {
         sweep(app, &mut ctx.warnings, "작업 끝");
@@ -342,6 +351,8 @@ fn cleanup(app: &App, job: &JobRow, _slot: Option<i64>, clean: bool, plan: &JobP
 /// Build-account leftover sweep (design §9.2), run as that account.
 fn sweep(app: &App, warnings: &mut Vec<Warning>, when: &str) {
     let Some(acct) = app.build_account() else { return };
+    // an install script or probe running as the build account finishes first
+    let _guard = app.build_guard();
     let tmp = app.layout.root.join("tmp");
     let spec = ExecSpec {
         program: acct.helper.clone(),
@@ -475,8 +486,7 @@ fn run_steps(ctx: &mut JobCtx<'_>, slot: Option<i64>, recreated: bool) -> Vec<St
         recs[i].started = Some(now());
         recs[i].result = "running".into();
         let _ = app.store.update_step(id, &recs[i].row());
-        let rec = run_one(ctx, &step, &label, &mut recs[i]);
-        let _ = rec;
+        run_one(ctx, &step, &label, &mut recs[i]);
         recs[i].finished = Some(now());
         if kind == Kind::Setup {
             if recs[i].result == "pass" {
@@ -785,8 +795,24 @@ fn setup_fingerprint(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> String {
         .filter(|(_, d)| d.applies_to.as_ref().is_some_and(|a| a.iter().any(|x| x == step.id())))
         .filter_map(|(n, _)| ctx.plan.plan.params.get(n).map(|v| (n, v)))
         .collect();
+    // the scripts a setup runs are part of what it does: their contents (and helpers
+    // they can load) go into the fingerprint, so a changed setup script runs again
+    let scripts = ctx.job.recipe_commit.as_deref().and_then(|c| ctx.app.recipes.tree(c).ok()).map(|t| {
+        use cimon_recipe::refs::{project_refs, ref_files, Scope};
+        let mine: Vec<_> = project_refs(&ctx.resolved).into_iter().filter(|(s, _)| *s == Scope::Project || *s == Scope::Step(step.id().to_string())).collect();
+        let mut files: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (_, rr) in &mine {
+            files.extend(ref_files(&*t, rr));
+        }
+        if !mine.is_empty() {
+            let own = format!("projects/{}/", ctx.resolved.id);
+            files.extend(cimon_recipe::Tree::files(&*t).into_iter().filter(|f| f.starts_with("scripts/") || f.starts_with(&own)).map(String::from));
+        }
+        t.digest(&files.into_iter().collect::<Vec<_>>())
+    });
     let v = json!({
         "def": step.def,
+        "scripts": scripts,
         "vars": ctx.resolved.vars,
         "env": ctx.resolved.env,
         "isolate": ctx.resolved.isolate,
