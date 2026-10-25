@@ -185,7 +185,7 @@ D:\cimon\                              서비스  빌드
   ws\<project>\<sibling id>\           rw      rw     「beside」 형제 트리
   ws\_sibling\<project>\j<id>\         rw      rw     「isolated」 형제 트리
   toolchains\<kind>\<ver>-<hash8>\     rw      r      managed 툴체인(카탈로그 항목 해시로 구분)
-  toolchains\_staging\<id>\            rw      rw     설치 중 — 빌드 계정이 스크립트·probe 를 실행
+  toolchains\_staging\<id>\            rw      r*     설치 중 — 빌드 계정이 probe 를 실행(script 설치기만 그 동안 rw)
   toolchains\_bootstrap\               rw      r      rustup·uv
   caches\<project>\                    rw      rw     프로젝트별 캐시 — cargo·npm·uv·gradle·nuget
   homes\p\<project>\<NAME>\            rw      rw     project 범위 홈
@@ -197,7 +197,7 @@ D:\cimon\                              서비스  빌드
   backup\                              rw      -      작업 저장소·레시피 저장소 백업(외부 사본은 §16.5)
 ```
 
-`*` `logs\j<id>\<step>\` 안에서 빌드 계정이 쓸 수 있는 것은 `out\` 하위뿐이다.
+`*` `logs\j<id>\<step>\` 안에서 빌드 계정이 쓸 수 있는 것은 `out\` 하위뿐이다 — `logs\` 는 서비스 전용이고, 러너가 단계마다 그 단계의 `out\` 에만 쓰기 권한을 준다. `toolchains\_staging\` 도 서비스 전용(빌드 계정은 읽기)이고, `script` 설치기의 staging 폴더만 그 설치 동안 쓰기 권한을 받았다가 probe 전에 돌려놓는다 — 확인한 내려받기를 푸는 사이에 빌드 단계가 바꿔치지 못하게.
 
 시도 브랜치에만 있는 새 프로젝트는 `<project>` 자리에 `<id>@<repo 해시 8자>` 를 쓴다 — 두 시도 브랜치가 같은 id 로 다른 저장소를 가리켜도 섞이지 않는다.
 
@@ -297,13 +297,15 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 |---|---|---|
 | **정적 검사** | head 에 `main` 대비 새 오류가 없다(이미 있던 오류는 막지 않는다 — §6.3 과 같은 기준) | 불가 |
 | **fast-forward** | `main` 이 제안의 기준 커밋 그대로인가. 아니면 `recipe_sync` 로 새 head 를 만들어야 한다 | 불가 |
-| **시도 실행** | 의미 차이가 영향을 준 프로젝트마다, head 커밋으로 돈 시도 작업 중 **바뀐(추가·변경) 단계를 모두 포함한 가장 최근 작업**의 판정이 `pass` 인가(`cimon.toml [review]`). 프로젝트 전체 설정(툴체인·env·isolate·account_env·vars·workspace)이나 카탈로그 항목이 바뀌면 기본 `run`(기본 build + test)의 단계도 포함해야 한다. 이 러너에서 돌 수 없는 단계(`needs`)와 setup 은 빼고 센다. 같은 head 에서 먼저 실패한 것을 재시도로 덮지 못한다 | 사유를 적으면 가능 |
-| **시도 실행으로 시험할 수 없는 변경** | 등록된 프로젝트의 `project.toml` 변경, 카탈로그 설치 항목 변경(관리자가 `provision --recipe-ref` 로 그 항목을 설치하고 시도 실행에 쓰였으면 시험된 것으로 친다) | 사유를 적어야만 반영 |
+| **변경 있음** | head 가 `main` 과 다르다(「변경 없음」 은 반영할 것이 없다) | 불가 |
+| **시도 실행** | 의미 차이가 영향을 준 프로젝트마다, head 커밋으로 돈 시도 작업 중 **바뀐(추가·변경) 단계를 모두 포함한 작업**이 있고, 그런 작업이 **모두** `pass` 인가(`cimon.toml [review]`) — 같은 head 에서 한 번이라도 실패했으면 재시도 통과로 덮지 못한다. 프로젝트 전체 설정(툴체인·env·isolate·account_env·vars·workspace)이나 카탈로그 항목이 바뀌면 기본 `run`(기본 build + test)의 단계도 포함해야 하고, 기본 `run` 을 고를 수 없으면 미충족이다. setup 은 모든 작업에서 돌므로 setup 만 바뀌었으면 head 의 시도 작업 하나면 된다 | 사유를 적으면 가능 |
+| **시도 실행으로 시험할 수 없는 변경** | 등록된 프로젝트의 `project.toml` 변경, 카탈로그 설치 항목 변경(관리자가 `provision --recipe-ref` 로 그 항목을 설치하고 시도 실행에 쓰였으면 시험된 것으로 친다), 이 러너에서 돌 수 없는(`needs`) 바뀐 단계, 의미 비교를 할 수 없는 변경(카탈로그가 해석되지 않음 등) | 사유를 적어야만 반영 |
 
-- 의미 차이·영향받는 프로젝트는 겹친 레시피를 `main` 과 head 에서 비교해 만든다(review-ui §4.4 와 같은 함수). 프리셋·카탈로그·공용 스크립트가 바뀌면 그것을 쓰는 모든 프로젝트가 영향받는다.
-- **`recipe_promote(proposal, head, override_reason?)`**: 잠금 → git 에서 브랜치 head 가 `head` 와 같은지(아니면 「제안이 그 사이 바뀌었다」 거절) → 조건을 **지금 다시 계산** → `update-ref refs/heads/main <head> <기준 커밋>`(fast-forward 만) → 브랜치 ref 삭제 → DB 상태·반영자·사유 기록 → 번들 백업. 리뷰어가 본 커밋과 다른 내용이 반영되지 않는다.
-- **`recipe_sync(branch, head, resolutions?)`**: `main` 을 브랜치에 합친 커밋을 만든다. 충돌이 없으면 그대로, 충돌이면 충돌 파일마다 base·`main`·브랜치 세 내용을 돌려준다 — Claude 가 해결한 내용을 `resolutions={path: content}` 로 다시 보내면 그것으로 병합 커밋을 만든다. 병합 커밋도 정적 검사를 통과해야 저장된다. **새 head 이므로 시도 실행 조건은 다시 채워야 한다** — 시험하지 않은 조합이 `main` 에 들어가지 않는다.
-- **`recipe_revert(commit, reason)`**: `main` 에 되돌리는 커밋을 바로 만든다(급한 복구). 정적 검사를 통과해야 하고, 이력·감사에 「되돌리기 — 사유」 로 남는다.
+- 의미 차이·영향받는 프로젝트는 겹친 레시피를 `main` 과 head 에서 비교해 만든다(review-ui §4.4 와 같은 함수). 프리셋·카탈로그·공용 스크립트가 바뀌면 그것을 쓰는 모든 프로젝트가 영향받는다. 스크립트는 **확장되는 모든 문자열**(단계·fixture·`[env]`·`clean_env`)의 **모든** `${recipes}` 참조로 찾고(두 구분자), 어느 레시피도 직접 가리키지 않는 바뀐 파일(스크립트가 불러 쓰는 헬퍼 등)은 스크립트를 참조하는 단계에 [실행]으로 붙는다. `default` 는 실효값으로 비교한다(test 가 기본 실행에서 빠지면 [동작·완화]).
+- **`recipe_promote(proposal, head, override_reason?)`**: 잠금 → git 에서 브랜치 head 가 `head` 와 같은지(아니면 「제안이 그 사이 바뀌었다」 거절) → 조건을 **지금 다시 계산** → 반영자·사유를 먼저 기록 → `update-ref refs/heads/main <head> <기준 커밋>`(fast-forward 만) → DB 상태 `promoted` → 브랜치 ref 삭제 → 번들 백업. 리뷰어가 본 커밋과 다른 내용이 반영되지 않는다. `main` 이 움직인 뒤 죽으면 시작할 때 맞추기가 먼저 기록한 반영자·사유로 마무리한다.
+- `base`·`head`(그리고 sync 의 `main`)는 **커밋 id(16진수)만** 받는다 — `recipe/x` 같은 이름은 늘 현재 head 와 같아 고정점이 되지 못한다. 브랜치 이름은 **소문자만**(Windows 의 ref 파일은 대소문자를 가리지 않아 `recipe/Foo` 와 `recipe/foo` 가 한 파일이 된다). 경로는 Windows 에서도 같은 파일을 가리켜야 한다 — 끝 점·공백, 장치 이름(`NUL`·`COM1`…), 대소문자만 다른 두 경로는 저장하지 않는다.
+- **`recipe_sync(branch, head, main?, resolutions?)`**: `main` 을 브랜치에 합친 커밋을 만든다. 충돌이 없으면 그대로, 충돌이면 충돌 파일마다 base·`main`·브랜치 세 내용과 **그때의 `main` 커밋**을 돌려준다 — Claude 가 해결한 내용을 `resolutions={path: content}` 로, 받은 `main` 과 함께 다시 보내면 그것으로 병합 커밋을 만든다(`main` 이 그 사이 움직였으면 거절 — 다른 `main` 에 낡은 해결을 덮지 않는다). 병합 커밋도 정적 검사를 통과해야 저장된다. **새 head 이므로 시도 실행 조건은 다시 채워야 한다** — 시험하지 않은 조합이 `main` 에 들어가지 않는다.
+- **`recipe_revert(commit, reason)`**: `main` 에 되돌리는 커밋을 바로 만든다(급한 복구). 정적 검사를 통과해야 하고, 이력·감사에 「되돌리기 — 사유」 로 남는다. 병합(sync) 커밋은 되돌리지 않는다 — `main` 에서 들어온 남의 변경까지 되돌리게 되므로 제안 자신의 커밋을 되돌린다. 이미 사라진 변경(빈 되돌리기)도 거절한다.
 - **시작할 때 맞추기**: 열린 제안인데 브랜치 ref 가 없고 head 가 `main` 이력에 있으면 `promoted` 로, 그 밖에 브랜치가 없으면 `closed`(「브랜치 없음」)로 바꾼다. 반영 도중 서비스가 죽어도 제안이 영영 열린 채 남지 않는다.
 - 리뷰 화면(M9)이 생기기 전에는 `recipe_proposal` 이 돌려주는 의미 차이·조건이 관리자의 리뷰 수단이다.
 
@@ -601,11 +603,11 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 ### 9.2 프로세스와 계정
 
-- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `LoadUserProfile` + `CreateProcessAsUserW`, 일시정지로 만든 뒤 Job Object 에 넣고 재개, 상속 핸들은 표준 입출력 셋만). 띄우는 것은 `cimon.exe __exec <spec>` 도우미이고, 도우미가 Rust 표준 라이브러리로 실제 명령을 띄운다(`.bat`·`.cmd` 인자 이스케이프를 표준 라이브러리에 맡기기 위해). 빌드 계정 비밀번호는 `cimon setup` 이 무작위로 정해 **DPAPI(머신 범위)로 암호화해 `config\build-account.dpapi`** 에 둔다 — `config\` 는 서비스 계정과 관리자만 읽는다. 서비스 계정에는 `setup` 이 「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」을 준다. 실제 빌드 머신에서 이 경로로 돌려 본 적은 아직 없다(**확인 필요**).
+- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `LoadUserProfile` + `CreateProcessAsUserW`, 일시정지로 만든 뒤 Job Object 에 넣고 재개, 상속 핸들은 표준 입출력 셋만). 띄우는 것은 `cimon.exe __exec <spec>` 도우미이고, 도우미가 Rust 표준 라이브러리로 실제 명령을 띄운다(`.bat`·`.cmd` 인자 이스케이프를 표준 라이브러리에 맡기기 위해). 빌드 계정 비밀번호는 `cimon setup` 이 무작위로 정해 **DPAPI(머신 범위)로 암호화해 `config\build-account.dpapi`** 에 둔다 — `config\` 는 서비스 계정과 관리자만 읽는다. 서비스 계정에는 `setup` 이 「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」과, `LoadUserProfile` 이 호출자에게 요구하는 **「파일 및 디렉터리 백업」·「복원」** 을 준다(서비스가 시작할 때 켠다 — 서비스는 빌드 계정 비밀번호를 쥔 신뢰 쪽이라 이 권한을 더해도 경계가 바뀌지 않는다). 자식은 서비스의 창 스테이션을 물려받지 않는다(`lpDesktop` = 빈 문자열). 파이프 핸들은 `CreateProcessAsUserW` 직전에만 상속 가능하게 해 다른 스레드가 띄우는 프로세스로 새지 않게 하고, 출력 읽기는 프로세스가 끝난 뒤 10초를 넘기면 끊는다. 도우미가 명령을 못 띄우면 그 사유를 따로 알려 종료 코드가 아니라 「시작 실패」(`inconclusive`/`infra`)가 된다. 실제 빌드 머신에서 이 경로로 돌려 본 적은 아직 없다(**확인 필요**).
 - 서비스 계정은 가상 계정 **`NT SERVICE\cimon`** 이다(관리할 비밀번호가 없다). 이 문서의 「서비스 계정 `cimon`」 은 이것을 가리킨다.
 - Job Object(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, breakaway 불허). 취소·시간 초과는 Job Object 통째로 종료. 단계가 끝난 뒤 남은 프로세스는 종료하고 경고로 남긴다.
 - **Job Object 로 못 잡는 것**: 작업 스케줄러·서비스로 띄운 프로세스. 프로젝트 도구가 스택을 「호출자보다 오래 살게」 띄우는 경우가 그렇다. 그래서:
-  - **작업이 끝날 때마다 빌드 계정이 소유한 모든 프로세스를 찾아 종료하고, 남은 것이 없는지 확인한다.** 빌드 계정이 등록한 예약 작업도 지운다. 남았던 것은 `warnings` 에 적는다.
+  - **작업이 끝날 때마다 빌드 계정이 소유한 모든 프로세스를 찾아 종료하고, 남은 것이 없는지 확인한다.** 빌드 계정이 등록한 예약 작업도 지운다. 남았던 것은 `warnings` 에 적는다. 프로세스는 Toolhelp 스냅숏과 각 프로세스 토큰의 SID 로 고른다(tasklist·wmic 은 출력이 지역화되고 wmic 은 현재 Windows 에 없다). 빌드 계정으로 도는 다른 일(접수 중 설치 스크립트·probe)과는 한 잠금으로 겹치지 않게 해 스윕이 그것을 죽이지 않는다.
   - 다음 작업 시작 전에 다시 확인한다.
   - 빌드 계정은 빌드만 하는 계정이라, 그 계정의 프로세스를 모두 죽여도 다른 것이 깨지지 않는다 — 계정을 나눈 이유 중 하나다(러너가 하나라 성립한다).
 - **계정 환경(`[account_env]`)**: 예약 작업으로 뜬 프로세스는 호출자의 환경이 아니라 **계정에 저장된 사용자 환경**을 받는다. 레시피가 `[account_env]` 에 적은 변수는 작업 시작 전에 cimon 이 **빌드 계정으로 작은 도우미를 실행해** 그 계정의 사용자 환경 변수(HKCU\Environment)로 쓰고, 작업 끝에 지운다. 값은 같은 이름의 `[isolate]` 경로와 같게 해 직접 실행한 단계와 예약 작업이 같은 홈을 본다. 작업 스케줄러가 새 프로세스에 이 값을 넣어 주는지는 **확인 필요**(M7).
@@ -681,8 +683,8 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 - **서비스 계정은 받은 것을 실행하지 않는다.**
   - `archive`·`github-release`: 서비스 계정이 내려받고 체크섬을 확인하고 `toolchains\_staging\<id>\` 에 푼다(경로 탈출 검사 포함).
   - `script`: 설치 스크립트를 **빌드 계정으로** staging 에서 실행한다. 스크립트 위치는 등록된 프로젝트 mirror 의 **전체 커밋 SHA** 로 고정한다(브랜치 이름 금지 — 그 브랜치에 push 할 수 있는 사람이 설치를 바꾸지 못하게).
-  - `probe` 도 빌드 계정으로 staging 에서 실행한다. 통과하면 서비스 계정이 staging 을 최종 폴더로 옮기고 빌드 계정에는 읽기만 준다.
-  - `rustup`·`uv-python`: 검증을 스스로 하는 bootstrap 도구라 서비스 계정이 실행한다. `uv-tool` 과 `uv-python` 의 `packages` 는 빌드 없이 휠만(`--no-build`) 설치한다 — 패키지의 빌드 스크립트가 서비스 계정으로 돌지 않게.
+  - `probe` 도 빌드 계정으로 staging 에서 실행한다(종료 코드 0·시간 안에 끝나야 통과). 통과하면 서비스 계정이 staging 을 최종 폴더로 옮기고 **ACL 을 다시 상속받게 해**(옮기기는 원래 ACL 을 그대로 가져온다) 빌드 계정에는 읽기만 남긴다.
+  - `rustup`·`uv-python`: 검증을 스스로 하는 bootstrap 도구라 서비스 계정이 실행한다. `uv-tool` 과 `uv-python` 의 `packages` 는 빌드 없이 휠만(`--no-build`) 설치한다 — 패키지의 빌드 스크립트가 서비스 계정으로 돌지 않게. `packages` 는 `name==version` 만 받는다(옵션·URL·경로를 uv 에 넘기지 않는다). uv 계열은 인터프리터·venv·실행기에 절대 경로를 박으므로 staging 이 아니라 최종 폴더에 바로 설치한다.
 - **체크섬 출처가 없는 managed 도구는 설치하지 않는다.**
 - `probe` 의 `expect` 는 정확한 버전 문자열이어야 한다(base 의 `version_any` 예외는 recipe-spec §16.1). 다르면 설치 실패.
 - rustup 의 자동 설치에 기대지 않는다.
@@ -994,9 +996,9 @@ login_code_minutes = 5
 | 계정 | 하는 일 | 쓸 수 있는 곳 |
 |---|---|---|
 | `cimon`(서비스) | MCP·HTTP 서버, 작업 저장소, mirror fetch, 툴체인 다운로드·검증·배치, 레시피 저장소, 산출물 수집·서빙 | `D:\cimon` 전부 |
-| `cimon-build`(빌드) | 단계 실행, 판정·검사 스크립트, **설치 스크립트와 probe 실행** | `ws\`·`caches\`·`homes\`·`tmp\`·`toolchains\_staging\`·`logs\j*\*\out\`. `mirrors\`·`toolchains\`·`recipes\<commit>\`·`artifacts\` 는 읽기만, `state\`·`config\`·`recipes.git`·`backup\` 은 접근 불가 |
+| `cimon-build`(빌드) | 단계 실행, 판정·검사 스크립트, **설치 스크립트와 probe 실행** | `ws\`·`caches\`·`homes\`·`tmp\`, 실행 중인 단계의 `logs\j*\*\out\`, 설치 중인 `script` 설치기의 staging 폴더. `mirrors\`·`toolchains\`(staging 포함)·`recipes\<commit>\`·`artifacts\` 는 읽기만, `state\`·`config\`·`recipes.git`·`backup\` 은 접근 불가 |
 
-둘 다 비관리자. 이렇게 나누면 브랜치의 빌드 스크립트도, 시도 브랜치의 카탈로그도, 받은 바이너리도 **작업 저장소·다른 작업의 산출물과 해시·링크 서명 키·설치된 툴체인·레시피 저장소를 바꿀 수 없다.**
+둘 다 비관리자(서비스 계정은 백업·복원 권한을 가진다 — §9.2). 작업 트리는 빌드 계정이 쓸 수 있으므로, 서비스가 거기서 읽는 파일(산출물·JUnit 보고서·fixture 증거)은 **연 핸들의 실제 경로**가 작업 트리 안인지 확인한 뒤에만 읽는다 — 정션으로 서비스 전용 파일을 산출물로 빼내지 못한다. 이렇게 나누면 브랜치의 빌드 스크립트도, 시도 브랜치의 카탈로그도, 받은 바이너리도 **작업 저장소·다른 작업의 산출물과 해시·링크 서명 키·설치된 툴체인·레시피 저장소를 바꿀 수 없다.**
 
 ### 15.2 위협과 대응
 
@@ -1078,7 +1080,7 @@ login_code_minutes = 5
 
 ### 16.1 설치 — 처음 한 번
 
-1. `cimon setup`(관리자, `--dry-run` 으로 미리 보기): 디렉터리와 ACL(§5, icacls), 빌드 계정 생성과 DPAPI 비밀번호 파일, 권한(`NT SERVICE\cimon` 「서비스로 로그온」·토큰 바꾸기·할당량, 빌드 계정 「일괄 작업으로 로그온」), `config\link.key` 생성, Windows 서비스 등록(sc.exe, 자동 시작·실패 시 재시작), rustup·uv bootstrap(체크섬 확인). **빌드 계정 아웃바운드 제한은 자동화하지 않았다** — Windows 방화벽은 사용자별 아웃바운드 규칙이 약해 수동 단계로 남기고 `setup` 이 안내한다.
+1. `cimon setup`(관리자, `--dry-run` 으로 미리 보기): 디렉터리, `config\link.key` 생성, **Windows 서비스 등록**(sc.exe, 절대 경로, 자동 시작·실패 시 재시작 — `NT SERVICE\cimon` 은 서비스가 있어야 해석되므로 먼저), 빌드 계정 생성(PowerShell, 비밀번호는 stdin 으로, 「비밀번호 만료 없음」 을 같은 호출에서)과 DPAPI 비밀번호 파일, 권한(`NT SERVICE\cimon` 「서비스로 로그온」·토큰 바꾸기·할당량·백업·복원, 빌드 계정 「일괄 작업으로 로그온」), ACL(§5, icacls), rustup·uv bootstrap(체크섬 확인). **빌드 계정 아웃바운드 제한은 자동화하지 않았다** — Windows 방화벽은 사용자별 아웃바운드 규칙이 약해 수동 단계로 남기고 `setup` 이 안내한다.
 2. Tailscale(§15.3).
 3. 첫 관리자: `cimon token create <이름> --admin`.
 4. 레시피 저장소: `cimon recipe import --init <사내 레시피 폴더> --author <이름>` — 저장소와 `main` 을 한 번 만든다(정적 검사를 통과해야 하고, `main` 이 있으면 거절). 바로 번들 백업.
@@ -1114,7 +1116,7 @@ login_code_minutes = 5
 
 ### 16.4 관측 · 정리
 
-- `GET /healthz`: 큐 길이, 실행 중 작업, 디스크 여유, 레시피 `main` 커밋, 마지막 백업과 외부 사본 시각.
+- `GET /healthz`: 토큰 없이는 `{"ok": true}` 만. 사용자 토큰(`Authorization: Bearer`)을 붙이면 큐 길이, 실행 중 작업, 디스크 여유, 레시피 `main` 커밋, 마지막 백업과 외부 사본 시각, 경고.
 - `cimon doctor`: base 툴체인, 두 계정과 권한(일괄 작업 로그온 포함), 디스크, GitHub 토큰(만료 14일 전 경고), 레시피 저장소(`git fsck` + `main` 정적 검사), 백업, Tailscale.
 - **정리 규칙 — 정본**:
 

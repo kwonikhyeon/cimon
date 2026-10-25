@@ -20,6 +20,8 @@ cimon 이 프로젝트를 빌드·테스트하는 방법은 **전부 데이터(T
 | `projects/<id>/*.toml` | `recipe.toml` 이 `include` 하는 조각(예: 시나리오 목록) |
 | `scripts/`, `projects/<id>/scripts/` | 판정·검사 스크립트, 레시피가 쓰는 설정 파일 — `${recipes}` 로 참조 |
 
+경로는 Windows 체크아웃에서도 같은 파일이어야 한다: 끝이 점이나 공백인 이름, 장치 이름(`NUL`·`CON`·`COM1`…, 확장자가 붙어도), `< > " | ? *`, 대소문자만 다른 두 경로는 저장되지 않는다 — 나중 파일이 리뷰한 파일을 덮어쓰게 되므로. 시도 브랜치 이름은 소문자만 쓴다.
+
 ### 1.1 버전
 
 모든 파일 첫 줄에 `schema = 1`. 서비스는 아는 schema 만 읽고, 모르는 schema 는 그 프로젝트의 작업을 거절한다.
@@ -149,7 +151,7 @@ msvc    = { min = "17.11", components = ["Microsoft.VisualStudio.Component.VC.To
 | `version` | 정확한 버전. managed 종류에 필수(`version_file` 이 없을 때) |
 | `version_file` | 저장소 안의 파일에서 버전을 읽는다(접수 때 `git show` 로 — 접수 검사, §15.2). 지금은 `rust-toolchain.toml` 의 `toolchain.channel` 만 지원하고, 그 값도 정확한 버전이어야 한다. 파일이 없거나, **저장소 안의 다른 `rust-toolchain.toml` 이 다른 버전을 적고 있으면** 작업은 `fail`/`recipe` 다(한 작업이 둘 중 하나로 조용히 지어지지 않게) |
 | `min` | base 종류의 최소 버전 |
-| `packages` | `python` 전용 — 정확한 버전의 패키지 목록. `(python 버전, 패키지 목록)` 마다 uv 가상 환경을 하나 만든다 |
+| `packages` | `python` 전용 — 정확한 버전의 패키지 목록(`name==x.y.z`, extras 허용 — 옵션·URL·경로는 오류). `(python 버전, 패키지 목록)` 마다 uv 가상 환경을 하나 만든다 |
 | `components` 등 | 종류별 추가 필드 — 카탈로그 정의를 따른다(§16) |
 | `optional` | `true` 면 기본으로는 갖추지 않는다. 그것을 `uses` 로 적은 단계가 선택됐을 때만 갖추고 검사한다 |
 
@@ -298,7 +300,7 @@ tags = ["android"]
 | `description` | 문자열 | | `describe_project`·결과에 보인다 |
 | `run` | 문자열 배열 | 필수 | argv. 셸을 거치지 않는다. **첫 원소에 경로 구분자가 있을 때만**(`./gradlew.bat`) `cwd` 기준으로 찾고, 이름만 있으면 구성한 `PATH` 에서만 찾는다. `.bat`·`.cmd` 는 Rust 표준 라이브러리의 배치 실행에 맡긴다 |
 | `shell` | `"bash"`·`"powershell"` | | `bash` 면 `bash <run…>`(Git Bash, base 층), `powershell` 이면 `powershell -NoProfile -ExecutionPolicy Bypass -File <run…>` |
-| `cwd` | 문자열 | `${ws}` | 작업 트리 기준 상대 경로. `..` 로 작업 트리 밖에 나가면 오류 |
+| `cwd` | 문자열 | `${ws}` | 작업 트리 기준 상대 경로(`app`, `./app`, `${ws}/app`). `..` 로 작업 트리 밖에 나가면 오류 |
 | `env` | 표 | | 이 단계에만 추가 |
 | `timeout_min` | 정수 | 30 | 넘으면 Job Object 종료 → 단계 `fail`/`code`(시간 초과) |
 | `after` | 문자열 배열 | `[]` | 먼저 끝나야 하는 단계 id(종류 무관) |
@@ -313,7 +315,7 @@ tags = ["android"]
 | `uncounted` | 불리언 | `false` | test·scenario 단계가 `exit` 판정기를 쓴다는 것 — 「몇 개 돌았는지 세지 않는다」 — 를 알고 쓴다는 표시. 없으면 경고(§12). 결과의 그 단계에 `uncounted: true` 가 실린다 |
 | `when` | `"always"`·`"cold"`·`"changed"` | `"always"` | **setup 만.** §9.4 |
 | `inputs` | 문자열 배열 | | **setup 만**, `when = "changed"` 일 때 지켜보는 파일 glob |
-| `disabled` | 불리언 | `false` | `true` 면 없는 것으로 친다. 프리셋 단계를 끌 때 — 이때 다른 키는 생략할 수 있다 |
+| `disabled` | 불리언 | `false` | `true` 면 없는 것으로 친다. 프리셋 단계를 끌 때 — 이때 다른 키는 생략할 수 있다. 앞 층에 없는 id 를 끄면 오류(오타로 프리셋 단계가 그대로 도는 것을 막는다). include 에서는 쓸 수 없다 |
 | `[[step.artifact]]` | 표 배열 | | 이 단계가 만드는 산출물(§9.5) |
 
 ### 9.3 종류
@@ -392,7 +394,7 @@ inspect = ["apk-signer", { builtin = "pe-version", required = true }, { script =
 | `step` | **id 단위로 통째 교체.** 필드 단위로 섞지 않는다 — 결과를 읽기 쉽게. `disabled = true` 로 끈다 |
 | `fixture` | 이름 단위로 통째 교체 |
 
-**`include`**(조각): 같은 출처, 같은 디렉터리의 파일을 이어 붙인다. `step`·`fixture`·`params` 만 담을 수 있다. **include 사이, include 와 recipe 사이에 같은 id 가 있으면 오류다** — 교체는 `extends` 에서만 일어난다.
+**`include`**(조각): 같은 출처, 같은 디렉터리의 파일을 이어 붙인다. `step`·`fixture`·`params` 만 담을 수 있다. **include 사이, include 와 recipe 사이에 같은 id 가 있으면 오류다** — 교체는 `extends` 에서만 일어난다. 위 층이 `disabled` 로 끈 id 를 include 가 다시 정의해도 오류다. 프리셋·include 파일도 `schema = 1` 이어야 한다.
 
 겹친 결과는 `cimon recipe show <project> --resolved` 와 MCP `describe_project` 로 본다. 리뷰의 의미 차이(review-ui §4.4)도 겹친 결과끼리 비교한다.
 
@@ -474,7 +476,9 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 
 ## 13. 변수
 
-`${…}` 는 `run`·`cwd`·`env`·`glob`·`exclude`·`pack_name`·`inputs`·`workspace.keep`·`workspace.clean_env`·judge·inspect·fixture 의 명령과 `env`·`collect` 에서 확장된다. 모르는 변수는 검증 오류다.
+`${…}` 는 `run`·`cwd`·`env`·`glob`·`exclude`·`pack_name`·`inputs`·`workspace.keep`·`workspace.clean_env`·judge·inspect·fixture 의 명령과 `env`·`collect` 에서 확장된다. 모르는 변수는 검증 오류다. pre-clean·산출물 수집·JUnit 보고서·`inputs` 도 단계 명령과 같은 규칙으로 확장한다(`${ws}/x` 는 작업 트리 기준 `x`).
+
+환경 변수 이름은 Windows 처럼 대소문자를 가리지 않는다 — 위 층의 `npm_config_cache` 는 아래 층의 `NPM_CONFIG_CACHE` 를 바꾼다.
 
 | 변수 | 값 |
 |---|---|
@@ -531,11 +535,12 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 |---|---|
 | schema·모르는 키·타입 | `timeot_min` |
 | 참조 | 모르는 프리셋, 카탈로그에 없는 툴체인 종류, 모르는 `after`·`fixture`·`uses`·`applies_to`·`requires_artifacts`, 등록되지 않은 형제 프로젝트 |
-| 변수 | 모르는 `${…}`, 값 없는 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}` |
+| 변수 | 모르는 `${…}`, 닫히지 않은 `${`, 값 없는(`default` 없는) 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}`, `[env]` 에서 단계마다 다른 값(`${param.*}`·`${artifact.*}`·`${step.out}`) |
 | 파라미터 | `applies_to` 없음, 소비처(`env`·`args`·`${param.x}`) 없음 |
 | 순환 | `after` 순환 |
 | 중복 | include 끼리 같은 step id, 산출물 이름 중복 |
-| 경로 | `cwd`·`glob` 이 작업 트리 밖, 절대 경로, `${recipes}` 밖을 가리키는 스크립트 경로, **그 레시피 커밋에 없는 `${recipes}/…` 파일** |
+| 겹치기 | 앞 층에 없는 id 를 끄는 `disabled`, include 의 `disabled`·위 층이 끈 id 재정의, 프리셋·include 의 `schema` |
+| 경로 | `cwd`·`glob` 이 작업 트리 밖, 절대 경로, `${recipes}` 밖을 가리키는 스크립트 경로, **그 레시피 커밋에 없는 `${recipes}/…` 파일**(확장되는 모든 문자열의 모든 참조, `/`·`\` 둘 다), Windows 에서 다른 파일이 되는 경로(§1) |
 | 버전 | managed 툴체인에 범위·채널 이름 |
 | 환경 | `[account_env]` 의 이름이 `[isolate]` 에 없음 |
 | 산출물 | `expect`·`expect_min` 이 둘 다 있거나 둘 다 없음, setup·test·scenario 에 산출물 |
