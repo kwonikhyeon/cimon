@@ -26,8 +26,37 @@ fn cmd(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn user_exists(name: &str) -> bool {
-    std::process::Command::new("net").args(["user", name]).output().map(|o| o.status.success()).unwrap_or(false)
+/// Creates or updates the local build account with PowerShell's LocalAccounts module.
+/// The password goes in on stdin (never on a command line), and "password never
+/// expires" is set in the same call — a failure fails the step.
+fn ensure_build_user(name: &str, password: &str) -> Result<()> {
+    use std::io::Write;
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) || name.is_empty() || name.len() > 20 {
+        bail!("[accounts].build {name:?} must be 1–20 characters of [A-Za-z0-9._-]");
+    }
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'\n\
+         $pw = ConvertTo-SecureString ([Console]::In.ReadLine()) -AsPlainText -Force\n\
+         if (Get-LocalUser -Name '{name}' -ErrorAction SilentlyContinue) {{\n\
+           Set-LocalUser -Name '{name}' -Password $pw -PasswordNeverExpires $true -AccountNeverExpires -UserMayChangePassword $false\n\
+         }} else {{\n\
+           New-LocalUser -Name '{name}' -Password $pw -PasswordNeverExpires -AccountNeverExpires -UserMayNotChangePassword -Description 'cimon build steps' | Out-Null\n\
+         }}"
+    );
+    let ps = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    let mut child = std::process::Command::new(ps)
+        .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("starting powershell")?;
+    child.stdin.take().unwrap().write_all(format!("{password}\n").as_bytes())?;
+    let out = child.wait_with_output()?;
+    if !out.status.success() {
+        bail!("creating {name}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
 }
 
 fn new_password() -> String {
@@ -45,59 +74,11 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         let d2 = d.clone();
         steps.push(step(format!("create {}", d.display()), move || Ok(std::fs::create_dir_all(&d2)?)));
     }
-    let key = layout.link_key();
-    steps.push(step(format!("link key {}", key.display()), move || {
-        if !key.exists() {
-            std::fs::write(&key, cimon_core::random_secret_hex())?;
-        }
-        Ok(())
-    }));
-    if !cfg.accounts.single_account() {
-        let pwfile = layout.config_dir().join("build-account.dpapi");
-        let b = build.clone();
-        steps.push(step(format!("build account {build} (local user, password stored DPAPI-encrypted in {})", pwfile.display()), move || {
-            let pw = new_password();
-            if user_exists(&b) {
-                cmd("net", &["user", &b, &pw])?;
-            } else {
-                cmd("net", &["user", &b, &pw, "/add", "/passwordchg:no", "/expires:never", "/comment:cimon build steps"])?;
-            }
-            let _ = cmd("wmic", &["useraccount", "where", &format!("name='{b}'"), "set", "PasswordExpires=false"]);
-            #[cfg(windows)]
-            {
-                let blob = cimon_runner::win::protect(pw.as_bytes())?;
-                std::fs::write(&pwfile, blob)?;
-            }
-            Ok(())
-        }));
-        let b = build.clone();
-        steps.push(step(format!("rights: {build} — log on as a batch job"), move || crate::lsa::add_rights(&b, &["SeBatchLogonRight"])));
-    }
-    steps.push(step(
-        format!("rights: {SERVICE_ACCOUNT} — log on as a service, replace a process level token, adjust memory quotas"),
-        || crate::lsa::add_rights(SERVICE_ACCOUNT, &["SeServiceLogonRight", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege"]),
-    ));
-    // ACLs (design §5): the service owns everything; the build account only where it must
-    let root = layout.root.clone();
-    let b = build.clone();
-    let single = cfg.accounts.single_account();
-    steps.push(step(format!("ACLs under {}", root.display()), move || {
-        let r = root.to_string_lossy().to_string();
-        cmd("icacls", &[&r, "/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", &format!("{SERVICE_ACCOUNT}:(OI)(CI)F")])?;
-        if !single {
-            let layout = Layout::new(&root);
-            for d in [layout.ws(), layout.root.join("caches"), layout.root.join("homes"), layout.root.join("tmp"), layout.toolchain_staging(), layout.logs()] {
-                cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)M")])?;
-            }
-            for d in [layout.mirrors(), layout.toolchains(), layout.recipe_checkouts(), layout.artifacts()] {
-                cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)RX")])?;
-            }
-            // state, config, recipes.git, backup: no grant — the build account cannot read them
-        }
-        Ok(())
-    }));
-    let exe = std::env::current_exe()?;
-    let cfgp = config_path.to_path_buf();
+    // the service first: NT SERVICE\cimon only resolves once the service exists, and
+    // the rights and ACL steps below name it. The service runs from System32, so both
+    // paths in its command line are absolute.
+    let exe = std::path::absolute(std::env::current_exe()?)?;
+    let cfgp = std::path::absolute(config_path)?;
     steps.push(step(format!("Windows service {SERVICE_NAME} as {SERVICE_ACCOUNT}, automatic start, restart on failure"), move || {
         let bin = format!("\"{}\" service --config \"{}\"", exe.display(), cfgp.display());
         let exists = std::process::Command::new("sc.exe").args(["query", SERVICE_NAME]).output().map(|o| o.status.success()).unwrap_or(false);
@@ -108,6 +89,58 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         }
         cmd("sc.exe", &["failure", SERVICE_NAME, "reset=", "86400", "actions=", "restart/10000/restart/60000/restart/300000"])?;
         cmd("sc.exe", &["description", SERVICE_NAME, "Cimon says: build. Remote build and test service (MCP)."])?;
+        Ok(())
+    }));
+    let key = layout.link_key();
+    steps.push(step(format!("link key {}", key.display()), move || {
+        if !key.exists() {
+            std::fs::write(&key, cimon_core::random_secret_hex())?;
+        }
+        Ok(())
+    }));
+    if !cfg.accounts.single_account() {
+        let pwfile = layout.config_dir().join("build-account.dpapi");
+        let b = build.clone();
+        steps.push(step(format!("build account {build} (local user, password never expires, stored DPAPI-encrypted in {})", pwfile.display()), move || {
+            let pw = new_password();
+            ensure_build_user(&b, &pw)?;
+            #[cfg(windows)]
+            {
+                let blob = cimon_runner::win::protect(pw.as_bytes())?;
+                std::fs::write(&pwfile, blob)?;
+            }
+            Ok(())
+        }));
+        let b = build.clone();
+        steps.push(step(format!("rights: {build} — log on as a batch job"), move || crate::lsa::add_rights(&b, &["SeBatchLogonRight"])));
+    }
+    // backup/restore: LoadUserProfile requires them in the caller (the build account's
+    // HKCU). They let the service read and write any file — it is the trusted part of
+    // the machine already (it holds the build account's password); design §15.1.
+    steps.push(step(
+        format!("rights: {SERVICE_ACCOUNT} — log on as a service, replace a process level token, adjust memory quotas, back up and restore files"),
+        || crate::lsa::add_rights(SERVICE_ACCOUNT, &["SeServiceLogonRight", "SeAssignPrimaryTokenPrivilege", "SeIncreaseQuotaPrivilege", "SeBackupPrivilege", "SeRestorePrivilege"]),
+    ));
+    // ACLs (design §5): the service owns everything; the build account only where it must
+    let root = layout.root.clone();
+    let b = build.clone();
+    let single = cfg.accounts.single_account();
+    steps.push(step(format!("ACLs under {}", root.display()), move || {
+        let r = root.to_string_lossy().to_string();
+        cmd("icacls", &[&r, "/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", &format!("{SERVICE_ACCOUNT}:(OI)(CI)F")])?;
+        if !single {
+            let layout = Layout::new(&root);
+            // not logs\ (the runner grants each step's out\ dir) and not toolchains\_staging
+            // (a script installer's dir is granted for the install only): a step must not
+            // rewrite another job's logs or a download between its check and extraction
+            for d in [layout.ws(), layout.root.join("caches"), layout.root.join("homes"), layout.root.join("tmp")] {
+                cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)M")])?;
+            }
+            for d in [layout.mirrors(), layout.toolchains(), layout.recipe_checkouts(), layout.artifacts()] {
+                cmd("icacls", &[&d.to_string_lossy(), "/grant", &format!("{b}:(OI)(CI)RX")])?;
+            }
+            // state, config, recipes.git, backup: no grant — the build account cannot read them
+        }
         Ok(())
     }));
     let boot = layout.bootstrap();

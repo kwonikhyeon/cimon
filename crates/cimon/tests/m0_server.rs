@@ -47,6 +47,10 @@ async fn healthz_answers() {
     let h = Harness::start("").await;
     let v: serde_json::Value = reqwest::get(format!("{}/healthz", h.base)).await.unwrap().json().await.unwrap();
     assert_eq!(v["ok"], true);
+    // without a token the machine's state stays private
+    assert!(v.get("queued").is_none() && v.get("recipes_main").is_none(), "{v}");
+    let v: serde_json::Value = reqwest::Client::new().get(format!("{}/healthz", h.base)).bearer_auth(&h.member_token).send().await.unwrap().json().await.unwrap();
+    assert!(v.get("queued").is_some(), "{v}");
 }
 
 #[tokio::test]

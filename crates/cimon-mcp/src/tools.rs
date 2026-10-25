@@ -353,23 +353,57 @@ fn job_log(app: &App, args: Value) -> ToolResult {
         return Err(ToolError::new("unknown_step", format!("{} has no step {step:?}", cimon_core::job_label(job.id))));
     }
     let path = app.layout.step_log(job.id, &step);
-    let text = match std::fs::read(&path) {
-        Ok(b) => String::from_utf8_lossy(&b).into_owned(),
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
         Err(_) => {
             let expired = cimon_core::parse_time(&job.expires_at).is_some_and(|t| t < chrono::Utc::now());
             let why = if expired { format!("its log expired on {}", job.expires_at) } else { "it did not run".to_string() };
             return Err(ToolError::new("log_unavailable", format!("no log for {step} — {why}")));
         }
     };
-    let lines: Vec<&str> = text.lines().collect();
-    let selected: Vec<String> = match &a.grep {
+    // a step log can be 200 MB: grep streams it, tail reads only the end
+    let (selected, total): (Vec<String>, String) = match &a.grep {
         Some(pat) => {
+            if pat.len() > 1000 {
+                return Err(ToolError::new("invalid_param", "grep pattern is longer than 1000 characters"));
+            }
             let re = regex::Regex::new(pat).map_err(|e| ToolError::new("invalid_param", format!("grep: {e}")))?;
-            lines.iter().enumerate().filter(|(_, l)| re.is_match(l)).take(200).map(|(i, l)| format!("{}: {}", i + 1, l)).collect()
+            use std::io::BufRead;
+            let mut out = vec![];
+            let mut n = 0usize;
+            let mut buf = vec![];
+            let mut r = std::io::BufReader::new(file);
+            loop {
+                buf.clear();
+                match r.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        n += 1;
+                        let line = String::from_utf8_lossy(&buf);
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        if out.len() < 200 && re.is_match(line) {
+                            out.push(format!("{n}: {line}"));
+                        }
+                    }
+                }
+            }
+            (out, format!("{n}"))
         }
         None => {
+            use std::io::{Read, Seek, SeekFrom};
             let n = a.tail.unwrap_or(100).min(2000);
-            lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect()
+            let mut f = file;
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let window = (n as u64 * 2048).min(len);
+            let _ = f.seek(SeekFrom::Start(len - window));
+            let mut bytes = vec![];
+            let _ = f.take(window).read_to_end(&mut bytes);
+            let text = String::from_utf8_lossy(&bytes).into_owned();
+            let mut lines: Vec<&str> = text.lines().collect();
+            if window < len && !lines.is_empty() {
+                lines.remove(0); // the first line of the window is probably cut
+            }
+            (lines[lines.len().saturating_sub(n)..].iter().map(|s| s.to_string()).collect(), if window < len { "?".into() } else { lines.len().to_string() })
         }
     };
     let mut body = selected.join("\n");
@@ -380,8 +414,8 @@ fn job_log(app: &App, args: Value) -> ToolResult {
         }
         body = format!("…\n{}", &body[cut..]);
     }
-    let summary = format!("{} {step} — {}줄 중 {}줄", cimon_core::job_label(job.id), lines.len(), selected.len());
-    ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "step": step, "lines": lines.len(), "log": body, "summary": summary }))
+    let summary = format!("{} {step} — {total}줄 중 {}줄", cimon_core::job_label(job.id), selected.len());
+    ok_structured(json!({ "job_id": cimon_core::job_label(job.id), "step": step, "lines": total, "log": body, "summary": summary }))
 }
 
 /// `build` / `test` / `run`: validate, commit, answer with a task (design §7.5).

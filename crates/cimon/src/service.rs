@@ -22,36 +22,67 @@ mod imp {
         }
     }
 
+    fn status(state: ServiceState, accept: ServiceControlAccept, code: u32, checkpoint: u32) -> ServiceStatus {
+        ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: state,
+            controls_accepted: accept,
+            exit_code: ServiceExitCode::Win32(code),
+            checkpoint,
+            wait_hint: Duration::from_secs(30),
+            process_id: None,
+        }
+    }
+
     fn run() -> anyhow::Result<()> {
         let token = tokio_util::sync::CancellationToken::new();
         let t2 = token.clone();
+        // the handler reports StopPending at once, and a reporter keeps the checkpoint
+        // moving while the job's processes are terminated and the workers finish; the
+        // mutex keeps a late StopPending from overwriting the final Stopped
+        let cell: std::sync::Arc<std::sync::OnceLock<service_control_handler::ServiceStatusHandle>> = Default::default();
+        let stopped: std::sync::Arc<std::sync::Mutex<bool>> = Default::default();
+        let (cell2, stopped2) = (cell.clone(), stopped.clone());
         let handle = service_control_handler::register(crate::ops::SERVICE_NAME, move |c| match c {
             ServiceControl::Stop | ServiceControl::Shutdown => {
+                if let Some(h) = cell2.get().copied() {
+                    let _ = h.set_service_status(status(ServiceState::StopPending, ServiceControlAccept::empty(), 0, 1));
+                    let stopped = stopped2.clone();
+                    std::thread::spawn(move || {
+                        for cp in 2..=12 {
+                            std::thread::sleep(Duration::from_secs(5));
+                            let done = stopped.lock().unwrap_or_else(|p| p.into_inner());
+                            if *done {
+                                break;
+                            }
+                            let _ = h.set_service_status(status(ServiceState::StopPending, ServiceControlAccept::empty(), 0, cp));
+                        }
+                    });
+                }
                 t2.cancel();
                 ServiceControlHandlerResult::NoError
             }
             ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
             _ => ServiceControlHandlerResult::NotImplemented,
         })?;
-        let status = |state: ServiceState, accept: ServiceControlAccept, code: u32| ServiceStatus {
-            service_type: ServiceType::OWN_PROCESS,
-            current_state: state,
-            controls_accepted: accept,
-            exit_code: ServiceExitCode::Win32(code),
-            checkpoint: 0,
-            wait_hint: Duration::from_secs(30),
-            process_id: None,
-        };
+        let _ = cell.set(handle);
+        let status = |state: ServiceState, accept: ServiceControlAccept, code: u32| status(state, accept, code, 0);
         handle.set_service_status(status(ServiceState::Running, ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN, 0))?;
         let cfg_path = CONFIG.get().cloned().unwrap_or_else(|| crate::config_path(&None));
         let res = (|| -> anyhow::Result<()> {
             let cfg = cimon_core::Config::load(&cfg_path)?;
             let _guard = crate::init_service_logging(&cimon_core::Layout::new(&cfg.paths.root).service_logs());
             let rt = tokio::runtime::Runtime::new()?;
-            rt.block_on(cimon::serve::run(cfg, Some(token)))
+            let r = rt.block_on(cimon::serve::run(cfg, Some(token)));
+            // blocking workers (a job being torn down, an intake fetch) get a bounded wait
+            rt.shutdown_timeout(Duration::from_secs(25));
+            r
         })();
         let code = if res.is_ok() { 0 } else { 1 };
+        let mut done = stopped.lock().unwrap_or_else(|p| p.into_inner());
+        *done = true;
         handle.set_service_status(status(ServiceState::Stopped, ServiceControlAccept::empty(), code))?;
+        drop(done);
         res
     }
 

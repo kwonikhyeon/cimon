@@ -180,20 +180,23 @@ pub fn collect(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step) -> Result<(), Ou
 fn run_inspect_script(ctx: &JobCtx<'_>, run: &[String], file: &Path) -> Result<Value, String> {
     let out_dir = ctx.app.layout.step_out(ctx.job.id, "_inspect");
     let _ = std::fs::create_dir_all(&out_dir);
+    if let Some(user) = &ctx.build_user {
+        cimon_runner::grant_modify(&out_dir, user)?;
+    }
     let lookup = ctx.lookup("_inspect", &out_dir);
     let argv: Vec<String> = run.iter().map(|a| cimon_recipe::vars::expand(a, &lookup)).collect::<Result<_, _>>()?;
     let mut env = cimon_runner::base_env(ctx.profile.as_deref(), ctx.build_user.as_deref());
     let mut path = ctx.tool_env.path.clone();
     path.extend(cimon_runner::system_path());
-    env.insert("PATH".into(), cimon_runner::join_path(&path));
+    cimon_runner::env_set(&mut env, "PATH", cimon_runner::join_path(&path));
     for (k, v) in &ctx.tool_env.exports {
-        env.insert(k.clone(), v.clone());
+        cimon_runner::env_set(&mut env, k, v.clone());
     }
-    env.insert("CIMON_ARTIFACT".into(), file.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "CIMON_ARTIFACT", file.to_string_lossy().into());
     let tmp = ctx.app.layout.tmp_job(ctx.job.id);
     let _ = std::fs::create_dir_all(&tmp);
-    env.insert("TEMP".into(), tmp.to_string_lossy().into());
-    env.insert("TMP".into(), tmp.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "TEMP", tmp.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "TMP", tmp.to_string_lossy().into());
     let dirs: Vec<PathBuf> = path;
     let program = cimon_runner::resolve_program(&argv[0], &ctx.ws, &dirs, env.get("PATHEXT").map(|s| s.as_str()).unwrap_or(".EXE;.BAT;.CMD"))?;
     let spec = cimon_runner::ExecSpec {

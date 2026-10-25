@@ -118,6 +118,8 @@ pub fn provide(app: &App, id: i64, job: &JobRow, r: &Resolved, plan: &JobPlan) -
         }
         let _ = app.store.set_status(id, &format!("툴체인: {kind} {version} 설치 중"));
         let mdef = main_cat.kinds.get(kind).unwrap();
+        // install scripts and probes run as the build account: not while a job sweeps
+        let _build_guard = app.engine.build_lock.lock().unwrap_or_else(|p| p.into_inner());
         match cimon_toolchain::install(&installer_ctx(app), kind, mdef, &entry, &version, &req, "main") {
             Ok(inst) => {
                 let _ = app.store.upsert_install(&inst);
@@ -349,6 +351,7 @@ pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, Str
         }
         let mut ctx = installer_ctx(app);
         ctx.installed_by = a.admin.clone();
+        let _build_guard = app.engine.build_lock.lock().unwrap_or_else(|p| p.into_inner());
         match cimon_toolchain::install(&ctx, &kind, def, &entry, &version, &req, &source_ref) {
             Ok(inst) => {
                 let _ = app.store.upsert_install(&inst);

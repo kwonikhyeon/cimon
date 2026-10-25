@@ -39,6 +39,10 @@ pub struct Engine {
     pub janitor: Notify,
     /// One lock per mirror: intake fetches/reads and GC never overlap.
     pub mirror_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// Held while anything runs as the build account (a job on the runner, an install
+    /// script or probe during intake): a job's start/end sweep terminates every
+    /// build-account process, so the two must not overlap.
+    pub build_lock: Mutex<()>,
 }
 
 impl Engine {
@@ -71,6 +75,7 @@ impl App {
             runner_lock: tokio::sync::Mutex::new(()),
             janitor: Notify::new(),
             mirror_locks: Mutex::new(HashMap::new()),
+            build_lock: Mutex::new(()),
         };
         Ok(Arc::new(App { config, layout, store, recipes, engine }))
     }

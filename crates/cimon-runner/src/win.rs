@@ -142,7 +142,10 @@ unsafe impl Sync for Logon {}
 impl Logon {
     /// `LogonUser(batch)` + `LoadUserProfile` — the profile must be loaded for the
     /// account's HKCU (account_env) and for tools that read the user's settings.
+    /// `LoadUserProfile` needs the backup and restore privileges in the caller's token;
+    /// `cimon setup` grants them to the service account and they are enabled here.
     pub fn new(user: &str, password: &str) -> std::io::Result<Logon> {
+        let missing: Vec<&str> = ["SeBackupPrivilege", "SeRestorePrivilege"].into_iter().filter(|p| enable_privilege(p).is_err()).collect();
         unsafe {
             let mut token: HANDLE = null_mut();
             let u = wide(user);
@@ -155,19 +158,46 @@ impl Logon {
             let mut name = wide(user);
             let mut pi: PROFILEINFOW = std::mem::zeroed();
             pi.dwSize = std::mem::size_of::<PROFILEINFOW>() as u32;
+            pi.dwFlags = 1; // PI_NOUI — never show a dialog from a service
             pi.lpUserName = name.as_mut_ptr();
             if LoadUserProfileW(token.0, &mut pi) == 0 {
-                return Err(last_error("LoadUserProfileW"));
+                let hint = if missing.is_empty() { String::new() } else { format!(" — the service account lacks {} (run `cimon setup` again)", missing.join(" and ")) };
+                return Err(last_error(&format!("LoadUserProfileW{hint}")));
             }
+            let mut logon = Logon { token, profile: pi.hProfile, profile_dir: String::new() };
             let mut buf = vec![0u16; 1024];
             let mut len = buf.len() as u32;
-            let profile_dir = if GetUserProfileDirectoryW(token.0, buf.as_mut_ptr(), &mut len) != 0 {
-                String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)])
-            } else {
-                String::new()
-            };
-            Ok(Logon { token, profile: pi.hProfile, profile_dir })
+            if GetUserProfileDirectoryW(logon.token.0, buf.as_mut_ptr(), &mut len) == 0 {
+                // without it USERPROFILE/APPDATA would be empty and tools would write anywhere
+                return Err(last_error("GetUserProfileDirectoryW"));
+            }
+            logon.profile_dir = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
+            Ok(logon)
         }
+    }
+}
+
+/// Enables a privilege the process token holds (it may be present but disabled).
+pub fn enable_privilege(name: &str) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_NOT_ALL_ASSIGNED, LUID};
+    use windows_sys::Win32::Security::{AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut tok: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &mut tok) == 0 {
+            return Err(last_error("OpenProcessToken"));
+        }
+        let tok = Handle(tok);
+        let mut luid: LUID = std::mem::zeroed();
+        let n = wide(name);
+        if LookupPrivilegeValueW(null(), n.as_ptr(), &mut luid) == 0 {
+            return Err(last_error("LookupPrivilegeValueW"));
+        }
+        let tp = TOKEN_PRIVILEGES { PrivilegeCount: 1, Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }] };
+        if AdjustTokenPrivileges(tok.0, 0, &tp, 0, null_mut(), null_mut()) == 0 || GetLastError() == ERROR_NOT_ALL_ASSIGNED {
+            return Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{name} is not held")));
+        }
+        Ok(())
     }
 }
 
@@ -225,16 +255,25 @@ pub fn spawn_as_user(
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::*;
     unsafe {
-        let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 1 };
-        let (mut out_r, mut out_w, mut err_r, mut err_w): (HANDLE, HANDLE, HANDLE, HANDLE) = (null_mut(), null_mut(), null_mut(), null_mut());
-        if CreatePipe(&mut out_r, &mut out_w, &sa, 0) == 0 || CreatePipe(&mut err_r, &mut err_w, &sa, 0) == 0 {
-            return Err(last_error("CreatePipe"));
-        }
-        let (out_r, out_w, err_r, err_w) = (Handle(out_r), Handle(out_w), Handle(err_r), Handle(err_w));
-        SetHandleInformation(out_r.0, HANDLE_FLAG_INHERIT, 0);
-        SetHandleInformation(err_r.0, HANDLE_FLAG_INHERIT, 0);
+        // Every handle starts non-inheritable: other threads spawn processes with std
+        // (git, probes) that inherit all inheritable handles, and one of them holding a
+        // write end would keep this step's pipe open after the step ends. The child's
+        // three handles become inheritable only around CreateProcessAsUserW.
+        let sa = SECURITY_ATTRIBUTES { nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32, lpSecurityDescriptor: null_mut(), bInheritHandle: 0 };
+        let pipe = || -> std::io::Result<(Handle, Handle)> {
+            let (mut r, mut w): (HANDLE, HANDLE) = (null_mut(), null_mut());
+            if CreatePipe(&mut r, &mut w, &sa, 0) == 0 {
+                return Err(last_error("CreatePipe"));
+            }
+            Ok((Handle(r), Handle(w)))
+        };
+        let (out_r, out_w) = pipe()?;
+        let (err_r, err_w) = pipe()?;
         let nul = wide("NUL");
         let nul_h = Handle(CreateFileW(nul.as_ptr(), FILE_GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, null_mut()));
+        if nul_h.0.is_null() || nul_h.0 == INVALID_HANDLE_VALUE {
+            return Err(last_error("CreateFileW(NUL)"));
+        }
 
         let mut size: usize = 0;
         InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut size);
@@ -260,6 +299,10 @@ pub fn spawn_as_user(
         let mut si: STARTUPINFOEXW = std::mem::zeroed();
         si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
         si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        // empty, not NULL: the child does not inherit the service's window station (the
+        // build account has no access to it); the system picks one for its logon session
+        let mut desktop = wide("");
+        si.StartupInfo.lpDesktop = desktop.as_mut_ptr();
         si.StartupInfo.hStdInput = nul_h.0;
         si.StartupInfo.hStdOutput = out_w.0;
         si.StartupInfo.hStdError = err_w.0;
@@ -277,6 +320,9 @@ pub fn spawn_as_user(
         let mut cmd = wide(cmdline);
         let dir = wide(cwd);
         let mut pi: PROCESS_INFORMATION = std::mem::zeroed();
+        for h in handles {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+        }
         let ok = CreateProcessAsUserW(
             logon.token.0,
             app.as_ptr(),
@@ -290,9 +336,13 @@ pub fn spawn_as_user(
             &si.StartupInfo,
             &mut pi,
         );
+        let create_err = (ok == 0).then(|| last_error("CreateProcessAsUserW (does the service account hold \"replace a process level token\"?)"));
+        for h in handles {
+            SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+        }
         DeleteProcThreadAttributeList(attrs);
-        if ok == 0 {
-            return Err(last_error("CreateProcessAsUserW (does the service account hold \"replace a process level token\"?)"));
+        if let Some(e) = create_err {
+            return Err(e);
         }
         let process = Handle(pi.hProcess);
         let thread = Handle(pi.hThread);
@@ -347,4 +397,121 @@ pub fn final_path(f: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
         }
         buf.resize(n + 1, 0);
     }
+}
+
+
+/// One process from a Toolhelp snapshot.
+#[derive(Debug, Clone)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+}
+
+pub fn processes() -> std::io::Result<Vec<ProcInfo>> {
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return Err(last_error("CreateToolhelp32Snapshot"));
+        }
+        let snap = Handle(snap);
+        let mut pe: PROCESSENTRY32W = std::mem::zeroed();
+        pe.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = vec![];
+        if Process32FirstW(snap.0, &mut pe) != 0 {
+            loop {
+                let len = pe.szExeFile.iter().position(|c| *c == 0).unwrap_or(pe.szExeFile.len());
+                out.push(ProcInfo { pid: pe.th32ProcessID, parent: pe.th32ParentProcessID, name: String::from_utf16_lossy(&pe.szExeFile[..len]) });
+                if Process32NextW(snap.0, &mut pe) == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn token_user_sid(token: HANDLE) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::{GetLengthSid, GetTokenInformation, TokenUser, TOKEN_USER};
+    unsafe {
+        let mut len = 0u32;
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(token, TokenUser, buf.as_mut_ptr() as _, len, &mut len) == 0 {
+            return None;
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let n = GetLengthSid(tu.User.Sid) as usize;
+        Some(std::slice::from_raw_parts(tu.User.Sid as *const u8, n).to_vec())
+    }
+}
+
+/// The SID of the user this process runs as.
+pub fn current_user_sid() -> Option<Vec<u8>> {
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    unsafe {
+        let mut tok: HANDLE = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut tok) == 0 {
+            return None;
+        }
+        let tok = Handle(tok);
+        token_user_sid(tok.0)
+    }
+}
+
+/// Terminates `pid` when it runs as `sid`. Ok(false): another user's process (left alone).
+pub fn terminate_if_owned(pid: u32, sid: &[u8]) -> std::io::Result<bool> {
+    use windows_sys::Win32::Security::TOKEN_QUERY;
+    use windows_sys::Win32::System::Threading::{OpenProcess, OpenProcessToken, TerminateProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE};
+    unsafe {
+        let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            // not ours to open: another user's process
+            return Ok(false);
+        }
+        let h = Handle(h);
+        let mut tok: HANDLE = null_mut();
+        if OpenProcessToken(h.0, TOKEN_QUERY, &mut tok) == 0 {
+            return Ok(false);
+        }
+        let tok = Handle(tok);
+        if token_user_sid(tok.0).as_deref() != Some(sid) {
+            return Ok(false);
+        }
+        if TerminateProcess(h.0, 1) == 0 {
+            return Err(last_error("TerminateProcess"));
+        }
+        Ok(true)
+    }
+}
+
+/// Decodes console output in the OEM code page (cmd and older tools on a Korean
+/// system write CP949, not UTF-8).
+pub fn decode_oem(bytes: &[u8]) -> Option<String> {
+    use windows_sys::Win32::Globalization::{GetOEMCP, MultiByteToWideChar};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    unsafe {
+        let cp = GetOEMCP();
+        let n = MultiByteToWideChar(cp, 0, bytes.as_ptr(), bytes.len() as i32, null_mut(), 0);
+        if n <= 0 {
+            return None;
+        }
+        let mut buf = vec![0u16; n as usize];
+        let n = MultiByteToWideChar(cp, 0, bytes.as_ptr(), bytes.len() as i32, buf.as_mut_ptr(), n);
+        (n > 0).then(|| String::from_utf16_lossy(&buf[..n as usize]))
+    }
+}
+
+/// Cancels a blocking read on another thread (a pipe whose write end leaked into an
+/// unrelated process never reaches end-of-file).
+pub fn cancel_thread_io(thread: HANDLE) {
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
+    unsafe { CancelSynchronousIo(thread) };
 }

@@ -5,7 +5,7 @@
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, VecDeque};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -71,11 +71,15 @@ pub fn default_error_patterns() -> Vec<Regex> {
 struct LogState {
     file: Option<std::fs::File>,
     path: PathBuf,
+    /// Bytes written to the file before truncation started.
     written: u64,
     cap: u64,
     truncating: bool,
+    /// The file keeps its first `head` bytes once truncation starts.
+    head: u64,
     ring: VecDeque<u8>,
-    dropped: u64,
+    /// Bytes that arrived after truncation started.
+    appended: u64,
     tail: VecDeque<String>,
     first_error: Option<String>,
     fail_hits: Vec<String>,
@@ -84,7 +88,8 @@ struct LogState {
 
 impl LogState {
     fn line(&mut self, raw: &[u8], patterns: &[Regex], fail: &[String], capture: &[String]) {
-        let text = String::from_utf8_lossy(raw);
+        // matching looks at the first MATCH_BYTES of a line; the log keeps all of it
+        let text = decode(&raw[..raw.len().min(MATCH_BYTES)]);
         let clean = strip_ansi(text.trim_end_matches(['\r', '\n']));
         if self.first_error.is_none() && patterns.iter().any(|p| p.is_match(&clean)) {
             self.first_error = Some(truncate(&clean, 500));
@@ -115,25 +120,28 @@ impl LogState {
     fn write(&mut self, bytes: &[u8]) {
         let quarter = self.cap / 4;
         if !self.truncating && self.written + bytes.len() as u64 > self.cap {
-            // Switch to keeping only the last quarter in memory, seeded with the end of
-            // what is on disk so the tail is continuous.
+            // Keep the file's first quarter and only the last quarter in memory, seeded
+            // with what is on disk after the head so the tail is continuous.
             self.truncating = true;
+            self.head = self.written.min(quarter);
+            let seed_from = self.head.max(self.written.saturating_sub(quarter));
             if let Some(f) = self.file.as_mut() {
-                let start = self.written.saturating_sub(quarter);
                 let _ = f.flush();
-                if let Ok(mut r) = std::fs::File::open(&self.path) {
-                    let _ = r.seek(SeekFrom::Start(start));
-                    let mut buf = vec![];
-                    let _ = r.read_to_end(&mut buf);
-                    self.ring.extend(buf);
+                if seed_from < self.written {
+                    if let Ok(mut r) = std::fs::File::open(&self.path) {
+                        let _ = r.seek(SeekFrom::Start(seed_from));
+                        let mut buf = vec![];
+                        let _ = r.take(self.written - seed_from).read_to_end(&mut buf);
+                        self.ring.extend(buf);
+                    }
                 }
             }
         }
         if self.truncating {
+            self.appended += bytes.len() as u64;
             self.ring.extend(bytes);
             while self.ring.len() as u64 > quarter {
                 self.ring.pop_front();
-                self.dropped += 1;
             }
         } else if let Some(f) = self.file.as_mut() {
             let _ = f.write_all(bytes);
@@ -147,11 +155,10 @@ impl LogState {
             let _ = f.flush();
             return false;
         }
-        let quarter = self.cap / 4;
         let _ = f.flush();
-        let _ = f.set_len(quarter);
+        let _ = f.set_len(self.head);
         let _ = f.seek(SeekFrom::End(0));
-        let omitted = self.written.saturating_sub(quarter) + self.dropped;
+        let omitted = (self.written + self.appended).saturating_sub(self.head + self.ring.len() as u64);
         let _ = writeln!(f, "\n[cimon] … log exceeded {} MB — {} bytes from the middle were dropped …", self.cap / (1024 * 1024), omitted);
         let ring: Vec<u8> = self.ring.drain(..).collect();
         let _ = f.write_all(&ring);
@@ -166,6 +173,26 @@ pub fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").into_owned()
 }
 
+/// How much of one line the matchers look at.
+const MATCH_BYTES: usize = 64 * 1024;
+/// A "line" longer than this (progress bars, binary) is handed on in pieces, so memory
+/// stays bounded and nothing is dropped.
+const LINE_LIMIT: usize = 1 << 20;
+
+/// UTF-8, or the OEM code page when the bytes are not UTF-8 (CP949 on Korean systems).
+fn decode(raw: &[u8]) -> String {
+    match std::str::from_utf8(raw) {
+        Ok(s) => s.to_string(),
+        Err(_) => {
+            #[cfg(windows)]
+            if let Some(s) = crate::win::decode_oem(raw) {
+                return s;
+            }
+            String::from_utf8_lossy(raw).into_owned()
+        }
+    }
+}
+
 fn truncate(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
@@ -177,23 +204,53 @@ fn truncate(s: &str, n: usize) -> String {
     format!("{}…", &s[..cut])
 }
 
-fn pump(reader: impl Read + Send + 'static, state: Arc<Mutex<LogState>>, patterns: Arc<Vec<Regex>>, fail: Arc<Vec<String>>, capture: Arc<Vec<String>>) -> std::thread::JoinHandle<()> {
+fn pump(mut reader: impl Read + Send + 'static, state: Arc<Mutex<LogState>>, patterns: Arc<Vec<Regex>>, fail: Arc<Vec<String>>, capture: Arc<Vec<String>>) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
-        let mut r = BufReader::with_capacity(64 * 1024, reader);
-        let mut buf = Vec::with_capacity(4096);
+        let mut chunk = vec![0u8; 64 * 1024];
+        let mut cur: Vec<u8> = Vec::with_capacity(4096);
         loop {
-            buf.clear();
-            match r.read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {
-                    // very long lines are cut so a single line cannot hold the lock forever
-                    let line = if buf.len() > 1_000_000 { &buf[..1_000_000] } else { &buf[..] };
-                    state.lock().unwrap().line(line, &patterns, &fail, &capture);
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let mut rest = &chunk[..n];
+                    while let Some(i) = rest.iter().position(|b| *b == b'\n') {
+                        cur.extend_from_slice(&rest[..=i]);
+                        state.lock().unwrap().line(&cur, &patterns, &fail, &capture);
+                        cur.clear();
+                        rest = &rest[i + 1..];
+                    }
+                    cur.extend_from_slice(rest);
+                    if cur.len() >= LINE_LIMIT {
+                        state.lock().unwrap().line(&cur, &patterns, &fail, &capture);
+                        cur.clear();
+                    }
                 }
-                Err(_) => break,
             }
         }
+        if !cur.is_empty() {
+            state.lock().unwrap().line(&cur, &patterns, &fail, &capture);
+        }
     })
+}
+
+/// Waits for the output pumps. Once the command and its job are gone the pipes reach
+/// end-of-file at once — unless a write end leaked into an unrelated process; then the
+/// read is cancelled after a grace period instead of hanging the step.
+fn join_pumps(pumps: Vec<std::thread::JoinHandle<()>>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while pumps.iter().any(|p| !p.is_finished()) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    #[cfg(windows)]
+    for p in &pumps {
+        if !p.is_finished() {
+            use std::os::windows::io::AsRawHandle;
+            crate::win::cancel_thread_io(p.as_raw_handle() as _);
+        }
+    }
+    for p in pumps {
+        let _ = p.join();
+    }
 }
 
 pub fn execute(spec: &ExecSpec, account: &Account, cancel: &AtomicBool) -> ExecResult {
@@ -209,8 +266,9 @@ pub fn execute(spec: &ExecSpec, account: &Account, cancel: &AtomicBool) -> ExecR
         written: 0,
         cap: spec.log_cap.max(4096),
         truncating: false,
+        head: 0,
         ring: VecDeque::new(),
-        dropped: 0,
+        appended: 0,
         tail: VecDeque::new(),
         first_error: None,
         fail_hits: vec![],
@@ -238,6 +296,11 @@ pub fn execute(spec: &ExecSpec, account: &Account, cancel: &AtomicBool) -> ExecR
             res.timed_out = o.timed_out;
             res.cancelled = o.cancelled;
             res.leftover = o.leftover;
+            // the helper could not start the program: that is not the program's exit code
+            if let Some(e) = o.spawn_error {
+                res.spawn_error = Some(e);
+                res.exit_code = None;
+            }
         }
         Err(e) => res.spawn_error = Some(e),
     }
@@ -268,6 +331,7 @@ struct RunOutcome {
     timed_out: bool,
     cancelled: bool,
     leftover: u32,
+    spawn_error: Option<String>,
 }
 
 #[cfg(windows)]
@@ -327,22 +391,27 @@ fn run_windows(
                 }
                 std::thread::sleep(Duration::from_millis(100));
             };
-            let leftover = job.active_processes();
-            if leftover > 0 {
-                job.terminate();
-            }
-            let _ = out.join();
-            let _ = err.join();
-            Ok(RunOutcome { exit_code: status.and_then(|s| s.code()).map(|c| c as i64), timed_out, cancelled, leftover })
+            // after a timeout or cancel the job is already being torn down
+            let leftover = if timed_out || cancelled { 0 } else { job.active_processes() };
+            job.terminate();
+            join_pumps(vec![out, err]);
+            Ok(RunOutcome { exit_code: status.and_then(|s| s.code()).map(|c| c as i64), timed_out, cancelled, leftover, spawn_error: None })
         }
         Account::Build { logon, helper } => {
-            let spec_file = spec.env.get("TEMP").map(PathBuf::from).unwrap_or_else(|| spec.cwd.clone()).join(format!("cimon-exec-{}.json", std::process::id()));
+            // one file per call: probes, fixtures and steps can run at the same time
+            let spec_file = spec.env.get("TEMP").map(PathBuf::from).unwrap_or_else(|| spec.cwd.clone()).join(format!("cimon-exec-{}.json", cimon_core::random_id128()));
+            let err_file = spec_file.with_extension("err");
             let child = ChildSpec { program: spec.program.clone(), args: spec.args.clone(), cwd: spec.cwd.clone(), env: spec.env.clone() };
             std::fs::write(&spec_file, serde_json::to_vec(&child).unwrap()).map_err(|e| format!("{}: {e}", spec_file.display()))?;
             let cmdline = format!("\"{}\" __exec \"{}\"", helper.display(), spec_file.display());
             let env: Vec<(String, String)> = spec.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-            let (proc_h, out_r, err_r) =
-                win::spawn_as_user(logon, &helper.to_string_lossy(), &cmdline, &env, &spec.cwd.to_string_lossy(), &job).map_err(|e| e.to_string())?;
+            let (proc_h, out_r, err_r) = match win::spawn_as_user(logon, &helper.to_string_lossy(), &cmdline, &env, &spec.cwd.to_string_lossy(), &job) {
+                Ok(x) => x,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&spec_file);
+                    return Err(e.to_string());
+                }
+            };
             let out = pump(out_r, state.clone(), patterns.clone(), fail.clone(), capture.clone());
             let err = pump(err_r, state.clone(), patterns.clone(), fail.clone(), capture.clone());
             loop {
@@ -358,14 +427,13 @@ fn run_windows(
                 }
             }
             let code = win::exit_code(proc_h.0);
-            let leftover = job.active_processes();
-            if leftover > 0 {
-                job.terminate();
-            }
-            let _ = out.join();
-            let _ = err.join();
+            let leftover = if timed_out || cancelled { 0 } else { job.active_processes() };
+            job.terminate();
+            join_pumps(vec![out, err]);
+            let spawn_error = std::fs::read_to_string(&err_file).ok().filter(|s| !s.trim().is_empty());
             let _ = std::fs::remove_file(&spec_file);
-            Ok(RunOutcome { exit_code: code, timed_out, cancelled, leftover })
+            let _ = std::fs::remove_file(&err_file);
+            Ok(RunOutcome { exit_code: code, timed_out, cancelled, leftover, spawn_error })
         }
     }
 }
@@ -406,9 +474,8 @@ fn run_portable(
         }
         std::thread::sleep(Duration::from_millis(100));
     };
-    let _ = out.join();
-    let _ = err.join();
-    Ok(RunOutcome { exit_code: status.and_then(|s| s.code()).map(|c| c as i64), timed_out, cancelled, leftover: 0 })
+    join_pumps(vec![out, err]);
+    Ok(RunOutcome { exit_code: status.and_then(|s| s.code()).map(|c| c as i64), timed_out, cancelled, leftover: 0, spawn_error: None })
 }
 
 /// What the `__exec` helper runs (as the build account, inside the job).
@@ -421,22 +488,23 @@ pub struct ChildSpec {
 }
 
 /// `cimon __exec <spec>` — runs the command with inherited stdio and exits with its
-/// code. std's Command handles `.bat`/`.cmd` argument escaping (design §9.3).
+/// code. std's Command handles `.bat`/`.cmd` argument escaping (design §9.3). When the
+/// command cannot be started, the reason goes to `<spec>.err` so the runner reports a
+/// start failure instead of an exit code.
 pub fn child_exec_main(spec_path: &Path) -> i32 {
+    let fail = |msg: String, code: i32| {
+        eprintln!("[cimon] {msg}");
+        let _ = std::fs::write(spec_path.with_extension("err"), &msg);
+        code
+    };
     let spec: ChildSpec = match std::fs::read(spec_path).ok().and_then(|b| serde_json::from_slice(&b).ok()) {
         Some(s) => s,
-        None => {
-            eprintln!("[cimon] __exec: cannot read {}", spec_path.display());
-            return 125;
-        }
+        None => return fail(format!("__exec: cannot read {}", spec_path.display()), 125),
     };
     let status = std::process::Command::new(&spec.program).args(&spec.args).current_dir(&spec.cwd).env_clear().envs(&spec.env).status();
     match status {
         Ok(s) => s.code().unwrap_or(1),
-        Err(e) => {
-            eprintln!("[cimon] could not start {}: {e}", spec.program.display());
-            126
-        }
+        Err(e) => fail(format!("could not start {}: {e}", spec.program.display()), 126),
     }
 }
 
@@ -532,6 +600,49 @@ mod tests {
         assert!(log.contains("line-1-"));
         assert!(log.contains("line-3000-"));
         assert!(log.contains("bytes from the middle were dropped"));
+    }
+
+    #[test]
+    fn log_cap_with_a_huge_first_line_and_no_newlines() {
+        let d = tempfile::tempdir().unwrap();
+        let mut st = LogState {
+            file: std::fs::File::create(d.path().join("l.txt")).ok(),
+            path: d.path().join("l.txt"),
+            written: 0,
+            cap: 4000,
+            truncating: false,
+            head: 0,
+            ring: VecDeque::new(),
+            appended: 0,
+            tail: VecDeque::new(),
+            first_error: None,
+            fail_hits: vec![],
+            captured: vec![],
+        };
+        st.write(b"start\n");
+        st.write(&vec![b'x'; 10_000]);
+        st.write(b"\nend\n");
+        assert!(st.finish());
+        let log = std::fs::read(d.path().join("l.txt")).unwrap();
+        assert!(!log.contains(&0u8), "no NUL padding");
+        assert!(log.starts_with(b"start\n"));
+        assert!(log.ends_with(b"end\n"));
+        let text = String::from_utf8_lossy(&log);
+        // 6 + 10000 + 5 bytes in, 6 kept at the head, 1000 in the tail
+        assert!(text.contains(" 9005 bytes from the middle"), "{text}");
+    }
+
+    #[test]
+    fn output_without_newlines_is_kept() {
+        let d = tempfile::tempdir().unwrap();
+        // ~1.2 MB of dots without a newline, then a marker
+        let s = spec(d.path(), &["/c", "powershell -NoProfile -Command \"[Console]::Out.Write('.' * 1200000); [Console]::Out.Write('MARK')\""], 60);
+        let mut s = s;
+        s.env.insert("PATH".into(), format!("{}\\System32;{}\\System32\\WindowsPowerShell\\v1.0", std::env::var("SystemRoot").unwrap(), std::env::var("SystemRoot").unwrap()));
+        let r = execute(&s, &Account::Current, &AtomicBool::new(false));
+        assert_eq!(r.exit_code, Some(0), "{r:?}");
+        let log = std::fs::read_to_string(d.path().join("log.txt")).unwrap();
+        assert!(log.contains("MARK"), "tail of a newline-less stream is not dropped");
     }
 
     #[test]

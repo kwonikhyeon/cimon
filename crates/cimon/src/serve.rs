@@ -38,12 +38,16 @@ pub async fn start(
     if !addr.ip().is_loopback() {
         anyhow::bail!("[server].bind must be a loopback address — tailscale serve is the only way in (design §15.3), got {addr}");
     }
-    // the engine's workers stop with the HTTP server
-    let engine_stop = app.engine.shutdown.clone();
+    // the engine's workers stop with the HTTP server, and a running job's processes
+    // are terminated (the job is recorded as interrupted) instead of holding the stop
+    let app2 = app.clone();
     let sd2 = shutdown.clone();
     tokio::spawn(async move {
         sd2.cancelled().await;
-        engine_stop.cancel();
+        app2.engine.shutdown.cancel();
+        for flag in app2.engine.running.lock().unwrap().values() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
     });
     cimon_engine::start(&app)?;
     let mut router = cimon_mcp::router(app.clone(), shutdown.clone());

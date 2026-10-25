@@ -135,6 +135,8 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         return;
     }
     let Ok(job) = app.store.require_job(id) else { return };
+    // the job's sweeps would kill an install running as the build account in intake
+    let _build_guard = app.engine.build_lock.lock().unwrap_or_else(|p| p.into_inner());
     let started = Instant::now();
     let request: JobRequest = serde_json::from_str(&job.request_json).unwrap();
     let plan: JobPlan = serde_json::from_str(job.plan_json.as_deref().unwrap_or("{}")).unwrap_or_default();
@@ -222,7 +224,20 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     let records = run_steps(&mut ctx, slot, recreated);
 
     crate::fixtures::account_env(&mut ctx, false);
-    let cancelled = cancel.load(Ordering::SeqCst) || app.store.job(id).ok().flatten().is_some_and(|j| j.cancel_requested_by.is_some());
+    let user_cancel = app.store.job(id).ok().flatten().is_some_and(|j| j.cancel_requested_by.is_some());
+    if app.engine.shutdown.is_cancelled() && !user_cancel {
+        // the service is stopping: nobody cancelled this job, it was interrupted
+        if build.is_some() {
+            sweep(app, &mut ctx.warnings, "서비스 중지");
+        }
+        if let Some(s) = slot {
+            let _ = app.store.clear_warm_state(&job.project_key, s);
+        }
+        jobs::finish_simple(app, id, JobState::Interrupted, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("interrupted"), "서비스 중지로 중단됨 — 다시 요청하라");
+        cleanup(app, &job, slot, request.args.clean, &plan, &resolved);
+        return;
+    }
+    let cancelled = cancel.load(Ordering::SeqCst) || user_cancel;
     let _ = app.store.transition(id, &[JobState::Running], JobState::Collecting, "결과 정리");
     if build.is_some() {
         sweep(app, &mut ctx.warnings, "작업 끝");
@@ -498,6 +513,14 @@ fn run_one(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, label: &str, rec: &m
         rec.result = "fail".into();
         rec.outcome = Some(Outcome::fail(FailureClass::Recipe, msg));
     };
+    // the logs tree is service-only; the build account may write this step's out dir
+    if let Some(user) = ctx.build_user.clone() {
+        if let Err(e) = cimon_runner::grant_modify(&out_dir, &user) {
+            rec.result = "inconclusive".into();
+            rec.outcome = Some(Outcome::inconclusive(FailureClass::Infra, format!("${{step.out}} 권한을 주지 못했다: {e}")));
+            return;
+        }
+    }
     // Everything that needs `${…}` expansion, while `ctx` is only borrowed.
     let prepared: Result<(BTreeMap<String, String>, PathBuf, Vec<String>, PathBuf, Vec<String>), String> = (|| {
         let lookup = ctx.lookup(&sid, &out_dir);
@@ -679,8 +702,8 @@ fn run_script_judge(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, res: &cimon
         Err(e) => return broken(e),
     };
     let mut env = env.clone();
-    env.insert("CIMON_STEP_EXIT".into(), res.exit_code.map(|c| c.to_string()).unwrap_or_default());
-    env.insert("CIMON_STEP_OUT".into(), out_dir.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "CIMON_STEP_EXIT", res.exit_code.map(|c| c.to_string()).unwrap_or_default());
+    cimon_runner::env_set(&mut env, "CIMON_STEP_OUT", out_dir.to_string_lossy().into());
     let path_dirs: Vec<PathBuf> = env.get("PATH").map(|p| p.split(';').map(PathBuf::from).collect()).unwrap_or_default();
     let pathext = env.get("PATHEXT").cloned().unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
     let program = match cimon_runner::resolve_program(&argv[0], &ctx.ws, &path_dirs, &pathext) {
@@ -843,57 +866,57 @@ impl JobCtx<'_> {
         let mut env = cimon_runner::base_env(self.profile.as_deref(), self.build_user.as_deref());
         let tmp = app.layout.tmp_job(id);
         std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
-        env.insert("TEMP".into(), tmp.to_string_lossy().into());
-        env.insert("TMP".into(), tmp.to_string_lossy().into());
+        cimon_runner::env_set(&mut env, "TEMP", tmp.to_string_lossy().into());
+        cimon_runner::env_set(&mut env, "TMP", tmp.to_string_lossy().into());
         let mut path = self.tool_env.path.clone();
         path.extend(cimon_runner::system_path());
-        env.insert("PATH".into(), cimon_runner::join_path(&path));
+        cimon_runner::env_set(&mut env, "PATH", cimon_runner::join_path(&path));
         for (k, v) in &self.tool_env.exports {
-            env.insert(k.clone(), v.clone());
+            cimon_runner::env_set(&mut env, k, v.clone());
         }
         let caches = app.layout.caches(pk);
         for (k, sub) in [("CARGO_HOME", "cargo"), ("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv"), ("GRADLE_USER_HOME", "gradle"), ("NUGET_PACKAGES", "nuget")] {
             let d = caches.join(sub);
             let _ = std::fs::create_dir_all(&d);
-            env.insert(k.into(), d.to_string_lossy().into());
+            cimon_runner::env_set(&mut env, k, d.to_string_lossy().into());
         }
         if let Some(rh) = &self.tool_env.rustup_home {
-            env.insert("RUSTUP_HOME".into(), rh.to_string_lossy().into());
+            cimon_runner::env_set(&mut env, "RUSTUP_HOME", rh.to_string_lossy().into());
         }
         for (name, scope) in &self.resolved.isolate {
             let d = if scope == "job" { app.layout.home_job(id, name) } else { app.layout.home_project(pk, name) };
             std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
-            env.insert(name.clone(), d.to_string_lossy().into());
+            cimon_runner::env_set(&mut env, name, d.to_string_lossy().into());
         }
         for s in &self.plan.siblings {
             if let Some(dir) = self.siblings.get(&s.project) {
                 for e in &s.env {
-                    env.insert(e.clone(), dir.to_string_lossy().into());
+                    cimon_runner::env_set(&mut env, e, dir.to_string_lossy().into());
                 }
             }
         }
         let lookup = self.lookup(step.id(), out_dir);
         let ex = |v: &str| cimon_recipe::vars::expand(v, &lookup);
         for (k, v) in &self.resolved.env {
-            env.insert(k.clone(), ex(v)?);
+            cimon_runner::env_set(&mut env, k, ex(v)?);
         }
         if self.clean {
             for (k, v) in &self.resolved.clean_env {
-                env.insert(k.clone(), ex(v)?);
+                cimon_runner::env_set(&mut env, k, ex(v)?);
             }
         }
         if let Some(f) = step.def.fixture.as_ref().and_then(|f| self.resolved.fixtures.get(f)) {
             for (k, v) in &f.env {
-                env.insert(k.clone(), ex(v)?);
+                cimon_runner::env_set(&mut env, k, ex(v)?);
             }
         }
         for (k, v) in &step.def.env {
-            env.insert(k.clone(), ex(v)?);
+            cimon_runner::env_set(&mut env, k, ex(v)?);
         }
         for (pname, pdef) in &self.resolved.params {
             if pdef.applies_to.as_ref().is_some_and(|a| a.iter().any(|x| x == step.id())) {
                 if let (Some(var), Some(val)) = (&pdef.env, self.plan.plan.params.get(pname)) {
-                    env.insert(var.clone(), param_string(val));
+                    cimon_runner::env_set(&mut env, var, param_string(val));
                 }
             }
         }

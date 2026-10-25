@@ -215,25 +215,25 @@ fn fixture_env(ctx: &JobCtx<'_>, def: &FixtureDef, out_dir: &std::path::Path) ->
     let mut env = cimon_runner::base_env(ctx.profile.as_deref(), ctx.build_user.as_deref());
     let tmp = ctx.app.layout.tmp_job(ctx.job.id);
     let _ = std::fs::create_dir_all(&tmp);
-    env.insert("TEMP".into(), tmp.to_string_lossy().into());
-    env.insert("TMP".into(), tmp.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "TEMP", tmp.to_string_lossy().into());
+    cimon_runner::env_set(&mut env, "TMP", tmp.to_string_lossy().into());
     let mut path = ctx.tool_env.path.clone();
     path.extend(cimon_runner::system_path());
-    env.insert("PATH".into(), cimon_runner::join_path(&path));
+    cimon_runner::env_set(&mut env, "PATH", cimon_runner::join_path(&path));
     for (k, v) in &ctx.tool_env.exports {
-        env.insert(k.clone(), v.clone());
+        cimon_runner::env_set(&mut env, k, v.clone());
     }
     for (name, scope) in &ctx.resolved.isolate {
         let d = if scope == "job" { ctx.app.layout.home_job(ctx.job.id, name) } else { ctx.app.layout.home_project(&ctx.job.project_key, name) };
         let _ = std::fs::create_dir_all(&d);
-        env.insert(name.clone(), d.to_string_lossy().into());
+        cimon_runner::env_set(&mut env, name, d.to_string_lossy().into());
     }
     let lookup = ctx.lookup("fixture", out_dir);
     for (k, v) in &ctx.resolved.env {
-        env.insert(k.clone(), cimon_recipe::vars::expand(v, &lookup)?);
+        cimon_runner::env_set(&mut env, k, cimon_recipe::vars::expand(v, &lookup)?);
     }
     for (k, v) in &def.env {
-        env.insert(k.clone(), cimon_recipe::vars::expand(v, &lookup)?);
+        cimon_runner::env_set(&mut env, k, cimon_recipe::vars::expand(v, &lookup)?);
     }
     Ok(env)
 }
@@ -245,6 +245,9 @@ fn run_argv(ctx: &JobCtx<'_>, name: &str, what: &str, argv: &[String], timeout: 
     let cancel = if cleanup { &never } else { ctx.cancel };
     let out_dir = ctx.app.layout.step_out(ctx.job.id, &format!("fixture-{name}"));
     let _ = std::fs::create_dir_all(&out_dir);
+    if let Some(user) = &ctx.build_user {
+        cimon_runner::grant_modify(&out_dir, user)?;
+    }
     let lookup = ctx.lookup("fixture", &out_dir);
     let argv: Vec<String> = argv.iter().map(|a| cimon_recipe::vars::expand(a, &lookup)).collect::<Result<_, _>>()?;
     let env = fixture_env(ctx, def, &out_dir)?;

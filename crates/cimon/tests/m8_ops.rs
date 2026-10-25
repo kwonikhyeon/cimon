@@ -123,7 +123,15 @@ async fn stale_offsite_copy_warns_on_recipe_tools() {
     let (v, _) = call(&c, "recipe_show", json!({})).await;
     let w = v["backup_warnings"][0].as_str().unwrap();
     assert!(w.contains("30시간 전"), "{w}");
-    let health: serde_json::Value = reqwest::get(format!("{}/healthz", h.base)).await.unwrap().json().await.unwrap();
+    let health: serde_json::Value = reqwest::Client::new()
+        .get(format!("{}/healthz", h.base))
+        .bearer_auth(&h.member_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
     assert!(health["warnings"][0].as_str().unwrap().contains("30시간 전"));
     c.cancel().await.unwrap();
 }

@@ -368,8 +368,8 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
         }
         if let Some(pkgs) = &req.packages {
             for pkg in pkgs {
-                if !pkg.contains("==") {
-                    cx.err_recipe(pkg, format!("toolchain {kind}: package {pkg:?} must pin an exact version (name==x.y.z)"));
+                if !valid_package_pin(pkg) {
+                    cx.err_recipe(pkg, format!("toolchain {kind}: package {pkg:?} must be name==x.y.z (an exact pin; no options, URLs or paths)"));
                 }
             }
         }
@@ -857,6 +857,37 @@ pub fn step_strings(d: &StepDef) -> Vec<String> {
         }
     }
     v
+}
+
+/// `name==version` (optionally with extras) — nothing uv could read as an option, a
+/// URL or a path.
+pub fn valid_package_pin(p: &str) -> bool {
+    let Some((name, ver)) = p.split_once("==") else { return false };
+    let (base, extras) = match name.split_once('[') {
+        Some((b, e)) => match e.strip_suffix(']') {
+            Some(e) => (b, Some(e)),
+            None => return false,
+        },
+        None => (name, None),
+    };
+    let word = |s: &str, extra: &[char]| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || extra.contains(&c));
+    base.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && word(base, &['.', '_', '-'])
+        && extras.is_none_or(|e| e.split(',').all(|x| word(x.trim(), &['.', '_', '-'])))
+        && ver.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && word(ver, &['.', '+', '!', '_', '-'])
+}
+
+#[cfg(test)]
+#[test]
+fn package_pins() {
+    assert!(valid_package_pin("ruff==0.6.9"));
+    assert!(valid_package_pin("uvicorn[standard]==0.30.1"));
+    assert!(!valid_package_pin("--index-url=https://evil==1"));
+    assert!(!valid_package_pin("-e==1"));
+    assert!(!valid_package_pin("pkg @ https://x==1"));
+    assert!(!valid_package_pin("ruff>=0.6"));
+    assert!(!valid_package_pin("ruff==-1"));
 }
 
 pub fn valid_env_name(s: &str) -> bool {

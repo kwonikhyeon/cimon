@@ -95,19 +95,27 @@ async fn download(
     if let Ok(v) = http::HeaderValue::from_str(&format!("attachment; filename=\"{safe}\"")) {
         resp.headers_mut().insert(header::CONTENT_DISPOSITION, v);
     }
+    // a build output is never a page on this origin, whatever its extension says
+    let h = resp.headers_mut();
+    h.insert(header::CONTENT_TYPE, http::HeaderValue::from_static("application/octet-stream"));
+    h.insert(header::X_CONTENT_TYPE_OPTIONS, http::HeaderValue::from_static("nosniff"));
+    h.insert(header::CONTENT_SECURITY_POLICY, http::HeaderValue::from_static("sandbox; default-src 'none'"));
     resp.headers_mut().insert("x-content-sha256", http::HeaderValue::from_str(&row.sha256).unwrap());
     resp
+}
+
+fn bearer(headers: &http::HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(|s| s.trim().to_string())
 }
 
 /// Rejects requests without a valid user token with HTTP 401 before rmcp sees them,
 /// and attaches the [`AuthUser`] for the tool handlers.
 async fn require_token(State(app): State<Arc<App>>, mut req: Request<Body>, next: Next) -> Response {
-    let token = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
-        .map(|s| s.trim().to_string());
+    let token = bearer(req.headers());
     let user = match token {
         Some(t) if !t.is_empty() => match app.store.authenticate(&t) {
             Ok(u) => u,
@@ -144,8 +152,15 @@ async fn require_token(State(app): State<Arc<App>>, mut req: Request<Body>, next
 #[derive(Debug, Clone)]
 pub struct TailnetLogin(pub Option<String>);
 
-async fn healthz(State(app): State<Arc<App>>) -> impl IntoResponse {
-    Json(cimon_engine::health(&app))
+/// Anyone who reaches the port gets `{"ok": true}`; queue, disk, recipe commit and
+/// backup state need a user token (they describe the machine).
+async fn healthz(State(app): State<Arc<App>>, headers: http::HeaderMap) -> impl IntoResponse {
+    let authed = bearer(&headers).filter(|t| !t.is_empty()).and_then(|t| app.store.authenticate(&t).ok().flatten()).is_some();
+    if authed {
+        Json(cimon_engine::health(&app))
+    } else {
+        Json(serde_json::json!({ "ok": true, "detail": "send a user token (Authorization: Bearer …) for queue, disk and backup state" }))
+    }
 }
 
 /// The authenticated user stored by [`require_token`] in the request parts rmcp hands

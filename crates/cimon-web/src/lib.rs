@@ -78,8 +78,14 @@ fn need(app: &App, headers: &HeaderMap) -> Result<Session, Response> {
     session(app, headers).ok_or_else(|| (StatusCode::UNAUTHORIZED, Html(views::login_page(None).into_string())).into_response())
 }
 
+/// Compares without an early exit, so response time says nothing about how much of a
+/// guessed token was right.
+fn same_secret(a: &str, b: &str) -> bool {
+    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 fn check_csrf(s: &Session, token: &str) -> Result<(), Response> {
-    if token.is_empty() || token != s.csrf {
+    if token.is_empty() || !same_secret(token, &s.csrf) {
         return Err((StatusCode::FORBIDDEN, "CSRF token mismatch — reload the page").into_response());
     }
     Ok(())

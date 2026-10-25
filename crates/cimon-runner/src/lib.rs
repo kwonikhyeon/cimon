@@ -37,6 +37,14 @@ pub const SYSTEM_VARS: &[&str] = &[
 /// process in single-account mode.
 pub const USER_VARS: &[&str] = &["USERPROFILE", "HOMEDRIVE", "HOMEPATH", "LOCALAPPDATA", "APPDATA", "USERNAME", "USERDOMAIN"];
 
+/// Sets `key` in an environment map the way Windows sees it: names are compared
+/// without case, so a later layer's `npm_config_cache` replaces an earlier
+/// `NPM_CONFIG_CACHE` instead of both reaching the child in byte order.
+pub fn env_set(env: &mut BTreeMap<String, String>, key: &str, value: String) {
+    env.retain(|k, _| !k.eq_ignore_ascii_case(key));
+    env.insert(key.to_string(), value);
+}
+
 /// Layers 1–2 plus the system part of PATH.
 pub fn base_env(profile_dir: Option<&Path>, user_name: Option<&str>) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
@@ -45,6 +53,12 @@ pub fn base_env(profile_dir: Option<&Path>, user_name: Option<&str>) -> BTreeMap
             env.insert(k.to_string(), v);
         }
     }
+    // cmd and CreateProcess look in the current directory first; with this set a
+    // script calling `cargo` cannot pick up a cargo.exe committed to the work tree
+    env.insert("NoDefaultCurrentDirectoryInExePath".into(), "1".into());
+    // English tool messages, so error patterns match (a recipe's [env] may override)
+    env.insert("VSLANG".into(), "1033".into());
+    env.insert("DOTNET_CLI_UI_LANGUAGE".into(), "en".into());
     match profile_dir {
         Some(p) => {
             let p = p.to_string_lossy().to_string();
@@ -168,54 +182,33 @@ pub struct SweepReport {
 }
 
 /// `cimon __sweep` — terminates every process of the current (build) user except
-/// itself and its parent chain, and deletes the scheduled tasks that run as it.
+/// itself and its ancestors, and deletes the scheduled tasks that run as it. Processes
+/// come from a Toolhelp snapshot and ownership from each process token (no tasklist or
+/// wmic: their output is localized, and wmic is gone from current Windows).
 pub fn sweep_main() -> i32 {
     let mut rep = SweepReport::default();
-    let me = std::process::id();
+    sweep_processes(&mut rep);
     let user = std::env::var("USERNAME").unwrap_or_default();
-    // tasklist /v gives the user name; /fo csv for parsing
-    let out = std::process::Command::new("tasklist").args(["/v", "/fo", "csv", "/nh"]).output();
-    if let Ok(out) = out {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let parent = parent_pid(me);
-        for line in text.lines() {
-            let cols = parse_csv(line);
-            if cols.len() < 7 {
-                continue;
-            }
-            let (name, pid, owner) = (&cols[0], cols[1].parse::<u32>().unwrap_or(0), &cols[6]);
-            let owner_user = owner.rsplit('\\').next().unwrap_or(owner);
-            if pid == 0 || pid == me || Some(pid) == parent || !owner_user.eq_ignore_ascii_case(&user) {
-                continue;
-            }
-            if matches!(name.to_lowercase().as_str(), "conhost.exe" | "tasklist.exe" | "dllhost.exe" | "sihost.exe" | "taskhostw.exe") {
-                continue;
-            }
-            let ok = std::process::Command::new("taskkill").args(["/f", "/t", "/pid", &pid.to_string()]).output().map(|o| o.status.success()).unwrap_or(false);
-            if ok {
-                rep.killed.push(format!("{name} ({pid})"));
-            } else {
-                rep.errors.push(format!("could not terminate {name} ({pid})"));
-            }
-        }
-    } else {
-        rep.errors.push("tasklist failed".into());
-    }
-    if let Ok(out) = std::process::Command::new("schtasks").args(["/query", "/fo", "csv", "/v", "/nh"]).output() {
-        let text = String::from_utf8_lossy(&out.stdout);
-        let mut seen = std::collections::BTreeSet::new();
-        for line in text.lines() {
-            let cols = parse_csv(line);
-            // TaskName is column 1, "Run As User" is column 14 in the verbose CSV
-            if cols.len() > 14 {
-                let name = cols[1].clone();
-                let run_as = cols[14].rsplit('\\').next().unwrap_or(&cols[14]).to_string();
-                if run_as.eq_ignore_ascii_case(&user) && !name.starts_with("\\Microsoft") && seen.insert(name.clone()) {
-                    let ok = std::process::Command::new("schtasks").args(["/delete", "/tn", &name, "/f"]).output().map(|o| o.status.success()).unwrap_or(false);
-                    if ok {
-                        rep.tasks_deleted.push(name);
-                    } else {
-                        rep.errors.push(format!("could not delete scheduled task {name}"));
+    let schtasks = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\schtasks.exe");
+    match std::process::Command::new(&schtasks).args(["/query", "/fo", "csv", "/v", "/nh"]).output() {
+        Ok(out) if !out.status.success() => rep.errors.push(format!("schtasks /query exited {:?}: {}", out.status.code(), String::from_utf8_lossy(&out.stderr).trim())),
+        Err(e) => rep.errors.push(format!("schtasks: {e}")),
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let mut seen = std::collections::BTreeSet::new();
+            for line in text.lines() {
+                let cols = parse_csv(line);
+                // TaskName is column 1, "Run As User" is column 14 in the verbose CSV
+                if cols.len() > 14 {
+                    let name = cols[1].clone();
+                    let run_as = cols[14].rsplit('\\').next().unwrap_or(&cols[14]).to_string();
+                    if run_as.eq_ignore_ascii_case(&user) && !name.starts_with("\\Microsoft") && seen.insert(name.clone()) {
+                        let ok = std::process::Command::new(&schtasks).args(["/delete", "/tn", &name, "/f"]).output().map(|o| o.status.success()).unwrap_or(false);
+                        if ok {
+                            rep.tasks_deleted.push(name);
+                        } else {
+                            rep.errors.push(format!("could not delete scheduled task {name}"));
+                        }
                     }
                 }
             }
@@ -225,9 +218,41 @@ pub fn sweep_main() -> i32 {
     0
 }
 
-fn parent_pid(pid: u32) -> Option<u32> {
-    let out = std::process::Command::new("wmic").args(["process", "where", &format!("ProcessId={pid}"), "get", "ParentProcessId", "/value"]).output().ok()?;
-    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| l.trim().strip_prefix("ParentProcessId=").and_then(|v| v.trim().parse().ok()))
+#[cfg(windows)]
+fn sweep_processes(rep: &mut SweepReport) {
+    let Some(sid) = win::current_user_sid() else {
+        rep.errors.push("cannot read this process's user".into());
+        return;
+    };
+    let procs = match win::processes() {
+        Ok(p) => p,
+        Err(e) => {
+            rep.errors.push(format!("process list: {e}"));
+            return;
+        }
+    };
+    // spare this process and its ancestors (the __exec helper that started it)
+    let parent: std::collections::HashMap<u32, u32> = procs.iter().map(|p| (p.pid, p.parent)).collect();
+    let mut spare = std::collections::HashSet::new();
+    let mut cur = std::process::id();
+    while cur != 0 && spare.insert(cur) {
+        cur = parent.get(&cur).copied().unwrap_or(0);
+    }
+    for p in &procs {
+        if p.pid == 0 || spare.contains(&p.pid) || matches!(p.name.to_lowercase().as_str(), "conhost.exe" | "dllhost.exe" | "sihost.exe" | "taskhostw.exe") {
+            continue;
+        }
+        match win::terminate_if_owned(p.pid, &sid) {
+            Ok(true) => rep.killed.push(format!("{} ({})", p.name, p.pid)),
+            Ok(false) => {}
+            Err(e) => rep.errors.push(format!("could not terminate {} ({}): {e}", p.name, p.pid)),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn sweep_processes(rep: &mut SweepReport) {
+    rep.errors.push("process sweep is Windows-only".into());
 }
 
 fn parse_csv(line: &str) -> Vec<String> {
@@ -266,11 +291,19 @@ pub fn account_env_main(args: &[String]) -> i32 {
                     return 2;
                 }
             },
-            "clear" => std::process::Command::new("reg").args(["delete", r"HKCU\Environment", "/v", item, "/f"]).output(),
+            "clear" => {
+                // only a value that is not there counts as cleared — any other failure
+                // would leave the previous job's homes in the account's environment
+                let present = std::process::Command::new("reg").args(["query", r"HKCU\Environment", "/v", item]).output().map(|o| o.status.success()).unwrap_or(true);
+                if !present {
+                    continue;
+                }
+                std::process::Command::new("reg").args(["delete", r"HKCU\Environment", "/v", item, "/f"]).output()
+            }
             _ => return 2,
         };
         match res {
-            Ok(o) if o.status.success() || mode == "clear" => {}
+            Ok(o) if o.status.success() => {}
             Ok(o) => {
                 eprintln!("reg failed for {item}: {}", String::from_utf8_lossy(&o.stderr));
                 return 1;
@@ -303,6 +336,26 @@ pub fn open_within(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
     } else {
         Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{} leads outside {} (to {})", path.display(), root.display(), real.display())))
     }
+}
+
+/// Gives `user` modify rights on `dir` and below (a step's `${step.out}` in the logs
+/// tree, which is otherwise service-only).
+pub fn grant_modify(dir: &Path, user: &str) -> Result<(), String> {
+    let out = std::process::Command::new("icacls").arg(dir).args(["/grant", &format!("{user}:(OI)(CI)M"), "/Q"]).output().map_err(|e| format!("icacls: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("icacls {} /grant {user}: {}", dir.display(), String::from_utf8_lossy(&out.stdout).trim()));
+    }
+    Ok(())
+}
+
+/// Replaces every ACL under `dir` with what it inherits from its parent — after a move
+/// (which keeps the old ACL) or after a script installer had write access.
+pub fn reset_acl(dir: &Path) -> Result<(), String> {
+    let out = std::process::Command::new("icacls").arg(dir).args(["/reset", "/T", "/C", "/Q"]).output().map_err(|e| format!("icacls: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("icacls {} /reset: {}", dir.display(), String::from_utf8_lossy(&out.stdout).trim()));
+    }
+    Ok(())
 }
 
 /// Free disk space for `[disk].min_free_gb`.

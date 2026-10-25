@@ -69,8 +69,9 @@ pub fn layout_of(ctx: &Ctx, _kind: &str, def: &KindDef, version: &str, root: &Pa
             if venv.exists() {
                 InstLayout { bins: vec![venv.join("Scripts")], home: venv }
             } else {
-                // `uv python install --install-dir` puts one interpreter directory here
-                let dir = std::fs::read_dir(root).ok().and_then(|rd| rd.flatten().find(|e| e.path().join("python.exe").exists()).map(|e| e.path())).unwrap_or_else(|| root.to_path_buf());
+                // UV_PYTHON_INSTALL_DIR = root\python holds one interpreter directory
+                let find = |d: &Path| std::fs::read_dir(d).ok().and_then(|rd| rd.flatten().find(|e| e.path().join("python.exe").exists()).map(|e| e.path()));
+                let dir = find(&root.join("python")).or_else(|| find(root)).unwrap_or_else(|| root.to_path_buf());
                 InstLayout { bins: vec![dir.clone()], home: dir }
             }
         }
@@ -90,12 +91,30 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
         return Err(err(format!("{kind} is a base kind — an admin installs it")));
     }
     let vkey = version_key(def, version, req);
+    if let Some(pkgs) = &req.packages {
+        for p in pkgs {
+            if !cimon_recipe::check::valid_package_pin(p) {
+                return Err(err(format!("package {p:?} is not name==version — refusing to pass it to uv")));
+            }
+        }
+    }
     let final_dir = ctx.layout.toolchain_dir(kind, &vkey, entry);
     let staging = ctx.layout.toolchain_staging().join(format!("{kind}-{}-{}", cimon_core::layout::sanitize(&vkey), &entry[..entry.len().min(8)]));
     let _ = remove_dir(&staging);
     std::fs::create_dir_all(&staging).map_err(|e| err(format!("{}: {e}", staging.display())))?;
-    let root = staging.join("root");
+    // uv writes absolute paths into interpreters, venvs and tool launchers: those kinds
+    // are built where they will live, the rest in staging and moved
+    let in_place = matches!(def.installer.as_str(), "uv-python" | "uv-tool");
+    let root = if in_place {
+        if final_dir.exists() {
+            remove_dir(&final_dir).map_err(|e| err(format!("{}: {e}", final_dir.display())))?;
+        }
+        final_dir.clone()
+    } else {
+        staging.join("root")
+    };
     std::fs::create_dir_all(&root).map_err(|e| err(e.to_string()))?;
+    let build_mode = ctx.account.is_some();
     let mut checksum: Option<String> = None;
     let res = (|| -> Result<(), InstallError> {
         match def.installer.as_str() {
@@ -174,34 +193,59 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
                     args.push(a.replace("{version}", version).replace("{root}", &root.to_string_lossy()));
                 }
                 let ps = PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
-                run_build(ctx, &ps, &args, &staging, BTreeMap::new(), Duration::from_secs(1800))?;
+                // the script runs as the build account and writes {root}: write access to
+                // this install's staging dir only, taken back before the probe
+                if let Some(a) = &ctx.account {
+                    cimon_runner::grant_modify(&staging, &a.name).map_err(err)?;
+                }
+                let r = run_build(ctx, &ps, &args, &staging, BTreeMap::new(), Duration::from_secs(1800));
+                if build_mode {
+                    cimon_runner::reset_acl(&staging).map_err(err)?;
+                }
+                r?;
             }
             other => return Err(err(format!("unknown installer {other}"))),
         }
         Ok(())
     })();
-    if let Err(e) = res {
+    let fail = |e: InstallError| {
         let _ = remove_dir(&staging);
-        return Err(e);
+        if in_place {
+            let _ = remove_dir(&final_dir);
+        }
+        e
+    };
+    if let Err(e) = res {
+        return Err(fail(e));
     }
-    // probe in staging (as the build account)
+    // probe before it is used (as the build account)
     let lay = layout_of(ctx, kind, def, version, &root, req);
-    let probe_out = probe(ctx, def, version, &lay)?;
+    probe(ctx, def, version, &root, &lay).map_err(fail)?;
     // move into place; rustup installs in the shared RUSTUP_HOME instead
     let installed_root = if def.installer == "rustup" {
         ctx.layout.bootstrap().join("rustup").join("toolchains").join(format!("{version}-x86_64-pc-windows-msvc"))
+    } else if in_place {
+        final_dir.clone()
     } else {
         if final_dir.exists() {
-            remove_dir(&final_dir).map_err(|e| err(format!("{}: {e}", final_dir.display())))?;
+            remove_dir(&final_dir).map_err(|e| fail(err(format!("{}: {e}", final_dir.display()))))?;
         }
         if let Some(p) = final_dir.parent() {
-            std::fs::create_dir_all(p).map_err(|e| err(e.to_string()))?;
+            std::fs::create_dir_all(p).map_err(|e| fail(err(e.to_string())))?;
         }
-        std::fs::rename(&root, &final_dir).map_err(|e| err(format!("moving into {}: {e}", final_dir.display())))?;
+        std::fs::rename(&root, &final_dir).map_err(|e| fail(err(format!("moving into {}: {e}", final_dir.display()))))?;
         final_dir.clone()
     };
+    // a move keeps the old ACL: re-inherit, so the shared toolchain is read-only for
+    // build steps (design §15.1)
+    if build_mode && def.installer != "rustup" {
+        if let Err(e) = cimon_runner::reset_acl(&installed_root) {
+            let _ = remove_dir(&installed_root);
+            let _ = remove_dir(&staging);
+            return Err(err(format!("{e} — not installed")));
+        }
+    }
     let _ = remove_dir(&staging);
-    let _ = probe_out;
     let t = now();
     Ok(ToolchainInstall {
         kind: kind.into(),
@@ -384,8 +428,9 @@ fn run_build(ctx: &Ctx, program: &Path, args: &[String], cwd: &Path, extra: BTre
     check_ok(program, &r)
 }
 
-/// Runs the catalog probe (as the build account) and checks its output.
-pub fn probe(ctx: &Ctx, def: &KindDef, version: &str, lay: &InstLayout) -> Result<String, InstallError> {
+/// Runs the catalog probe (as the build account) and checks its output. A probe that
+/// prints the version and then fails or hangs is a failure too.
+pub fn probe(ctx: &Ctx, def: &KindDef, version: &str, root: &Path, lay: &InstLayout) -> Result<String, InstallError> {
     let Some(p) = &def.probe else { return Ok(String::new()) };
     let expected = def.expected_probe(version).unwrap_or_default();
     let (acct, profile, user) = match &ctx.account {
@@ -394,7 +439,14 @@ pub fn probe(ctx: &Ctx, def: &KindDef, version: &str, lay: &InstLayout) -> Resul
     };
     let mut extra = BTreeMap::new();
     for (k, v) in &def.exports {
-        extra.insert(k.clone(), v.replace("{version}", version).replace("{home}", &lay.home.to_string_lossy()).replace("{root}", &lay.home.to_string_lossy()));
+        // the same placeholders steps get (engine toolchains::placeholders)
+        extra.insert(
+            k.clone(),
+            v.replace("{version}", version)
+                .replace("{home}", &lay.home.to_string_lossy())
+                .replace("{root}", &root.to_string_lossy())
+                .replace("{bin}", &lay.bins.first().map(|b| b.to_string_lossy().to_string()).unwrap_or_default()),
+        );
     }
     if def.installer == "rustup" {
         extra.insert("RUSTUP_HOME".into(), ctx.layout.bootstrap().join("rustup").to_string_lossy().into());
@@ -408,7 +460,13 @@ pub fn probe(ctx: &Ctx, def: &KindDef, version: &str, lay: &InstLayout) -> Resul
     let r = exec(&acct, &program, &p.run[1..].to_vec(), &tmp, env, Duration::from_secs(120));
     let out = r.tail.join("\n");
     let _ = std::fs::remove_dir_all(&tmp);
-    if r.spawn_error.is_some() || !out.contains(&expected) {
+    if let Some(e) = &r.spawn_error {
+        return Err(err(format!("probe `{}` could not start: {e} — not installed", p.run.join(" "))));
+    }
+    if r.timed_out || r.exit_code != Some(0) {
+        return Err(err(format!("probe `{}` {} — not installed", p.run.join(" "), if r.timed_out { "timed out".to_string() } else { format!("exited {:?}", r.exit_code) })));
+    }
+    if !out.contains(&expected) {
         return Err(err(format!("probe `{}` did not print {expected:?} (got: {}) — not installed", p.run.join(" "), out.lines().take(3).collect::<Vec<_>>().join(" | "))));
     }
     Ok(out)
