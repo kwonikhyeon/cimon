@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.94"
+
+[workspace.dependencies]
+cimon-core = { path = "crates/cimon-core" }
+cimon-recipe = { path = "crates/cimon-recipe" }
+cimon-store = { path = "crates/cimon-store" }
+cimon-recipestore = { path = "crates/cimon-recipestore" }
+cimon-toolchain = { path = "crates/cimon-toolchain" }
+cimon-workspace = { path = "crates/cimon-workspace" }
+cimon-runner = { path = "crates/cimon-runner" }
+cimon-judge = { path = "crates/cimon-judge" }
+cimon-engine = { path = "crates/cimon-engine" }
+cimon-mcp = { path = "crates/cimon-mcp" }
+cimon-web = { path = "crates/cimon-web" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+axum = "0.8"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs"] }
+http = "1"
+rmcp = { version = "=3.7.0", features = ["server", "transport-streamable-http-server"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+rand = "0.8"
+sha2 = "0.10"
+hmac = "0.12"
+hex = "0.4"
+base64 = "0.22"
+regex = "1"
+globset = "0.4"
+walkdir = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+tempfile = "3"
+quick-xml = "0.36"
+serde_json_path = "0.7"
+similar = "2"
+maud = "0.26"
+x509-parser = "0.16"
+pelite = "0.10"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Registry", "Win32_Storage_FileSystem", "Win32_System_Pipes", "Win32_System_Environment", "Win32_Security_Authentication_Identity", "Win32_System_SystemServices", "Win32_System_IO", "Win32_System_Console"] }
+windows-service = "0.7"
+futures = "0.3"
+bytes = "1"
+
+[profile.release]
+debug = 1
