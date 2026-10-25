@@ -613,7 +613,7 @@ probe = { run = ["node", "--version"], expect = "v{version}" }
 |---|---|
 | `{ vswhere = true }` | `vswhere -products * -requires <components> -version [<min>,)` |
 | `{ path_from = "<cimon.toml [base] 키>" }` | 그 경로에 `probe` 실행 |
-| `{ sdkmanager = true }` | `sdkmanager --list_installed` 에 레시피의 `platforms`·`build_tools` 가 있나 |
+| `{ sdkmanager = true }` | 레시피의 `platforms`·`build_tools` 가 SDK 안(`platforms\<p>`, `build-tools\<v>`)에 설치돼 있나 — `sdkmanager` 를 실행하지 않고 디렉터리로 확인한다(sdkmanager 는 JDK 가 필요하다) |
 
 빠진 것이 있으면 작업은 접수에서 `inconclusive`/`environment` 로 끝나고, **빠진 목록과 `hint` 를 결과에 적는다.**
 

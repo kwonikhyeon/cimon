@@ -3,7 +3,7 @@
 > **Cimon says: build.**
 
 - 이름: **cimon**(「시몬」 으로 읽는다). CI + mon — zenmon(zenoh + monitor)의 형제 이름이다. 「Simon says」(시키는 대로 하는 놀이)처럼, 사람이 Claude 를 통해 시키면 빌드하고 결과를 가져온다. 같은 이름의 PLC·SCADA 브랜드(대문자 CIMON)와 헷갈리지 않도록 소문자로 쓴다.
-- 상태: 초안 · 2026-10-26 — 구현 전
+- 상태: 2026-10-26 — M0~M9 구현됨. 관리자 권한·실제 빌드 머신이 필요한 부분(빌드 계정 모드, `cimon setup` 실제 실행, Windows 서비스 기동, Tailscale)은 아직 그 환경에서 돌려 보지 않았다 — README 「검증 상태」
 - 「확인 필요」 는 아직 실측·실행으로 확인하지 않은 가정이다.
 
 | 문서 | 내용 |
@@ -143,6 +143,9 @@ Rust 워크스페이스. 실행 파일 하나(`cimon.exe`)가 서비스와 관�
 cimon/
   Cargo.toml                 워크스페이스
   crates/
+    cimon-core/              cimon.toml, 디스크 레이아웃, 판정·실패 분류·허용 조합, 식별자
+    cimon-engine/            App(설정·저장소들), 작업 수명(생성·접수·provisioning·러너), 결과, 산출물, fixture,
+                             반영 조건, 정리기, 백업
     cimon-recipe/            레시피 파싱·정적 검사·겹치기·선택·의미 차이. 순수 — 네트워크·프로세스 없음
     cimon-recipestore/       레시피 git 저장소: 읽기·편집 커밋·제안·반영 조건·반영·되돌리기·가져오기·내보내기·번들
     cimon-store/             SQLite 작업 저장소(rusqlite), 스키마 마이그레이션
@@ -152,7 +155,8 @@ cimon/
     cimon-judge/             판정기(exit·cargo-test·junit·script), 검사(apk-signer·pe-version·script)
     cimon-mcp/               rmcp 서버 처리기, 도구 정의, task↔작업 대응
     cimon-web/               리뷰 화면(M9) — axum 라우트, maud 템플릿, 포함된 정적 자원
-    cimon/                   바이너리: serve · setup · doctor · token · user · provision · recipe(check·show·import·export·restore)
+    cimon/                   바이너리: serve · service · setup · doctor · drain · github-token · token · user · provision ·
+                             recipe(check·show·import·export·restore), 숨은 도우미 __exec · __sweep · __account-env
   examples/recipes/          형식 예시(레시피 검사기의 시험 입력)
   docs/
 ```
@@ -170,6 +174,9 @@ D:\cimon\                              서비스  빌드
   state\cimon.db                       rw      -      작업 저장소
   config\cimon.toml                    rw      -      설정
   config\link.key                      rw      -      산출물 링크 서명 키(cimon setup 이 만든다)
+  config\build-account.dpapi           rw      -      빌드 계정 비밀번호(DPAPI, cimon setup)
+  config\github-token.dpapi            rw      -      GitHub 읽기 토큰(DPAPI, cimon github-token)
+  state\draining                       rw      -      있으면 새 작업 거절(cimon drain, 서비스 시작 때 지움)
   recipes.git                          rw      -      레시피 저장소(bare git) — 원본
   recipes\<commit>\                    rw      r      고정한 커밋의 레시피 체크아웃(${recipes})
   mirrors\<project>.git                rw      r      bare mirror(독립 클론의 alternates). gc.auto=0
@@ -288,9 +295,9 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 
 | 조건 | 판정 | 덮어쓰기 |
 |---|---|---|
-| **정적 검사** | head 에서 통과 | 불가 |
+| **정적 검사** | head 에 `main` 대비 새 오류가 없다(이미 있던 오류는 막지 않는다 — §6.3 과 같은 기준) | 불가 |
 | **fast-forward** | `main` 이 제안의 기준 커밋 그대로인가. 아니면 `recipe_sync` 로 새 head 를 만들어야 한다 | 불가 |
-| **시도 실행** | 의미 차이가 영향을 준 프로젝트마다, head 커밋으로 돈 시도 작업 중 **바뀐(추가·변경) 단계를 모두 포함한 가장 최근 작업**의 판정이 `pass` 인가(`cimon.toml [review]`). 같은 head 에서 먼저 실패한 것을 재시도로 덮지 못한다 | 사유를 적으면 가능 |
+| **시도 실행** | 의미 차이가 영향을 준 프로젝트마다, head 커밋으로 돈 시도 작업 중 **바뀐(추가·변경) 단계를 모두 포함한 가장 최근 작업**의 판정이 `pass` 인가(`cimon.toml [review]`). 프로젝트 전체 설정(툴체인·env·isolate·account_env·vars·workspace)이나 카탈로그 항목이 바뀌면 기본 `run`(기본 build + test)의 단계도 포함해야 한다. 이 러너에서 돌 수 없는 단계(`needs`)와 setup 은 빼고 센다. 같은 head 에서 먼저 실패한 것을 재시도로 덮지 못한다 | 사유를 적으면 가능 |
 | **시도 실행으로 시험할 수 없는 변경** | 등록된 프로젝트의 `project.toml` 변경, 카탈로그 설치 항목 변경(관리자가 `provision --recipe-ref` 로 그 항목을 설치하고 시도 실행에 쓰였으면 시험된 것으로 친다) | 사유를 적어야만 반영 |
 
 - 의미 차이·영향받는 프로젝트는 겹친 레시피를 `main` 과 head 에서 비교해 만든다(review-ui §4.4 와 같은 함수). 프리셋·카탈로그·공용 스크립트가 바뀌면 그것을 쓰는 모든 프로젝트가 영향받는다.
@@ -424,7 +431,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 ```
 
 - `toolchains` 값은 예시다. 실제 값은 작업마다 실행해서 읽은 버전이다.
-- **출력 스키마**(`outputSchema`)에서 필수 필드는 `job_id`·`done`·`summary` 뿐이다 — task 를 못 쓰는 호출자에게 돌려주는 「접수됨」 결과(§7.5)도 같은 스키마에 맞는다. 나머지는 선택 필드.
+- **출력 스키마(`outputSchema`)는 선언하지 않는다.** 선언하면 거절 결과(`isError`, `{error, message}`)까지 그 스키마에 맞아야 한다. 결과의 모양은 이 절이 정본이고, 성공·「접수됨」(§7.5) 결과는 언제나 `job_id`·`done`·`summary` 를 싣는다.
 - **Claude 가 알아야 할 것은 전부 `structuredContent` 에** — 요약도 `summary` 로. 같은 요약을 `content` 텍스트에도 싣는다(Agent SDK 문서는 `structuredContent` 가 있으면 `content` 를 넘기지 않는다고 한다. 원격 서버도 그런지는 확인 안 함).
 - 실패면 `summary` 첫 줄에 실패 분류·실패한 단계·**첫 에러 줄**. `excluded`·`warnings` 가 있으면 그 수를 적는다.
 - 리뷰 화면이 켜져 있으면(`[web].enabled`) `job_url` 을 싣는다. 꺼져 있으면 싣지 않는다.
@@ -594,7 +601,8 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 ### 9.2 프로세스와 계정
 
-- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `CreateProcessAsUser`, 일시정지로 만든 뒤 Job Object 에 넣고 재개). 빌드 계정 비밀번호는 서비스 계정만 읽는 자격 증명 저장소에 둔다. 서비스 계정에 필요한 권한(「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」)은 **확인 필요**(M2).
+- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `LoadUserProfile` + `CreateProcessAsUserW`, 일시정지로 만든 뒤 Job Object 에 넣고 재개, 상속 핸들은 표준 입출력 셋만). 띄우는 것은 `cimon.exe __exec <spec>` 도우미이고, 도우미가 Rust 표준 라이브러리로 실제 명령을 띄운다(`.bat`·`.cmd` 인자 이스케이프를 표준 라이브러리에 맡기기 위해). 빌드 계정 비밀번호는 `cimon setup` 이 무작위로 정해 **DPAPI(머신 범위)로 암호화해 `config\build-account.dpapi`** 에 둔다 — `config\` 는 서비스 계정과 관리자만 읽는다. 서비스 계정에는 `setup` 이 「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」을 준다. 실제 빌드 머신에서 이 경로로 돌려 본 적은 아직 없다(**확인 필요**).
+- 서비스 계정은 가상 계정 **`NT SERVICE\cimon`** 이다(관리할 비밀번호가 없다). 이 문서의 「서비스 계정 `cimon`」 은 이것을 가리킨다.
 - Job Object(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, breakaway 불허). 취소·시간 초과는 Job Object 통째로 종료. 단계가 끝난 뒤 남은 프로세스는 종료하고 경고로 남긴다.
 - **Job Object 로 못 잡는 것**: 작업 스케줄러·서비스로 띄운 프로세스. 프로젝트 도구가 스택을 「호출자보다 오래 살게」 띄우는 경우가 그렇다. 그래서:
   - **작업이 끝날 때마다 빌드 계정이 소유한 모든 프로세스를 찾아 종료하고, 남은 것이 없는지 확인한다.** 빌드 계정이 등록한 예약 작업도 지운다. 남았던 것은 `warnings` 에 적는다.
@@ -740,7 +748,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 ### 11.6 자격 증명
 
-- 서비스 계정: 등록된 저장소를 읽는 GitHub fine-grained 토큰(자격 증명 관리자 + credential helper). **SSH 키는 두지 않는다** — git 설정 `url."https://github.com/".insteadOf "ssh://git@github.com/"`.
+- 서비스 계정: 등록된 저장소를 읽는 GitHub fine-grained 토큰. `cimon github-token`(표준 입력)이 DPAPI 로 암호화해 `config\github-token.dpapi` 에 두고, fetch 할 때 **`GIT_CONFIG_*` 환경 변수의 `http.https://github.com/.extraheader`** 로만 넘긴다 — 명령줄·설정 파일에 남지 않는다. **SSH 키는 두지 않는다** — git 설정 `url."https://github.com/".insteadOf "ssh://git@github.com/"`.
 - 빌드 계정: 기본은 **GitHub 자격 증명이 없다.** 빌드 중에 비공개 저장소를 git 으로 받는 프로젝트가 있으면 그 저장소만 읽는 **별도 토큰**을 빌드 계정에 둔다(어느 저장소인지는 레시피 저장소 노트).
 - `core.longpaths=true`.
 
@@ -1070,7 +1078,7 @@ login_code_minutes = 5
 
 ### 16.1 설치 — 처음 한 번
 
-1. `cimon setup`(관리자): 디렉터리와 권한(§5), 두 계정(서비스 계정 「서비스로 로그온」, 빌드 계정 「일괄 작업으로 로그온」), `config\link.key` 생성, Windows 서비스 등록(자동 시작·실패 시 재시작), rustup·uv bootstrap, git 전역 설정, 빌드 계정 아웃바운드 방화벽 규칙.
+1. `cimon setup`(관리자, `--dry-run` 으로 미리 보기): 디렉터리와 ACL(§5, icacls), 빌드 계정 생성과 DPAPI 비밀번호 파일, 권한(`NT SERVICE\cimon` 「서비스로 로그온」·토큰 바꾸기·할당량, 빌드 계정 「일괄 작업으로 로그온」), `config\link.key` 생성, Windows 서비스 등록(sc.exe, 자동 시작·실패 시 재시작), rustup·uv bootstrap(체크섬 확인). **빌드 계정 아웃바운드 제한은 자동화하지 않았다** — Windows 방화벽은 사용자별 아웃바운드 규칙이 약해 수동 단계로 남기고 `setup` 이 안내한다.
 2. Tailscale(§15.3).
 3. 첫 관리자: `cimon token create <이름> --admin`.
 4. 레시피 저장소: `cimon recipe import --init <사내 레시피 폴더> --author <이름>` — 저장소와 `main` 을 한 번 만든다(정적 검사를 통과해야 하고, `main` 이 있으면 거절). 바로 번들 백업.
