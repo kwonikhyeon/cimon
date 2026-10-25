@@ -10,6 +10,7 @@
 |---|---|
 | **design.md**(이 문서) | 서비스 구조 · MCP 인터페이스 · 작업 모델 · 실행 · 저장 · 보안 · 운영 |
 | [recipe-spec.md](recipe-spec.md) | 레시피 파일 형식(정본) |
+| [review-ui.md](review-ui.md) | 레시피 리뷰 웹 화면 — 제안·의미 차이·반영 조건·로그인 |
 | [`examples/recipes/`](../examples/recipes/) | 형식 예시이자 레시피 검사기의 시험 입력 |
 
 **이 저장소는 어떤 프로젝트를 빌드하는지 모른다.** 실제 프로젝트의 레시피·툴체인 카탈로그·프로젝트별 사실과 결정은 **cimon 이 빌드 머신 안에 직접 갖는 레시피 저장소**(`D:\cimon\recipes.git`)에 있다. GitHub 등 외부에 올리지 않는다. 사람은 MCP 도구로 고친다(§6.4).
@@ -96,7 +97,7 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
  |   Invoke-WebReq.   | ------------> |          -> http://127.0.0.1:8770              |
  | tailscale client   | <------------ |                                                |
  +--------------------+  POST /mcp    | cimon.exe (service account "cimon")            |
-                      GET /artifacts  |   MCP endpoint        Artifact HTTP            |
+                      GET /artifacts  |   MCP endpoint · /ui  Artifact HTTP            |
                                       |   Job store (SQLite)  Intake workers (2)       |
                                       |   Recipe store (git)  Runner (1) -- spawns as  |
                                       |   Toolchain manager   Workspace manager        |
@@ -116,6 +117,7 @@ cimon 은 팀원의 Claude Code 세션이 MCP 로 부르는 **원격 빌드·테
 |---|---|---|
 | MCP 엔드포인트 | 도구 목록·호출, task 응답, `tasks/get`·`tasks/cancel` | 없음 — 작업 저장소에서 읽는다 |
 | 아티팩트 HTTP | 산출물 다운로드, 링크 토큰 검증 | `artifacts\` |
+| 리뷰 화면(`/ui`) | 레시피 제안 리뷰·반영, 이력, 레시피 탐색, 작업 상세(읽기) — [review-ui.md](review-ui.md) | 작업 저장소(제안·댓글·세션) |
 | 레시피 저장소 | 빌드 머신 안의 git 저장소. 읽기(검증·겹치기·선택), 편집 도구(검사 후 커밋), 반영·되돌리기, 가져오기·내보내기 | `recipes.git`, 메모리 캐시(커밋별) |
 | 작업 저장소 | 작업·task·단계·산출물·툴체인 사용·warm 상태·감사 로그 | `state\cimon.db`(SQLite, WAL) |
 | 접수 작업자 | fetch → 커밋 고정 → 레시피 → 계획 → 툴체인. 러너를 쓰지 않는다(동시 2) | 작업 저장소 |
@@ -149,6 +151,7 @@ cimon/
     cimon-runner/            빌드 계정 토큰, Job Object, 환경 구성, 단계 실행, fixture, 사전 정리, 수집
     cimon-judge/             판정기(exit·cargo-test·junit·script), 검사(apk-signer·pe-version·script)
     cimon-mcp/               rmcp 서버 처리기, 도구 정의, task↔작업 대응
+    cimon-web/               리뷰 화면 — axum 라우트, maud 템플릿, 포함된 정적 자원
     cimon/                   바이너리: serve · doctor · setup · token · provision · recipe check/show/import/export
   examples/recipes/          형식 예시(레시피 검사기의 시험 입력)
   docs/
@@ -235,7 +238,7 @@ D:\cimon\                          서비스      빌드
 | `recipe_edit` | 파일 하나를 만들거나 바꾸거나 지운다. **저장 전에 그 브랜치 전체에 레시피 검사**를 돌려 통과할 때만 커밋한다 | `recipe/*` 브랜치: 팀원. `main`: 관리자 |
 | `recipe_diff` | 두 브랜치·커밋의 차이 | 팀원 |
 | `recipe_history` | 파일·브랜치의 커밋 이력(작성자·시각·메시지) | 팀원 |
-| `recipe_promote` | `recipe/*` 브랜치를 `main` 에 반영(fast-forward, 안 되면 거절하고 다시 맞추라고 알린다). 반영 전에 `main` 기준으로 다시 검사 | 관리자 |
+| `recipe_promote` | `recipe/*` 브랜치(제안)를 `main` 에 반영 — 리뷰어가 본 head 커밋만, 반영 조건(review-ui §4.3)을 반영 순간에 다시 계산해서. fast-forward 가 안 되면 충돌 없는 자동 병합 뒤 `main` 기준 재검사, 충돌이면 거절하고 `recipe_sync` 를 안내 | 관리자 |
 | `recipe_revert` | `main` 의 커밋 하나를 되돌리는 커밋을 만든다 | 관리자 |
 
 규칙:
@@ -244,7 +247,9 @@ D:\cimon\                          서비스      빌드
 - **동시 편집**: `recipe_edit` 은 `base`(편집자가 읽은 커밋)를 받는다. 그 브랜치가 그 사이 움직였으면 `recipe_conflict` 로 거절하고 최신 커밋을 알려 준다. 덮어쓰지 않는다.
 - **검사에 실패하면 저장하지 않는다.** 오류를 파일·줄·키로 돌려준다. 깨진 레시피가 브랜치에 들어가지 않는다.
 - 시도 브랜치는 `recipe/<설명>`. 반영되거나 30일 동안 안 쓰이면 정리기가 지운다(이력은 `main` 에 남은 것만).
-- 신뢰 수준: 시도 브랜치를 고칠 수 있는 사람은 시도 실행으로 빌드 머신에서 명령을 돌릴 수 있다 — 팀원 전체에게 그 권한이 있다는 전제다(§15.2). `main` 반영은 관리자가 diff 를 보고 한다.
+- 신뢰 수준: 시도 브랜치를 고칠 수 있는 사람은 시도 실행으로 빌드 머신에서 명령을 돌릴 수 있다 — 팀원 전체에게 그 권한이 있다는 전제다(§15.2). `main` 반영은 관리자가 리뷰하고 한다.
+
+**리뷰 — 제안과 리뷰 화면.** 시도 브랜치 하나가 곧 **제안**(PR 에 해당)이다. 첫 `recipe_edit` 으로 자동으로 열리고, 리뷰 화면(`/ui`)에서 **의미 차이**(겹친 레시피 기준으로 단계·툴체인·파라미터·권한이 어떻게 바뀌나, 위험 표시 [권한]·[실행]·[공급망]·[동작])·파일 차이·**반영 조건**(레시피 검사, 병합 가능, 바뀐 프로젝트의 시도 실행 통과)·토론을 보고 관리자가 반영한다. 반영은 리뷰어가 본 head 커밋만, 반영 순간에 조건을 다시 계산해서 한다. `recipe_promote` 도 같은 조건을 따른다. 자세한 것은 [review-ui.md](review-ui.md).
 
 사람이 편집기로 고치고 싶으면:
 
@@ -292,6 +297,8 @@ D:\cimon\                          서비스      빌드
 | `cancel_job` | | 작업 취소 — 그 작업을 따르는 모든 요청에서(§7.5) |
 | `queue` | | 접수·대기·실행 중 작업 |
 | `recipe_show` · `recipe_edit` · `recipe_diff` · `recipe_history` · `recipe_promote` · `recipe_revert` | | 레시피 저장소 읽기·편집(§6.4) |
+| `recipe_propose` · `recipe_proposals` · `recipe_proposal` · `recipe_comment` · `recipe_sync` | | 제안 — 제목·설명, 목록, 반영 조건·의미 차이·댓글 읽기, 댓글, `main` 합치기(review-ui §9) |
+| `web_login` | | 리뷰 화면 5분짜리 일회용 로그인 링크(review-ui §8) |
 | `scaffold_recipe` | **●** | 저장소를 읽어 레시피 초안을 만든다(등록하지 않는다, 저장소 코드를 실행하지 않는다). **2단계** |
 
 `run` 이 기본형이고 `build`·`test` 는 고를 수 있는 종류를 좁힌 줄임이다. 툴체인 설치는 MCP 도구가 아니라 관리자 CLI `cimon provision` 이다(§10.4).
@@ -855,6 +862,8 @@ CREATE TABLE warm_state (
   PRIMARY KEY (project, slot, step_id)
 );
 
+-- 리뷰 화면 테이블(proposals · proposal_checks · proposal_comments · web_sessions · login_codes)은 review-ui.md §11
+
 CREATE TABLE users (
   name TEXT PRIMARY KEY, token_sha256 TEXT NOT NULL UNIQUE,
   role TEXT NOT NULL DEFAULT 'member',           -- member | admin — 레시피 main 반영·되돌리기는 admin(§6.4)
@@ -899,6 +908,16 @@ default_branch = "main"
 trial_prefix = "recipe/"
 trial_branch_idle_days = 30                        # 반영 안 된 시도 브랜치 정리
 allowed_repo_prefixes = ["https://github.com/<org>/"]   # 시도 브랜치의 새 프로젝트가 가리킬 수 있는 저장소
+
+[review]                                           # 반영 조건(review-ui §4.3)
+require_trial = "changed_projects"                 # changed_projects | none
+trial_must_pass = true                             # 아니면 관리자가 사유를 적고 덮어쓴다
+require_other_admin = false
+
+[web]                                              # 리뷰 화면(review-ui §8)
+enabled = true
+session_hours = 12
+login_code_minutes = 5
 
 [runner]
 name = "cimon-01"
@@ -962,6 +981,8 @@ log_max_mb_per_step = 200
 | 브랜치·시도 브랜치가 권한을 넓힌다 | 등록된 프로젝트의 `project.toml` 은 언제나 레시피 저장소 `main` 에서 읽는다. 시도 브랜치의 새 프로젝트는 `allowed_repo_prefixes` 안의 저장소만 |
 | 레시피를 고칠 수 있는 사람 | 레시피 = 빌드 머신에서 실행되는 명령이다. 시도 브랜치(`recipe/*`)는 팀원 누구나 고치고 시도 실행할 수 있다 — 토큰을 가진 팀원 전체를 그만큼 믿는다는 전제다. `main` 반영·되돌리기는 관리자(`users.role = admin`)만, diff 를 보고. 모든 편집은 작성자와 함께 커밋·감사 로그에 남는다 |
 | 레시피 저장소가 사라진다 | 외부 원격이 없으므로 매일 `git bundle` 백업(§16.4). 레시피 저장소는 빌드 계정이 읽지 못한다 — 체크아웃(`recipes\<commit>\`)만 읽기 전용으로 |
+| 리뷰어가 본 것과 다른 레시피가 반영된다 | 반영 요청에 head 커밋을 싣고, 서버가 반영 순간에 조건을 다시 계산한다(review-ui §4.7) |
+| 리뷰 화면으로 공격한다(XSS·CSRF·세션 탈취) | 서버 렌더링 + 기본 이스케이프, 엄격한 CSP, `SameSite=Strict` 세션 쿠키 + CSRF 토큰, 일회용 로그인 링크(5분). 신원 헤더로 로그인하지 않는다(review-ui §8, §10.3) |
 | 빌드 스크립트가 cimon 을 해친다 | 빌드 계정 분리와 디렉터리 권한(§15.1) |
 | 빌드 스크립트가 다른 프로젝트를 오염시킨다 | 캐시를 프로젝트별로(`caches\<project>\`). 내려받을 때만 체크섬을 보는 패키지 캐시를 공유하면, 한 브랜치가 풀어 둔 소스를 다른 프로젝트 빌드가 그대로 쓰게 된다 |
 | 빌드 스크립트가 비밀을 훔친다 | 서명 키·릴리스 키·배포 자격 증명을 두지 않는다. 빌드 계정에는 기본적으로 GitHub 자격 증명도 없다(§11.6) |
@@ -1097,7 +1118,8 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | 확장 | 지금 준비된 것 | 할 일 |
 |---|---|---|
 | 새 프로젝트 | 레시피·프리셋·카탈로그, 시도 실행, `recipe_edit` | 레시피 저장소에 추가 |
-| 레시피 리뷰 화면 | `recipe_diff`·`recipe_history` | tailnet 안 읽기 전용 웹 화면에 diff·반영 버튼 |
+| 제안·반영 알림 | 제안·감사 기록 | 메신저 webhook |
+| 리뷰 화면에서 시도 실행 시작 | 같은 작업 모델 | `test` 와 같은 검증을 거치는 버튼 |
 | 레시피 저장소의 외부 사본 | 평범한 git 저장소 | 원하면 사내 비공개 원격으로 단방향 push(백업 겸용). 1단계는 번들 백업만 |
 | 레시피 초안 자동 생성 | `scaffold_recipe` 도구 정의 | 구현(저장소 코드를 실행하지 않고 표지 파일만 읽는다, `allowed_repo_prefixes` 안만) |
 | 프로젝트 레시피(`recipe_source = "project"`) | 형식·검증 시점 정의 | 구현 |
@@ -1126,6 +1148,7 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | M6 | 산출물(사전 정리·수집·검사·HTTP) | 받은 파일 sha256 이 결과와 같다. 옛 버전이 쌓인 폴더에서도 새 것 하나만 잡힌다 |
 | M7 | fixture + `script` 판정기 + 시나리오 | 시나리오가 판정을 낸다. 관측 창을 줄이면 `inconclusive`/`unobserved`. fixture 의 서비스가 기동 중 죽으면 `fail`/`code` 와 서비스 이름. 취소해도 스택이 남지 않는다 |
 | M8 | 운영 — 정리기·드레인·doctor·감사·백업(작업 저장소 + 레시피 번들)·복구 | 7일 지난 산출물이 `410`. 레시피 저장소를 지우고 어제 번들로 `restore` 하면 그 시점 `main` 으로 돌아온다. 디스크를 채우면 정리기가 먼저 돈다 |
+| M9 | 리뷰 화면 + 제안 도구(`recipe_propose`·`proposals`·`proposal`·`comment`·`sync`, `web_login`) + 반영 조건 | review-ui §14 — 화면을 연 뒤 브랜치가 바뀌면 반영이 거절된다, 팀원 반영 403, 시도 실행 없는 반영은 사유 요구, `<script>` 가 글자 그대로 보인다, 일회용 링크 재사용 실패 |
 
 ---
 
@@ -1162,6 +1185,10 @@ Claude Code 는 인증 오류가 나면 `headersHelper` 를 다시 실행하므�
 | 2026-10-26 | **서비스 저장소와 레시피 저장소를 나눈다** | 원격 빌드 서비스는 프로젝트를 몰라야 한다. 프로젝트 정보(고객사 포함)는 레시피 저장소에만 |
 | 2026-10-26 | **레시피 저장소는 빌드 머신 안의 git, 편집은 MCP 도구** — GitHub 등 외부 저장소에 올리지 않는다 | 저장소를 하나 더 관리하지 않는다. git 이라 버전 고정·시도 브랜치·이력은 그대로. 대가: PR 리뷰 화면이 없고(`recipe_diff` 로 대신), 유일한 사본이라 번들 백업이 필수 |
 | 2026-10-26 | 레시피 `main` 반영·되돌리기는 관리자만, 시도 브랜치는 팀원 누구나 | 레시피 = 빌드 머신 명령. 이전의 「저장소 push 권한 + main 보호」 와 같은 신뢰 수준 |
+| 2026-10-26 | 레시피 리뷰 화면 — 보기·토론·반영 전용, 편집은 MCP 로만 | 저장 전 검사·충돌 처리를 한 곳에 둔다. PR 화면이 없는 대가를 메운다 |
+| 2026-10-26 | 리뷰의 중심은 **의미 차이**(겹친 레시피 비교 + 위험 표시) | 파일 차이로는 「무엇이 실행되게 바뀌나」 를 읽기 어렵다. 프리셋 하나가 여러 프로젝트를 바꾼다 |
+| 2026-10-26 | 반영 조건: 검사·병합 가능은 필수, 바뀐 프로젝트의 시도 실행 통과는 기본 필수(사유를 적으면 덮어쓰기) | 레시피 변경도 시험을 거쳐 들어가게. 덮어쓴 사실은 영구히 보인다 |
+| 2026-10-26 | 리뷰 화면 로그인은 MCP 가 발급하는 일회용 링크 | 브라우저에 Bearer 토큰을 넣지 않는다. 신원 헤더는 로컬 프로세스가 꾸밀 수 있다 |
 | 2026-10-26 | 프로젝트별 결과 판정은 `script` 판정기로 레시피 저장소에 | 특정 프로젝트의 결과 형식을 아는 코드를 서비스에 넣지 않는다 |
 | 2026-10-26 | 빌드 계정 분리 | 빌드 스크립트가 서비스 상태·다른 작업의 산출물을 바꾸지 못하게 |
 | 2026-10-26 | 실패 분류(`failure_class`) | 「다시 돌릴까」 와 「코드를 고칠까」 를 사람이 추측하지 않게 |
