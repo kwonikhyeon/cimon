@@ -13,7 +13,7 @@ android_sdk = { platforms = ["android-35"], build_tools = ["35.0.0"] }
 
 [workspace]
 keep = ["backend/target", "app/.gradle", "app/**/build"]
-clean_env = { GRADLE_OPTS = "-Dorg.gradle.caching=false" }
+clean_env = { GRADLE_OPTS = "-Dorg.gradle.daemon=false -Dorg.gradle.caching=false" }   # [env] 값을 통째로 바꾸므로 둘 다 적는다
 
 [env]
 GRADLE_OPTS = "-Dorg.gradle.daemon=false"
@@ -77,3 +77,4 @@ cwd = "${vars.gradle_dir}"
 timeout_min = 20
 tags = ["ui"]
 needs = ["display"]
+judge = { type = "junit", reports = "app/app/build/outputs/androidTest-results/**/*.xml", min_tests = 1 }

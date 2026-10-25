@@ -8,6 +8,15 @@ check = { vswhere = true }
 fields = ["min", "components"]
 hint = "Visual Studio Build Tools 를 관리자가 설치한다"
 
+[kind.git_bash]
+tier = "base"
+installer = "base"
+check = { path_from = "git" }
+version_any = true                                  # 버전을 고정하지 않는다 — expect 는 자리표시자 없는 고정 문자열
+bin = ["bin", "usr/bin"]
+probe = { run = ["bash", "--version"], expect = "GNU bash, version" }
+hint = "Git for Windows 를 관리자가 설치한다"
+
 [kind.android_sdk]
 tier = "base"
 installer = "base"
