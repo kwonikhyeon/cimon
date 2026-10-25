@@ -284,6 +284,27 @@ pub fn account_env_main(args: &[String]) -> i32 {
     0
 }
 
+/// Opens `path` for reading only if, after following every link and junction, it is
+/// still inside `root`. The work tree is writable by build steps, and the service
+/// account copies and reads files from it: a junction must not turn an artifact or a
+/// report into a copy of a service-only file. The check is made on the open handle,
+/// so swapping a directory after the check does not help.
+pub fn open_within(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
+    let f = std::fs::File::open(path)?;
+    #[cfg(windows)]
+    let real = win::final_path(&f)?;
+    #[cfg(not(windows))]
+    let real = std::fs::canonicalize(path)?;
+    let root = std::fs::canonicalize(root)?;
+    let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
+    let (r, f_) = (norm(&root), norm(&real));
+    if f_.starts_with(&format!("{}\\", r.trim_end_matches('\\'))) {
+        Ok(f)
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{} leads outside {} (to {})", path.display(), root.display(), real.display())))
+    }
+}
+
 /// Free disk space for `[disk].min_free_gb`.
 pub fn free_bytes(path: &Path) -> Option<u64> {
     #[cfg(windows)]
@@ -300,6 +321,29 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_within_refuses_links_out() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        let outside = d.path().join("secret");
+        std::fs::create_dir_all(ws.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(ws.join("sub/a.txt"), "a").unwrap();
+        std::fs::write(outside.join("key"), "k").unwrap();
+        assert!(open_within(&ws, &ws.join("sub/a.txt")).is_ok());
+        assert!(open_within(&ws, &outside.join("key")).is_err());
+        assert!(open_within(&ws, &ws.join("sub/../../secret/key")).is_err());
+        #[cfg(windows)]
+        {
+            // a junction inside the work tree pointing out of it
+            let j = ws.join("j");
+            let ok = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&j).arg(&outside).output().map(|o| o.status.success()).unwrap_or(false);
+            if ok {
+                assert!(open_within(&ws, &j.join("key")).is_err());
+            }
+        }
+    }
 
     #[test]
     fn resolution_rules() {

@@ -98,11 +98,14 @@ pub fn judge_cargo(exec: &ExecResult, min_tests: u32) -> StepJudgement {
 }
 
 /// Counts JUnit `<testcase>` elements in the given files.
-pub fn junit_counts(files: &[std::path::PathBuf]) -> Result<TestCounts, String> {
+/// Counts test cases in JUnit reports under `ws`; a report that leads outside the work
+/// tree (link, junction) is refused.
+pub fn junit_counts(ws: &Path, files: &[std::path::PathBuf]) -> Result<TestCounts, String> {
     use quick_xml::events::Event;
     let mut t = TestCounts::default();
     for f in files {
-        let mut reader = quick_xml::Reader::from_file(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let file = cimon_runner::open_within(ws, f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let mut reader = quick_xml::Reader::from_reader(std::io::BufReader::new(file));
         let mut buf = vec![];
         let mut in_case = false;
         let mut case_failed = false;
@@ -170,7 +173,7 @@ pub fn find_files(ws: &Path, globs: &[String]) -> Vec<std::path::PathBuf> {
 
 pub fn judge_junit(exec: &ExecResult, ws: &Path, reports: &[String], min_tests: u32) -> StepJudgement {
     let files = find_files(ws, reports);
-    let counts = if files.is_empty() { None } else { junit_counts(&files).ok() };
+    let counts = if files.is_empty() { None } else { junit_counts(ws, &files).ok() };
     let mut j = match exec.exit_code {
         Some(0) => {
             if files.is_empty() {
@@ -179,7 +182,7 @@ pub fn judge_junit(exec: &ExecResult, ws: &Path, reports: &[String], min_tests: 
                     format!("no JUnit report matched {} — no tests ran (or reports goes somewhere else)", reports.join(", ")),
                 ))
             } else {
-                match junit_counts(&files) {
+                match junit_counts(ws, &files) {
                     Err(e) => StepJudgement::of(Outcome::inconclusive(FailureClass::Recipe, format!("unreadable JUnit report: {e}"))),
                     Ok(t) if t.failed > 0 => StepJudgement::of(Outcome::fail(FailureClass::Code, format!("{} test(s) failed", t.failed))),
                     Ok(t) if t.passed < min_tests as u64 => StepJudgement::of(Outcome::fail(

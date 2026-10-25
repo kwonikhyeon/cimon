@@ -330,3 +330,21 @@ pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
     let mut avail: u64 = 0;
     (unsafe { GetDiskFreeSpaceExW(p.as_ptr(), &mut avail, null_mut(), null_mut()) } != 0).then_some(avail)
 }
+
+/// The path a handle really points at, after every link and junction.
+pub fn final_path(f: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS};
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let n = unsafe { GetFinalPathNameByHandleW(f.as_raw_handle() as HANDLE, buf.as_mut_ptr(), buf.len() as u32, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS) } as usize;
+        if n == 0 {
+            return Err(last_error("GetFinalPathNameByHandleW"));
+        }
+        if n < buf.len() {
+            return Ok(std::ffi::OsString::from_wide(&buf[..n]).into());
+        }
+        buf.resize(n + 1, 0);
+    }
+}

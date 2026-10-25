@@ -29,6 +29,9 @@ pub type Result<T> = std::result::Result<T, StoreError>;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// The database file (None in memory) — backups open their own connection so a
+    /// long `VACUUM INTO` does not hold every request behind the mutex.
+    path: Option<std::path::PathBuf>,
 }
 
 const SCHEMA: &str = include_str!("schema.sql");
@@ -40,14 +43,14 @@ impl Store {
             let _ = std::fs::create_dir_all(parent);
         }
         let conn = Connection::open(path)?;
-        Self::init(conn)
+        Self::init(conn, Some(path.to_path_buf()))
     }
 
     pub fn open_in_memory() -> Result<Store> {
-        Self::init(Connection::open_in_memory()?)
+        Self::init(Connection::open_in_memory()?, None)
     }
 
-    fn init(conn: Connection) -> Result<Store> {
+    fn init(conn: Connection, path: Option<std::path::PathBuf>) -> Result<Store> {
         conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "FULL")?;
@@ -66,7 +69,7 @@ impl Store {
             }
             Some(_) => {}
         }
-        Ok(Store { conn: Mutex::new(conn) })
+        Ok(Store { conn: Mutex::new(conn), path })
     }
 
     pub(crate) fn conn(&self) -> MutexGuard<'_, Connection> {
@@ -85,7 +88,16 @@ impl Store {
     /// `VACUUM INTO` — a consistent copy even in WAL mode (design §16.5).
     pub fn vacuum_into(&self, target: &Path) -> Result<()> {
         let _ = std::fs::remove_file(target);
-        self.conn().execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+        match &self.path {
+            Some(p) => {
+                let c = Connection::open(p)?;
+                c.busy_timeout(std::time::Duration::from_secs(30))?;
+                c.execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+            }
+            None => {
+                self.conn().execute("VACUUM INTO ?1", [target.to_string_lossy().as_ref()])?;
+            }
+        }
         Ok(())
     }
 

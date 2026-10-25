@@ -35,6 +35,16 @@ pub struct Engine {
     pub helper: Mutex<Option<PathBuf>>,
     /// Held by the runner while a job runs, and by the janitor while it deletes.
     pub runner_lock: tokio::sync::Mutex<()>,
+    /// Wakes the janitor (disk floor reached during a call).
+    pub janitor: Notify,
+    /// One lock per mirror: intake fetches/reads and GC never overlap.
+    pub mirror_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+}
+
+impl Engine {
+    pub fn mirror_lock(&self, key: &str) -> Arc<Mutex<()>> {
+        self.mirror_locks.lock().unwrap().entry(key.to_string()).or_insert_with(|| Arc::new(Mutex::new(()))).clone()
+    }
 }
 
 pub struct App {
@@ -59,6 +69,8 @@ impl App {
             build_account: Mutex::new(None),
             helper: Mutex::new(std::env::current_exe().ok()),
             runner_lock: tokio::sync::Mutex::new(()),
+            janitor: Notify::new(),
+            mirror_locks: Mutex::new(HashMap::new()),
         };
         Ok(Arc::new(App { config, layout, store, recipes, engine }))
     }

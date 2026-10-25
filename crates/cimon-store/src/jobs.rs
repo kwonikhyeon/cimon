@@ -251,23 +251,31 @@ impl Store {
         )?)
     }
 
-    pub fn set_state(&self, id: i64, state: JobState, status: &str) -> Result<()> {
+    /// Compare-and-set state change: applies only when the job is in one of `from` and
+    /// no cancellation was requested (unless moving to `cancelling`). Returns whether it
+    /// applied — every transition goes through here so a late writer cannot bring a
+    /// finished or cancelled job back.
+    pub fn transition(&self, id: i64, from: &[JobState], to: JobState, status: &str) -> Result<bool> {
         let t = now();
-        let extra = match state {
+        let extra = match to {
             JobState::Ready => ", ready_at = ?4",
             JobState::Running => ", started_at = COALESCE(started_at, ?4)",
-            _ => ", last_updated_at = ?4",
+            _ => "",
         };
-        self.conn().execute(
-            &format!("UPDATE jobs SET state = ?2, status_message = ?3, last_updated_at = ?4 {extra} WHERE id = ?1"),
-            params![id, state.as_str(), status, t],
+        let list = from.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(",");
+        let cancel_guard = if to == JobState::Cancelling { "" } else { " AND cancel_requested_by IS NULL" };
+        let n = self.conn().execute(
+            &format!("UPDATE jobs SET state = ?2, status_message = ?3, last_updated_at = ?4 {extra} WHERE id = ?1 AND state IN ({list}){cancel_guard}"),
+            params![id, to.as_str(), status, t],
         )?;
-        Ok(())
+        Ok(n > 0)
     }
 
+    /// Status text for a job that is still going; finished jobs keep theirs.
     pub fn set_status(&self, id: i64, status: &str) -> Result<()> {
         self.conn().execute(
-            "UPDATE jobs SET status_message = ?2, last_updated_at = ?3 WHERE id = ?1",
+            "UPDATE jobs SET status_message = ?2, last_updated_at = ?3 WHERE id = ?1
+               AND state NOT IN ('done','merged','cancelled','queue_timeout','interrupted')",
             params![id, status, now()],
         )?;
         Ok(())
@@ -310,11 +318,36 @@ impl Store {
         warnings_json: &str,
         result_json: &str,
     ) -> Result<bool> {
+        self.finish_job_if(id, None, state, verdict, failure_class, reason_code, status, summary, warnings_json, result_json)
+    }
+
+    /// `finish_job` restricted to jobs currently in one of `from` (e.g. only pre-start
+    /// jobs for a queue timeout or a pre-start cancel).
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_job_if(
+        &self,
+        id: i64,
+        from: Option<&[JobState]>,
+        state: JobState,
+        verdict: Option<&str>,
+        failure_class: Option<&str>,
+        reason_code: Option<&str>,
+        status: &str,
+        summary: &str,
+        warnings_json: &str,
+        result_json: &str,
+    ) -> Result<bool> {
         let t = now();
+        let guard = match from {
+            Some(list) => format!(" AND state IN ({})", list.iter().map(|s| format!("'{}'", s.as_str())).collect::<Vec<_>>().join(",")),
+            None => String::new(),
+        };
         let n = self.conn().execute(
-            "UPDATE jobs SET state = ?2, verdict = ?3, failure_class = ?4, reason_code = ?5, status_message = ?6,
-               summary = ?7, warnings_json = ?8, result_json = ?9, finished_at = ?10, last_updated_at = ?10
-             WHERE id = ?1 AND state NOT IN ('done','merged','cancelled','queue_timeout','interrupted')",
+            &format!(
+                "UPDATE jobs SET state = ?2, verdict = ?3, failure_class = ?4, reason_code = ?5, status_message = ?6,
+                   summary = ?7, warnings_json = ?8, result_json = ?9, finished_at = ?10, last_updated_at = ?10
+                 WHERE id = ?1 AND state NOT IN ('done','merged','cancelled','queue_timeout','interrupted'){guard}"
+            ),
             params![id, state.as_str(), verdict, failure_class, reason_code, status, summary, warnings_json, result_json, t],
         )?;
         Ok(n > 0)
@@ -341,16 +374,30 @@ impl Store {
             .optional()?)
     }
 
-    /// Ends `id` as merged into `into` and moves its tasks there.
-    pub fn merge_job(&self, id: i64, into: i64, status: &str) -> Result<()> {
+    /// Ends `id` as merged into `into` and moves its tasks there — only if, inside the
+    /// same transaction, `id` is still pre-start without a cancel request and `into` is
+    /// still ready/running without one. Returns whether the merge happened.
+    pub fn merge_job(&self, id: i64, into: i64, status: &str) -> Result<bool> {
         self.tx(|tx| {
             let t = now();
-            tx.execute(
-                "UPDATE jobs SET state = 'merged', merged_into = ?2, status_message = ?3, finished_at = ?4, last_updated_at = ?4 WHERE id = ?1",
+            let target_ok: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM jobs WHERE id = ?1 AND state IN ('ready','running') AND cancel_requested_by IS NULL",
+                [into],
+                |r| r.get(0),
+            )?;
+            if target_ok == 0 {
+                return Ok(false);
+            }
+            let n = tx.execute(
+                "UPDATE jobs SET state = 'merged', merged_into = ?2, status_message = ?3, finished_at = ?4, last_updated_at = ?4
+                 WHERE id = ?1 AND state IN ('intake','provisioning','ready') AND cancel_requested_by IS NULL",
                 params![id, into, status, t],
             )?;
+            if n == 0 {
+                return Ok(false);
+            }
             tx.execute("UPDATE tasks SET job_id = ?2 WHERE job_id = ?1", params![id, into])?;
-            Ok(())
+            Ok(true)
         })
     }
 
@@ -428,6 +475,31 @@ impl Store {
     pub fn touch_task(&self, task_id: &str) -> Result<()> {
         self.conn().execute("UPDATE tasks SET last_polled_at = ?2 WHERE task_id = ?1", params![task_id, now()])?;
         Ok(())
+    }
+
+    /// Detaches a task and, in the same transaction, requests cancellation of its job
+    /// when no attached task remains (so a concurrent merge cannot attach a task to a
+    /// job that is about to be cancelled). Returns (job id, remaining attached tasks).
+    pub fn detach_task_cancel(&self, task_id: &str, reason: &str, by: &str) -> Result<(i64, i64)> {
+        self.tx(|tx| {
+            let job: Option<i64> = tx.query_row("SELECT job_id FROM tasks WHERE task_id = ?1", [task_id], |r| r.get(0)).optional()?;
+            let Some(job) = job else {
+                return Err(StoreError::NotFound(task_id.to_string()));
+            };
+            tx.execute(
+                "UPDATE tasks SET detached_at = COALESCE(detached_at, ?2), detached_reason = COALESCE(detached_reason, ?3) WHERE task_id = ?1",
+                params![task_id, now(), reason],
+            )?;
+            let remaining: i64 = tx.query_row("SELECT COUNT(*) FROM tasks WHERE job_id = ?1 AND detached_at IS NULL", [job], |r| r.get(0))?;
+            if remaining == 0 {
+                tx.execute(
+                    "UPDATE jobs SET cancel_requested_by = COALESCE(cancel_requested_by, ?2), last_updated_at = ?3
+                     WHERE id = ?1 AND state NOT IN ('done','merged','cancelled','queue_timeout','interrupted')",
+                    params![job, by, now()],
+                )?;
+            }
+            Ok((job, remaining))
+        })
     }
 
     /// Detaches a task; returns how many tasks remain attached to the job.
@@ -818,10 +890,12 @@ mod tests {
         let b = s.insert_job_with_task(&new_job("u"), "t2", true, None).unwrap();
         assert_eq!(s.count_pre_start_by_user("u").unwrap(), 2);
         s.set_intake(a, "c1", "[]", "{}", "k").unwrap();
-        s.set_state(a, JobState::Ready, "대기").unwrap();
+        assert!(s.transition(a, &[JobState::Intake], JobState::Ready, "대기").unwrap());
+        // a transition from the wrong state does not apply
+        assert!(!s.transition(a, &[JobState::Intake], JobState::Running, "x").unwrap());
         s.set_intake(b, "c1", "[]", "{}", "k").unwrap();
         assert_eq!(s.merge_target("k", b).unwrap(), Some(a));
-        s.merge_job(b, a, "merged").unwrap();
+        assert!(s.merge_job(b, a, "merged").unwrap());
         assert_eq!(s.tasks_for_job(a).unwrap().len(), 2);
         assert_eq!(s.require_job(b).unwrap().state, JobState::Merged);
         // one task detaches, one remains
@@ -831,6 +905,28 @@ mod tests {
         // a second finish does not overwrite
         assert!(!s.finish_job(a, JobState::Cancelled, None, None, None, "", "", "[]", "{}").unwrap());
         assert_eq!(s.require_job(a).unwrap().verdict.as_deref(), Some("pass"));
+        // and a finished job cannot be moved to cancelling
+        assert!(!s.transition(a, &[JobState::Running, JobState::Collecting], JobState::Cancelling, "x").unwrap());
+        s.set_status(a, "late").unwrap();
+        assert_eq!(s.require_job(a).unwrap().status_message.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn merge_refuses_cancelled_parties_and_detach_cancels_atomically() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_job_with_task(&new_job("u"), "ta", true, None).unwrap();
+        let b = s.insert_job_with_task(&new_job("u"), "tb", true, None).unwrap();
+        assert!(s.transition(a, &[JobState::Intake], JobState::Ready, "").unwrap());
+        // the only task of A detaches: cancellation is requested in the same transaction
+        let (job, remaining) = s.detach_task_cancel("ta", "tasks/cancel", "u").unwrap();
+        assert_eq!((job, remaining), (a, 0));
+        assert!(s.require_job(a).unwrap().cancel_requested_by.is_some());
+        // so B cannot merge into it
+        assert!(!s.merge_job(b, a, "m").unwrap());
+        assert_eq!(s.require_job(b).unwrap().state, JobState::Intake);
+        // and a cancelled job does not leave pre-start by transition
+        s.request_cancel(b, "u").unwrap();
+        assert!(!s.transition(b, &[JobState::Intake], JobState::Provisioning, "").unwrap());
     }
 
     #[test]

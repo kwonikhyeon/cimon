@@ -131,7 +131,7 @@ impl Fixtures {
         let lookup_dir = ctx.app.layout.step_out(ctx.job.id, &format!("fixture-{name}"));
         let globs: Vec<String> = {
             let l = ctx.lookup(name, &lookup_dir);
-            def.collect.iter().filter_map(|g| cimon_recipe::vars::expand(g, &l).ok()).collect()
+            def.collect.iter().filter_map(|g| cimon_recipe::vars::expand(g, &l).ok()).map(|g| crate::run::relative_to_ws(&ctx.ws, &g)).collect()
         };
         if !globs.is_empty() {
             let files = cimon_judge::find_files(&ctx.ws, &globs);
@@ -141,14 +141,22 @@ impl Fixtures {
                 if let Some(p) = to.parent() {
                     let _ = std::fs::create_dir_all(p);
                 }
-                let _ = std::fs::copy(f, &to);
+                // the work tree is build-writable: never follow a link out of it
+                if let Ok(mut src) = cimon_runner::open_within(&ctx.ws, f) {
+                    if let Ok(mut dst) = std::fs::File::create(&to) {
+                        let _ = std::io::copy(&mut src, &mut dst);
+                    }
+                }
             }
         }
         for (i, cmd) in def.down.iter().enumerate() {
-            if let Ok(r) = run_cmd(ctx, name, &format!("down-{i}"), cmd, &def) {
-                if r.exit_code != Some(0) {
-                    ctx.warnings.push(Warning::new("fixture", format!("{name}: down 명령이 {:?} 로 끝났다", r.exit_code)));
+            match run_cmd(ctx, name, &format!("down-{i}"), cmd, &def) {
+                Ok(r) if r.exit_code == Some(0) && r.spawn_error.is_none() && !r.timed_out => {}
+                Ok(r) => {
+                    let why = r.spawn_error.clone().unwrap_or_else(|| format!("exit {:?}{}", r.exit_code, if r.timed_out { " (timeout)" } else { "" }));
+                    ctx.warnings.push(Warning::new("fixture", format!("{name}: down-{i} 명령 실패 — {why}")));
                 }
+                Err(e) => ctx.warnings.push(Warning::new("fixture", format!("{name}: down-{i} 명령을 띄우지 못했다 — {e}"))),
             }
         }
         if let Some(gone) = &def.gone {
@@ -171,7 +179,10 @@ impl Fixtures {
                 ctx.warnings.push(Warning::new("fixture", format!("{name}: down 뒤에도 남아 있다(fixture 잔류) — 작업 끝 정리가 마무리한다")));
             }
         }
-        self.state.insert(name.to_string(), State::Down);
+        // a failed fixture stays failed: later steps that use it get the same outcome
+        if !matches!(self.state.get(name), Some(State::Failed(_))) {
+            self.state.insert(name.to_string(), State::Down);
+        }
         let _ = ctx.app.store.set_fixture_state(ctx.job.id, None);
     }
 }
@@ -228,6 +239,10 @@ fn fixture_env(ctx: &JobCtx<'_>, def: &FixtureDef, out_dir: &std::path::Path) ->
 }
 
 fn run_argv(ctx: &JobCtx<'_>, name: &str, what: &str, argv: &[String], timeout: Duration, def: &FixtureDef) -> Result<cimon_runner::ExecResult, String> {
+    // why: teardown must finish even after a cancel, or the fixture outlives the job
+    let cleanup = what.starts_with("down") || what == "gone";
+    let never = AtomicBool::new(false);
+    let cancel = if cleanup { &never } else { ctx.cancel };
     let out_dir = ctx.app.layout.step_out(ctx.job.id, &format!("fixture-{name}"));
     let _ = std::fs::create_dir_all(&out_dir);
     let lookup = ctx.lookup("fixture", &out_dir);
@@ -248,7 +263,7 @@ fn run_argv(ctx: &JobCtx<'_>, name: &str, what: &str, argv: &[String], timeout: 
         capture_prefixes: vec![String::new()],
         preamble: vec![],
     };
-    Ok(exec::execute(&spec, &ctx.account, &AtomicBool::new(false)))
+    Ok(exec::execute(&spec, &ctx.account, cancel))
 }
 
 fn run_cmd(ctx: &JobCtx<'_>, name: &str, what: &str, cmd: &FixtureCmd, def: &FixtureDef) -> Result<cimon_runner::ExecResult, String> {

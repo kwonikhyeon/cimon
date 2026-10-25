@@ -136,10 +136,17 @@ impl Mirror {
     /// Resolves a requested ref to a commit (design §7.3): a branch name, or a commit
     /// reachable from one of the allowed branches.
     pub fn resolve(&self, r: &str, allowed: impl Fn(&str) -> bool) -> std::result::Result<(String, Option<String>), ResolveError> {
-        if let Some(c) = self.branch(r) {
-            return Ok((c, Some(r.to_string())));
-        }
         let looks_sha = r.len() >= 7 && r.len() <= 40 && r.bytes().all(|b| b.is_ascii_hexdigit());
+        if let Some(c) = self.branch(r) {
+            if allowed(r) {
+                return Ok((c, Some(r.to_string())));
+            }
+            // a branch named like a hash is still a branch: it must be allowed, or the
+            // name is taken as a commit and has to be reachable from an allowed branch
+            if !looks_sha {
+                return Err(ResolveError::CommitNotAllowed(format!("branch {r:?} is not in allowed_refs")));
+            }
+        }
         if !looks_sha {
             return Err(ResolveError::RefNotFound(format!("branch {r:?} does not exist in the repository")));
         }
@@ -182,8 +189,10 @@ impl Mirror {
 
     /// GC — only when the runner is idle (design §11.1). Keep refs protect the commits
     /// warm slots and running jobs borrow.
+    /// Repacks and prunes. Loose objects younger than an hour survive, so a fetch that
+    /// is writing objects (or a clone borrowing them) right now is not cut short.
     pub fn gc(&self) -> Result<()> {
-        git(&self.dir, &["gc", "--quiet", "--prune=now"]).map(|_| ())
+        git(&self.dir, &["gc", "--quiet", "--prune=1.hour.ago"]).map(|_| ())
     }
 }
 
@@ -381,8 +390,12 @@ mod tests {
         git(&w, &["add", "-A"]).unwrap();
         git(&w, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "s"]).unwrap();
         let c2 = git(&w, &["rev-parse", "HEAD"]).unwrap();
+        // a branch named like a hash is not a way around allowed_refs
+        git(&w, &["branch", "deadbeef"]).unwrap();
         let m = Mirror::fetch(&d.path().join("m.git"), &url).unwrap();
         assert!(matches!(m.resolve(&c2, allowed), Err(ResolveError::CommitNotAllowed(_))));
+        assert!(matches!(m.resolve("deadbeef", allowed), Err(ResolveError::CommitNotAllowed(_))));
+        assert!(matches!(m.resolve("secret", allowed), Err(ResolveError::CommitNotAllowed(_))));
 
         // warm slot: create, add untracked files, reuse with keep
         let slot = d.path().join("ws").join("warm-1");

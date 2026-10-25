@@ -41,10 +41,14 @@ pub fn startup(app: &App) {
             }
         }
     }
-    // clean clones and isolated sibling trees of finished jobs
-    if let Ok(rd) = std::fs::read_dir(app.layout.ws()) {
-        for p in rd.flatten() {
-            if let Ok(inner) = std::fs::read_dir(p.path()) {
+    // clean clones (ws/<project>/j<id>) and isolated sibling trees
+    // (ws/_sibling/<project>/j<id>) of finished jobs
+    let sibling_root = app.layout.ws().join("_sibling");
+    let project_dirs = std::fs::read_dir(app.layout.ws()).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| *p != sibling_root);
+    let sibling_dirs = std::fs::read_dir(&sibling_root).into_iter().flatten().flatten().map(|e| e.path());
+    {
+        for p in project_dirs.chain(sibling_dirs) {
+            if let Ok(inner) = std::fs::read_dir(&p) {
                 for e in inner.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     if let Some(id) = name.strip_prefix('j').and_then(|n| n.parse::<i64>().ok()) {
@@ -59,20 +63,45 @@ pub fn startup(app: &App) {
 }
 
 /// Every minute: queue timeouts; every hour: retention; daily: backups and mirror GC.
+/// A disk-floor wake-up runs `free_space` as soon as the runner lock is free. Work that
+/// needs the runner lock goes to its own task, so a long job never holds up the
+/// minute tick (queue timeouts).
 pub async fn ticker(app: Arc<App>) {
     let mut last_hourly = std::time::Instant::now() - Duration::from_secs(3600);
+    let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
     loop {
+        let mut disk = false;
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(60)) => {}
+            _ = app.engine.janitor.notified() => disk = true,
             _ = app.engine.shutdown.cancelled() => return,
         }
         let a = app.clone();
         let _ = tokio::task::spawn_blocking(move || crate::jobs::tick(&a)).await;
-        if last_hourly.elapsed() >= Duration::from_secs(3600) {
-            last_hourly = std::time::Instant::now();
+        let hourly_due = last_hourly.elapsed() >= Duration::from_secs(3600);
+        if (hourly_due || disk) && !busy.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            if hourly_due {
+                last_hourly = std::time::Instant::now();
+            }
             let a = app.clone();
-            let _guard = app.engine.runner_lock.lock().await;
-            let _ = tokio::task::spawn_blocking(move || hourly(&a)).await;
+            let busy = busy.clone();
+            tokio::spawn(async move {
+                let _guard = a.engine.runner_lock.lock().await;
+                let b = a.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    if hourly_due {
+                        hourly(&b);
+                    }
+                    if disk {
+                        free_space(&b);
+                    }
+                })
+                .await;
+                if let Err(e) = res {
+                    tracing::error!("janitor pass panicked: {e}");
+                }
+                busy.store(false, std::sync::atomic::Ordering::SeqCst);
+            });
         }
     }
 }
@@ -134,7 +163,8 @@ pub fn retention_pass(app: &App) {
     for p in app.store.closed_before(&after_secs(-CLOSED_PROPOSAL_DAYS * 86400)).unwrap_or_default() {
         let _ = app.recipes.drop_closed(&cimon_core::proposal_label(p.id));
     }
-    // toolchains unused for 30 days and not used by an unfinished job
+    // toolchains unused for 30 days and not used by an unfinished job (job_toolchains
+    // records the install's version key, the same key installs are stored under)
     let in_use = app.store.installs_in_use().unwrap_or_default();
     for i in app.store.installs().unwrap_or_default() {
         if older_than_days(&i.last_used_at, TOOLCHAIN_DAYS) && !in_use.iter().any(|(k, v, e)| *k == i.kind && *v == i.version && *e == i.entry_sha256) {
@@ -187,7 +217,7 @@ fn trial_project_leftovers(app: &App) {
 /// Keeps each project's package cache under `[disk].cache_max_gb_per_project`,
 /// deleting the least recently modified top-level entries first.
 fn cache_limits(app: &App) {
-    let limit = app.config.disk.cache_max_gb_per_project * (1 << 30);
+    let limit = app.config.disk.cache_max_gb_per_project.saturating_mul(1 << 30);
     let Ok(rd) = std::fs::read_dir(app.layout.root.join("caches")) else { return };
     for project in rd.flatten() {
         let mut entries: Vec<(std::time::SystemTime, u64, std::path::PathBuf)> = vec![];
@@ -231,9 +261,13 @@ fn daily_backups(app: &App) {
             tracing::error!("daily db backup: {e}");
         }
     }
-    // mirror GC — the caller holds the runner lock, so no job borrows objects right now
+    // mirror GC — the caller holds the runner lock, so no job borrows objects right now;
+    // the mirror lock keeps intake's fetch/resolve/keep out while it runs
     if let Ok(rd) = std::fs::read_dir(app.layout.mirrors()) {
         for e in rd.flatten() {
+            let key = e.file_name().to_string_lossy().trim_end_matches(".git").to_string();
+            let lock = app.engine.mirror_lock(&key);
+            let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(m) = cimon_workspace::Mirror::open(&e.path()) {
                 let stamp = e.path().join("cimon-last-gc");
                 let fresh = std::fs::metadata(&stamp).ok().and_then(|m| m.modified().ok()).is_some_and(|m| m.elapsed().map(|d| d.as_secs() < 86400).unwrap_or(true));
@@ -249,10 +283,11 @@ fn daily_backups(app: &App) {
 }
 
 /// Disk floor (design §16.4): run retention, then drop least recently used warm slots
-/// until the floor is met. Called before refusing a job with `disk_low`.
+/// until the floor is met. Runs from the ticker with the runner lock held, after a call
+/// was refused with `disk_low`.
 pub fn free_space(app: &App) {
     retention_pass(app);
-    let min = app.config.disk.min_free_gb * (1 << 30);
+    let min = app.config.disk.min_free_gb.saturating_mul(1 << 30);
     let busy: std::collections::BTreeSet<(String, i64)> = app
         .store
         .jobs_in_states(&[JobState::Running, JobState::Collecting, JobState::Cancelling])
@@ -261,6 +296,8 @@ pub fn free_space(app: &App) {
         .filter_map(|j| j.workspace_slot.map(|s| (j.project_key, s)))
         .collect();
     for (project, slot, _) in app.store.all_warm_slots().unwrap_or_default() {
+        let lock = app.engine.mirror_lock(&project);
+        let _g = lock.lock().unwrap_or_else(|p| p.into_inner());
         if cimon_runner::free_bytes(&app.layout.root).unwrap_or(u64::MAX) >= min {
             break;
         }

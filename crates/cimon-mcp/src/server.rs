@@ -95,9 +95,13 @@ impl ServerHandler for CimonMcp {
         if crate::auth_user(parts).is_none() {
             return Err(McpError::invalid_request("unauthenticated", None));
         }
-        match tools::get_task(&self.app, &request.task_id) {
-            Ok(t) => Ok(GetTaskResult::new(t)),
-            Err(ToolError { message, .. }) => Err(McpError::invalid_params(message, None)),
+        // store and log reads block; keep them off the async workers
+        let app = self.app.clone();
+        let id = request.task_id.clone();
+        match tokio::task::spawn_blocking(move || tools::get_task(&app, &id)).await {
+            Ok(Ok(t)) => Ok(GetTaskResult::new(t)),
+            Ok(Err(ToolError { message, .. })) => Err(McpError::invalid_params(message, None)),
+            Err(e) => Err(McpError::internal_error(format!("tasks/get failed: {e}"), None)),
         }
     }
 
@@ -106,6 +110,11 @@ impl ServerHandler for CimonMcp {
         let Some(user) = crate::auth_user(parts) else {
             return Err(McpError::invalid_request("unauthenticated", None));
         };
-        tools::cancel_task(&self.app, &user, &request.task_id).map_err(|e| McpError::invalid_params(e.message, None))
+        let app = self.app.clone();
+        let id = request.task_id.clone();
+        match tokio::task::spawn_blocking(move || tools::cancel_task(&app, &user, &id)).await {
+            Ok(r) => r.map_err(|e| McpError::invalid_params(e.message, None)),
+            Err(e) => Err(McpError::internal_error(format!("tasks/cancel failed: {e}"), None)),
+        }
     }
 }

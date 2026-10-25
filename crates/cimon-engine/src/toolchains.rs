@@ -90,12 +90,14 @@ pub fn provide(app: &App, id: i64, job: &JobRow, r: &Resolved, plan: &JobPlan) -
             continue;
         }
         let version = plan.versions.get(kind).cloned().ok_or_else(|| env_err("toolchain_not_provisioned", format!("{kind}: no version resolved")))?;
+        // installs are stored under the version key (python + packages gets a suffix)
+        let vkey = cimon_toolchain::version_key(def, &version, &req);
         let entry = cat.hash(kind).unwrap_or_default().to_string();
         let main_entry = main_cat.hash(kind).map(str::to_string);
-        if let Ok(Some(i)) = app.store.install(kind, &version, &entry) {
+        if let Ok(Some(i)) = app.store.install(kind, &vkey, &entry) {
             if PathBuf::from(&i.root).exists() {
-                let _ = app.store.touch_install(kind, &version, &entry);
-                let _ = app.store.set_job_toolchain(id, kind, &version, &entry, None);
+                let _ = app.store.touch_install(kind, &vkey, &entry);
+                let _ = app.store.set_job_toolchain(id, kind, &vkey, &entry, None);
                 continue;
             }
         }
@@ -119,7 +121,7 @@ pub fn provide(app: &App, id: i64, job: &JobRow, r: &Resolved, plan: &JobPlan) -
         match cimon_toolchain::install(&installer_ctx(app), kind, mdef, &entry, &version, &req, "main") {
             Ok(inst) => {
                 let _ = app.store.upsert_install(&inst);
-                let _ = app.store.set_job_toolchain(id, kind, &version, &entry, None);
+                let _ = app.store.set_job_toolchain(id, kind, &vkey, &entry, None);
             }
             Err(e) => {
                 return Err(Provision {
@@ -167,16 +169,18 @@ pub fn env_for(app: &App, id: i64, r: &Resolved, plan: &JobPlan) -> Result<ToolE
     // declaration order of [toolchains] (BTreeMap: sorted by kind, stable)
     for kind in &plan.plan.toolchains {
         let def = cat.kinds.get(kind).ok_or_else(|| format!("{kind} missing from the catalog"))?;
-        let Some((_, version, entry, _)) = used.iter().find(|(k, ..)| k == kind) else {
+        let Some((_, vkey, entry, _)) = used.iter().find(|(k, ..)| k == kind) else {
             return Err(format!("{kind} was not provided by intake"));
         };
-        ident.push_str(&format!("{kind}={version}@{entry};"));
+        ident.push_str(&format!("{kind}={vkey}@{entry};"));
+        // the plain version for `{version}` placeholders; the key finds the install
+        let version = &vkey.split("+pkgs.").next().unwrap_or(vkey).to_string();
         let req = r.toolchains.get(kind).cloned().unwrap_or_default();
         let (root, bins, home) = if def.is_base() {
             let found = cimon_toolchain::base::check(app_base(app), kind, def, &req).map_err(|e| format!("{kind}: {e}"))?;
             (found.root.clone(), found.bins.clone(), found.root)
         } else {
-            let inst = app.store.install(kind, version, entry).map_err(|e| e.to_string())?.ok_or_else(|| format!("{kind} {version} is not installed"))?;
+            let inst = app.store.install(kind, vkey, entry).map_err(|e| e.to_string())?.ok_or_else(|| format!("{kind} {vkey} is not installed"))?;
             let root = PathBuf::from(&inst.root);
             let layout = cimon_toolchain::layout_of(&installer_ctx(app), kind, def, version, &root, &req);
             (root, layout.bins, layout.home)

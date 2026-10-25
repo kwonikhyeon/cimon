@@ -3,14 +3,14 @@
 use crate::jobs::{self, JobPlan, JobRequest};
 use crate::App;
 use cimon_core::{job_label, now, FailureClass, JobState, Outcome, Verdict, Warning};
-use cimon_recipe::model::{Inspect, Kind};
+use cimon_recipe::model::Kind;
 use cimon_recipe::resolve::Resolved;
 use cimon_recipe::select::param_string;
 use cimon_runner::{exec, ExecSpec};
 use cimon_store::{JobRow, StepRow};
 use cimon_workspace::{Mirror, WorkTree};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -39,7 +39,18 @@ pub async fn runner_loop(app: Arc<App>) {
         app.engine.running.lock().unwrap().remove(&id);
         if let Err(e) = res {
             tracing::error!("runner panicked on {}: {e}", job_label(id));
-            jobs::finish_simple(&app, id, JobState::Done, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("internal_error"), "the runner crashed — see the service log");
+            if let Ok(Some(j)) = app.store.job(id) {
+                if let Some(slot) = j.workspace_slot {
+                    let _ = app.store.clear_warm_state(&j.project_key, slot);
+                }
+                if j.cancel_requested_by.is_some() {
+                    jobs::finish_simple(&app, id, JobState::Cancelled, None, None, None, "취소 중 러너가 멈췄다 — 취소로 끝냄");
+                } else {
+                    jobs::finish_simple(&app, id, JobState::Done, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("internal_error"), "the runner crashed — see the service log");
+                }
+                jobs::release_keeps(&app, &j);
+                let _ = cimon_workspace::remove_dir_all_robust(&app.layout.sibling_isolated(&j.project_key, id));
+            }
             cleanup_job_dirs(&app, id);
         }
         drop(guard);
@@ -114,15 +125,17 @@ pub struct JobCtx<'a> {
 }
 
 pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
-    let Ok(job) = app.store.require_job(id) else { return };
-    if job.cancel_requested_by.is_some() || job.state != JobState::Ready {
-        if job.state == JobState::Ready {
-            jobs::finish_simple(app, id, JobState::Cancelled, None, None, None, "시작 전에 취소됨");
+    // compare-and-set: a cancel or queue timeout that landed first wins
+    if !app.store.transition(id, &[JobState::Ready], JobState::Running, "작업 공간 준비").unwrap_or(false) {
+        if let Ok(Some(j)) = app.store.job(id) {
+            if j.state == JobState::Ready && j.cancel_requested_by.is_some() {
+                jobs::finish_simple_if(app, id, Some(jobs::PRE_START), JobState::Cancelled, None, None, None, "시작 전에 취소됨");
+            }
         }
         return;
     }
+    let Ok(job) = app.store.require_job(id) else { return };
     let started = Instant::now();
-    let _ = app.store.set_state(id, JobState::Running, "작업 공간 준비");
     let request: JobRequest = serde_json::from_str(&job.request_json).unwrap();
     let plan: JobPlan = serde_json::from_str(job.plan_json.as_deref().unwrap_or("{}")).unwrap_or_default();
     let resolved = match resolve_pinned(app, &job, &request) {
@@ -145,6 +158,10 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     let (ws, recreated, slot) = match ws_res {
         Ok(x) => x,
         Err(e) => {
+            // a half-recreated slot must not skip setup next time
+            if let Some(s) = app.store.job(id).ok().flatten().and_then(|j| j.workspace_slot) {
+                let _ = app.store.clear_warm_state(&job.project_key, s);
+            }
             finish_infra(app, &job, &format!("작업 공간 준비 실패: {e}"), &warnings);
             cleanup(app, &job, None, request.args.clean, &plan, &resolved);
             return;
@@ -206,16 +223,17 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
 
     crate::fixtures::account_env(&mut ctx, false);
     let cancelled = cancel.load(Ordering::SeqCst) || app.store.job(id).ok().flatten().is_some_and(|j| j.cancel_requested_by.is_some());
-    if cancelled || records.iter().any(|r| matches!(r.result.as_str(), "fail" | "inconclusive") && r.kind == Kind::Setup) {
+    let _ = app.store.transition(id, &[JobState::Running], JobState::Collecting, "결과 정리");
+    if build.is_some() {
+        sweep(app, &mut ctx.warnings, "작업 끝");
+    }
+    let verdict = finish(&ctx, &records, cancelled);
+    // anything but a clean pass (cancel, timeout, failure) forgets the slot's setup state
+    if verdict != Some(Verdict::Pass) {
         if let Some(s) = slot {
             let _ = app.store.clear_warm_state(&job.project_key, s);
         }
     }
-    let _ = app.store.set_state(id, JobState::Collecting, "결과 정리");
-    if build.is_some() {
-        sweep(app, &mut ctx.warnings, "작업 끝");
-    }
-    finish(&ctx, &records, cancelled);
     cleanup(app, &job, slot, request.args.clean, &plan, &resolved);
 }
 
@@ -258,6 +276,7 @@ fn prepare_workspace(
         .or_else(|| slots.iter().filter(|(s, ..)| *s <= n).min_by(|a, b| a.3.cmp(&b.3)).map(|(s, ..)| *s))
         .unwrap_or(1);
     let dir = app.layout.warm_slot(&job.project_key, slot as u32);
+    let _ = app.store.set_workspace(job.id, "warm", Some(slot));
     let (_, recreated, note) = WorkTree::prepare_warm(&mirror, &dir, commit, &keep).map_err(|e| e.to_string())?;
     if let Some(note) = note {
         warnings.push(Warning::new("workspace", note));
@@ -399,7 +418,7 @@ fn run_steps(ctx: &mut JobCtx<'_>, slot: Option<i64>, recreated: bool) -> Vec<St
             deps.extend(f.after.clone());
             deps.extend(f.requires_artifacts.iter().filter_map(|a| producers.get(a).cloned()));
         }
-        if let Some(bad) = deps.iter().find(|d| recs.iter().any(|x| &x.id == *d && x.result != "pass")) {
+        if let Some(bad) = deps.iter().find(|d| recs.iter().any(|x| &x.id == *d && !matches!(x.result.as_str(), "pass" | "skipped"))) {
             recs[i].result = "not_run".into();
             recs[i].outcome = Some(Outcome { verdict: Verdict::Inconclusive, class: None, reason: format!("돌지 않음: {bad} 실패") });
             let _ = app.store.update_step(id, &recs[i].row());
@@ -533,8 +552,8 @@ fn run_one(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, label: &str, rec: &m
             .map(|r| r.to_vec())
             .unwrap_or_default()
             .iter()
-            .map(|g| expand(g).unwrap_or_else(|_| g.clone()))
-            .collect();
+            .map(|g| expand(g).map(|e| relative_to_ws(&ctx.ws, &e)))
+            .collect::<Result<_, _>>()?;
         Ok((env, cwd, args, program, reports))
     })();
     let (env, cwd, args, program, reports) = match prepared {
@@ -544,7 +563,11 @@ fn run_one(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, label: &str, rec: &m
     // pre-clean of requested artifacts and junit reports (design §12.2)
     let preamble = match crate::artifacts::pre_clean(ctx, step) {
         Ok(p) => p,
-        Err(e) => return fail_recipe(rec, e),
+        Err(o) => {
+            rec.result = o.verdict.as_str().into();
+            rec.outcome = Some(o);
+            return;
+        }
     };
     let mut patterns = exec::default_error_patterns();
     for p in &step.def.error_patterns {
@@ -677,7 +700,7 @@ fn run_script_judge(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, res: &cimon
         capture_prefixes: vec!["{".into()],
         preamble: vec![],
     };
-    let jr = exec::execute(&spec, &ctx.account, &AtomicBool::new(false));
+    let jr = exec::execute(&spec, &ctx.account, ctx.cancel);
     cimon_judge::judge_script_output(&jr, &jr.captured)
 }
 
@@ -692,11 +715,12 @@ fn setup_skip(ctx: &JobCtx<'_>, step: &cimon_recipe::Step, slot: Option<i64>, re
         return None;
     }
     let state = ctx.app.store.warm_state(&ctx.job.project_key, slot, step.id()).ok().flatten()?;
-    if state.def_sha256.as_deref() != Some(step_def_hash(step).as_str()) || state.toolchains_hash.as_deref() != Some(ctx.tool_env.hash.as_str()) {
+    if state.def_sha256.as_deref() != Some(setup_fingerprint(ctx, step).as_str()) || state.toolchains_hash.as_deref() != Some(ctx.tool_env.hash.as_str()) {
         return None;
     }
     if when == "changed" {
-        let h = inputs_hash(ctx, step);
+        // inputs that match nothing would hash the same forever — run instead
+        let h = inputs_hash(ctx, step)?;
         if state.inputs_sha256.as_deref() != Some(h.as_str()) {
             return None;
         }
@@ -704,34 +728,76 @@ fn setup_skip(ctx: &JobCtx<'_>, step: &cimon_recipe::Step, slot: Option<i64>, re
     Some("setup 생략: 변경 없음".into())
 }
 
-fn record_setup_ok(ctx: &JobCtx<'_>, step: &cimon_recipe::Step, slot: i64) {
+fn record_setup_ok(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, slot: i64) {
+    let inputs = if step.def.when.as_deref() == Some("changed") {
+        let h = inputs_hash(ctx, step);
+        if h.is_none() {
+            ctx.warnings.push(Warning::new("setup", format!("{}: inputs 가 어떤 파일에도 맞지 않는다 — 매번 setup 을 돌린다", step.id())));
+        }
+        h
+    } else {
+        None
+    };
     let _ = ctx.app.store.set_warm_state(
         &ctx.job.project_key,
         slot,
         &cimon_store::WarmStateRow {
             step_id: step.id().to_string(),
             last_ok_commit: Some(ctx.commit.clone()),
-            inputs_sha256: Some(inputs_hash(ctx, step)),
+            inputs_sha256: inputs,
             toolchains_hash: Some(ctx.tool_env.hash.clone()),
-            def_sha256: Some(step_def_hash(step)),
+            def_sha256: Some(setup_fingerprint(ctx, step)),
         },
     );
 }
 
-fn step_def_hash(step: &cimon_recipe::Step) -> String {
-    cimon_core::sha256_hex(serde_json::to_string(&step.def).unwrap_or_default().as_bytes())
+/// Everything besides the work tree that decides what a setup step does: its
+/// definition, the recipe's vars and environment layers, parameter values that apply
+/// to it, and sibling commits. Per-job values (`${job.id}`, temp dirs) are left out.
+fn setup_fingerprint(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> String {
+    let params: BTreeMap<&String, &serde_json::Value> = ctx
+        .resolved
+        .params
+        .iter()
+        .filter(|(_, d)| d.applies_to.as_ref().is_some_and(|a| a.iter().any(|x| x == step.id())))
+        .filter_map(|(n, _)| ctx.plan.plan.params.get(n).map(|v| (n, v)))
+        .collect();
+    let v = json!({
+        "def": step.def,
+        "vars": ctx.resolved.vars,
+        "env": ctx.resolved.env,
+        "isolate": ctx.resolved.isolate,
+        "account_env": ctx.resolved.account_env,
+        "params": params,
+        "siblings": ctx.plan.siblings.iter().map(|s| (&s.project, &s.commit)).collect::<Vec<_>>(),
+    });
+    cimon_core::sha256_hex(v.to_string().as_bytes())
 }
 
-fn inputs_hash(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> String {
-    let globs: Vec<String> = step.def.inputs.iter().map(|g| cimon_recipe::vars::expand(g, &|n| n.strip_prefix("vars.").and_then(|k| ctx.resolved.vars.get(k).cloned())).unwrap_or_else(|_| g.clone())).collect();
+/// Hash of the files `inputs` match (expanded like every other recipe string); None
+/// when they match nothing.
+fn inputs_hash(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> Option<String> {
+    let out = ctx.app.layout.step_out(ctx.job.id, step.id());
+    let lookup = ctx.lookup(step.id(), &out);
+    let globs: Vec<String> = step.def.inputs.iter().filter_map(|g| cimon_recipe::vars::expand(g, &lookup).ok()).map(|g| relative_to_ws(&ctx.ws, &g)).collect();
     let files = cimon_judge::find_files(&ctx.ws, &globs);
+    if files.is_empty() {
+        return None;
+    }
     let mut h = String::new();
     for f in files {
         let rel = f.strip_prefix(&ctx.ws).unwrap_or(&f).to_string_lossy().replace('\\', "/");
         let data = std::fs::read(&f).unwrap_or_default();
         h.push_str(&format!("{rel}:{}\n", cimon_core::sha256_hex(&data)));
     }
-    cimon_core::sha256_hex(h.as_bytes())
+    Some(cimon_core::sha256_hex(h.as_bytes()))
+}
+
+/// Globs are matched relative to the work tree; `${ws}/x` becomes `x`.
+pub fn relative_to_ws(ws: &Path, g: &str) -> String {
+    let wsn = ws.to_string_lossy().replace('\\', "/");
+    let gn = g.replace('\\', "/");
+    gn.strip_prefix(&format!("{wsn}/")).map(str::to_string).unwrap_or(gn)
 }
 
 impl JobCtx<'_> {
@@ -835,16 +901,19 @@ impl JobCtx<'_> {
     }
 }
 
-/// Folds step results into the job verdict and writes the final record.
-fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) {
+/// Folds step results into the job verdict and writes the final record. Returns the
+/// verdict (None when cancelled).
+fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) -> Option<Verdict> {
     let app = ctx.app;
     let job = app.store.require_job(ctx.job.id).unwrap_or_else(|_| ctx.job.clone());
     if cancelled {
         let by = job.cancel_requested_by.clone().unwrap_or_else(|| "?".into());
         let summary = format!("{} {} 취소됨 — {by} 요청", job.project, job.ref_.clone().unwrap_or_default());
         let result = crate::result::build_with_steps(app, &job, None, None, &summary, recs, &ctx.warnings, None);
-        let _ = app.store.finish_job(job.id, JobState::Cancelled, None, None, None, &format!("{by} 가 취소함"), &summary, &serde_json::to_string(&ctx.warnings).unwrap(), &result.to_string());
-        return;
+        if let Err(e) = app.store.finish_job(job.id, JobState::Cancelled, None, None, None, &format!("{by} 가 취소함"), &summary, &serde_json::to_string(&ctx.warnings).unwrap(), &result.to_string()) {
+            tracing::error!("could not record the end of {}: {e}", job_label(job.id));
+        }
+        return None;
     }
     let judged: Vec<&StepRec> = recs.iter().filter(|r| matches!(r.result.as_str(), "pass" | "fail" | "inconclusive")).collect();
     let mut verdict = Verdict::Pass;
@@ -855,16 +924,35 @@ fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) {
             }
         }
     }
+    // pass needs evidence: every planned step judged, every requested artifact collected
+    let mut synthetic: Option<(String, Outcome)> = None;
+    if verdict == Verdict::Pass {
+        if let Some(r) = recs.iter().find(|r| r.kind != Kind::Setup && !matches!(r.result.as_str(), "pass" | "fail" | "inconclusive")) {
+            let o = Outcome::inconclusive(FailureClass::Infra, format!("{} 가 돌지 않았다({}) — 통과로 칠 수 없다", r.id, r.result));
+            verdict = Verdict::Inconclusive;
+            synthetic = Some((r.id.clone(), o));
+        } else if let Some(a) = ctx.plan.plan.artifacts.iter().find(|a| !ctx.artifacts.contains_key(*a)) {
+            let o = Outcome::fail(FailureClass::Code, format!("요청한 산출물 {a} 이 수집되지 않았다"));
+            verdict = Verdict::Fail;
+            synthetic = Some((a.clone(), o));
+        }
+    }
     let ran_non_setup = recs.iter().any(|r| r.kind != Kind::Setup && matches!(r.result.as_str(), "pass" | "fail" | "inconclusive"));
     if verdict == Verdict::Pass && !ran_non_setup {
         verdict = Verdict::Inconclusive;
+        synthetic = Some(("steps".into(), Outcome::inconclusive(FailureClass::Infra, "setup 말고 돈 단계가 없다")));
     }
     // class from the first step with the job's verdict (design §8.2)
     let first = judged.iter().find(|r| r.outcome.as_ref().is_some_and(|o| o.verdict == verdict));
+    let (first_id, first_outcome, first_excerpt): (String, Option<Outcome>, Option<String>) = match (first, &synthetic) {
+        (Some(r), _) => (r.id.clone(), r.outcome.clone(), r.excerpt.clone()),
+        (None, Some((id, o))) => (id.clone(), Some(o.clone()), None),
+        (None, None) => ("job".into(), None, None),
+    };
     let class = if verdict == Verdict::Pass {
         None
     } else {
-        first.and_then(|r| r.outcome.as_ref().and_then(|o| o.class)).or(Some(FailureClass::Infra))
+        first_outcome.as_ref().and_then(|o| o.class).or(Some(FailureClass::Infra))
     };
     let names: Vec<&str> = recs.iter().filter(|r| r.kind != Kind::Setup).map(|r| r.id.as_str()).collect();
     let short_commit: String = ctx.commit.chars().take(7).collect();
@@ -880,8 +968,7 @@ fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) {
             warnings_note(&ctx.warnings)
         )
     } else {
-        let f = first.unwrap();
-        let o = f.outcome.as_ref().unwrap();
+        let reason = first_outcome.as_ref().map(|o| o.reason.clone()).unwrap_or_else(|| "판정 근거 없음".into());
         format!(
             "[{}] {} {}({short_commit}) {} {} — {}: {}{}{}{}",
             class.map(|c| c.as_str()).unwrap_or("?"),
@@ -889,15 +976,15 @@ fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) {
             job.ref_.clone().unwrap_or_default(),
             job.tool,
             verdict.as_str(),
-            f.id,
-            o.reason,
-            f.excerpt.as_ref().filter(|e| !o.reason.contains(e.as_str())).map(|e| format!("\n첫 에러 줄: {e}")).unwrap_or_default(),
+            first_id,
+            reason,
+            first_excerpt.as_ref().filter(|e| !reason.contains(e.as_str())).map(|e| format!("\n첫 에러 줄: {e}")).unwrap_or_default(),
             excluded_note(&ctx.plan.plan),
             warnings_note(&ctx.warnings)
         )
     };
     let result = crate::result::build_with_steps(app, &job, Some(verdict), class, &summary, recs, &ctx.warnings, None);
-    let _ = app.store.finish_job(
+    if let Err(e) = app.store.finish_job(
         job.id,
         JobState::Done,
         Some(verdict.as_str()),
@@ -907,8 +994,11 @@ fn finish(ctx: &JobCtx<'_>, recs: &[StepRec], cancelled: bool) {
         &summary,
         &serde_json::to_string(&ctx.warnings).unwrap(),
         &result.to_string(),
-    );
+    ) {
+        tracing::error!("could not record the end of {}: {e}", job_label(job.id));
+    }
     crate::artifacts::write_provenance(ctx, recs, verdict);
+    Some(verdict)
 }
 
 fn excluded_note(p: &cimon_recipe::select::Plan) -> String {
@@ -927,12 +1017,3 @@ fn warnings_note(w: &[Warning]) -> String {
     }
 }
 
-pub fn known_inspects(i: &Inspect) -> bool {
-    match i {
-        Inspect::Builtin { name, .. } => cimon_recipe::model::BUILTIN_INSPECTS.contains(&name.as_str()),
-        Inspect::Script { .. } => true,
-    }
-}
-
-#[allow(dead_code)]
-fn unused(_: BTreeSet<()>) {}

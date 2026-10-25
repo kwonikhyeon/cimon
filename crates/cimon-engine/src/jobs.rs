@@ -62,16 +62,18 @@ pub fn create(app: &Arc<App>, user: &str, tool: Tool, args: RunArgs, via_task: b
         return Err(Rejection::new("draining", "cimon is draining for an upgrade — no new jobs until it restarts"));
     }
     if let Some(free) = cimon_runner::free_bytes(&app.layout.root) {
-        let min = app.config.disk.min_free_gb * 1024 * 1024 * 1024;
+        let min = app.config.disk.min_free_gb.saturating_mul(1 << 30);
         if free < min {
-            crate::janitor::free_space(app);
-            let free = cimon_runner::free_bytes(&app.layout.root).unwrap_or(free);
-            if free < min {
-                return Err(Rejection::new(
-                    "disk_low",
-                    format!("only {} GB free on the build machine (min {}) even after cleanup — an admin must free space", free / (1 << 30), app.config.disk.min_free_gb),
-                ));
-            }
+            // the janitor needs the runner lock; it runs in the background and the caller retries
+            app.engine.janitor.notify_one();
+            return Err(Rejection::new(
+                "disk_low",
+                format!(
+                    "only {} GB free on the build machine (min {}) — cleanup has started; retry in a few minutes, or an admin frees space",
+                    free / (1 << 30),
+                    app.config.disk.min_free_gb
+                ),
+            ));
         }
     }
     let queued = app.store.count_pre_start_by_user(user)?;
@@ -109,8 +111,11 @@ pub fn create(app: &Arc<App>, user: &str, tool: Tool, args: RunArgs, via_task: b
     Ok(CreatedTask { task_id, job_id: id, created_at: job.created_at, status: "접수: 대기".into() })
 }
 
+pub const PRE_START: &[JobState] = &[JobState::Intake, JobState::Provisioning, JobState::Ready];
+
 /// `cancel_job`: before the runner → cancelled now; running → `cancelling`, the runner
-/// tears down and finishes it.
+/// tears down and finishes it. Every step is compare-and-set, so a cancel that races
+/// a finish never resurrects the job.
 pub fn cancel(app: &App, job_id: i64, by: &str) -> Result<String, Rejection> {
     let job = app.store.job(job_id)?.ok_or_else(|| Rejection::new("unknown_job", format!("no job {}", job_label(job_id))))?;
     if job.state.is_terminal() {
@@ -118,41 +123,56 @@ pub fn cancel(app: &App, job_id: i64, by: &str) -> Result<String, Rejection> {
     }
     app.store.request_cancel(job_id, by)?;
     let _ = app.store.audit(cimon_store::AuditEntry { user: by, action: "cancel", job_id: Some(job_id), ..Default::default() });
-    if job.state.is_pre_start() {
-        finish_simple(app, job_id, JobState::Cancelled, None, None, None, &format!("{by} 가 취소함"));
-        return Ok(format!("{} cancelled", job_label(job_id)));
+    Ok(apply_cancel(app, job_id, &format!("{by} 가 취소함")))
+}
+
+/// After `cancel_requested_by` is set: finish a pre-start job, or move a running one to
+/// `cancelling` and raise its flag. Returns the caller-facing message.
+fn apply_cancel(app: &App, job_id: i64, why: &str) -> String {
+    if finish_simple_if(app, job_id, Some(PRE_START), JobState::Cancelled, None, None, None, why) {
+        return format!("{} cancelled", job_label(job_id));
     }
-    app.store.set_state(job_id, JobState::Cancelling, &format!("취소 중 — 정리하는 중({by} 요청)"))?;
+    let _ = app.store.transition(job_id, &[JobState::Running, JobState::Collecting], JobState::Cancelling, &format!("취소 중 — 정리하는 중({why})"));
     if let Some(flag) = app.engine.running.lock().unwrap().get(&job_id) {
         flag.store(true, Ordering::SeqCst);
     }
-    Ok(format!("cancellation requested — job_status shows cancelled once {} has cleaned up", job_label(job_id)))
+    match app.store.job(job_id).ok().flatten() {
+        Some(j) if j.state.is_terminal() => format!("{} already finished ({}) — nothing to cancel", job_label(job_id), j.state.as_str()),
+        _ => format!("cancellation requested — job_status shows cancelled once {} has cleaned up", job_label(job_id)),
+    }
 }
 
-/// `tasks/cancel`: detaches one task; the job is cancelled only when none remain.
+/// `tasks/cancel`: detaches one task; the job is cancelled only when none remain. The
+/// count and the cancel request are one transaction (a merge cannot slip in between).
 pub fn detach_task(app: &App, task_id: &str, by: &str) -> Result<(), Rejection> {
-    let t = app.store.task(task_id)?.ok_or_else(|| Rejection::new("unknown_task", format!("unknown task {task_id}")))?;
-    let remaining = app.store.detach_task(task_id, &format!("tasks/cancel by {by}"))?;
+    if app.store.task(task_id)?.is_none() {
+        return Err(Rejection::new("unknown_task", format!("unknown task {task_id}")));
+    }
+    let (job_id, remaining) = app.store.detach_task_cancel(task_id, &format!("tasks/cancel by {by}"), by)?;
     if remaining == 0 {
-        let job = app.store.require_job(t.job_id)?;
-        if !job.state.is_terminal() {
-            app.store.request_cancel(t.job_id, by)?;
-            if job.state.is_pre_start() {
-                finish_simple(app, t.job_id, JobState::Cancelled, None, None, None, "요청한 task 가 모두 떨어짐");
-            } else {
-                app.store.set_state(t.job_id, JobState::Cancelling, "취소 중 — 요청한 task 가 모두 떨어짐")?;
-                if let Some(flag) = app.engine.running.lock().unwrap().get(&t.job_id) {
-                    flag.store(true, Ordering::SeqCst);
-                }
-            }
-        }
+        let _ = apply_cancel(app, job_id, "요청한 task 가 모두 떨어짐");
     }
     Ok(())
 }
 
-/// Ends a job that never reached the runner, with a minimal result.
-pub fn finish_simple(app: &App, job_id: i64, state: JobState, verdict: Option<Verdict>, class: Option<FailureClass>, reason_code: Option<&str>, message: &str) {
-    let Ok(Some(job)) = app.store.job(job_id) else { return };
+/// Ends a job outside the runner, with a minimal result.
+pub fn finish_simple(app: &App, job_id: i64, state: JobState, verdict: Option<Verdict>, class: Option<FailureClass>, reason_code: Option<&str>, message: &str) -> bool {
+    finish_simple_if(app, job_id, None, state, verdict, class, reason_code, message)
+}
+
+/// `finish_simple` only when the job is in one of `from`. Returns whether it applied.
+#[allow(clippy::too_many_arguments)]
+pub fn finish_simple_if(
+    app: &App,
+    job_id: i64,
+    from: Option<&[JobState]>,
+    state: JobState,
+    verdict: Option<Verdict>,
+    class: Option<FailureClass>,
+    reason_code: Option<&str>,
+    message: &str,
+) -> bool {
+    let Ok(Some(job)) = app.store.job(job_id) else { return false };
     let summary = match verdict {
         Some(v) => format!(
             "{} {} {} — {}{}",
@@ -165,8 +185,9 @@ pub fn finish_simple(app: &App, job_id: i64, state: JobState, verdict: Option<Ve
         None => format!("{} {} — {message}", job_label(job_id), state.as_str()),
     };
     let result = crate::result::build(app, &job, verdict, class, &summary, &[], reason_code);
-    let _ = app.store.finish_job(
+    let applied = match app.store.finish_job_if(
         job_id,
+        from,
         state,
         verdict.map(|v| v.as_str()),
         class.map(|c| c.as_str()),
@@ -175,11 +196,53 @@ pub fn finish_simple(app: &App, job_id: i64, state: JobState, verdict: Option<Ve
         &summary,
         "[]",
         &result.to_string(),
-    );
+    ) {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!("could not record the end of {}: {e}", job_label(job_id));
+            false
+        }
+    };
+    if applied {
+        release_keeps(app, &job);
+    }
+    applied
+}
+
+/// Drops the keep refs intake placed on the job's commits (design §11.1).
+pub fn release_keeps(app: &App, job: &cimon_store::JobRow) {
+    if let Some(m) = Mirror::open(&app.layout.mirror(&job.project_key)) {
+        m.unkeep(&format!("j{}", job.id));
+    }
+    let sibs: Vec<SiblingPin> = job.siblings_json.as_deref().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+    for s in sibs {
+        if let Some(m) = Mirror::open(&app.layout.mirror(&s.project_key)) {
+            m.unkeep(&format!("j{}-sibling", job.id));
+        }
+    }
 }
 
 fn fail_intake(app: &App, job_id: i64, verdict: Verdict, class: FailureClass, code: &str, message: &str) {
     finish_simple(app, job_id, JobState::Done, Some(verdict), Some(class), Some(code), &format!("{code}: {message}"));
+}
+
+/// Intake must never leave a job behind without a state change: a job that is no
+/// longer wanted (cancel requested) is finished as cancelled here. Returns true when
+/// intake should stop working on it.
+fn abandon_if_unwanted(app: &App, id: i64) -> bool {
+    match app.store.job(id).ok().flatten() {
+        None => true,
+        Some(j) if j.state.is_terminal() => true,
+        Some(j) if j.cancel_requested_by.is_some() => {
+            let by = j.cancel_requested_by.clone().unwrap_or_default();
+            if !finish_simple_if(app, id, Some(PRE_START), JobState::Cancelled, None, None, None, &format!("{by} 가 취소함")) {
+                // it left pre-start meanwhile (e.g. merged): nothing more to do here
+            }
+            true
+        }
+        Some(j) if !j.state.is_pre_start() => true,
+        _ => false,
+    }
 }
 
 /// The intake worker: one at a time (design §8.1).
@@ -211,10 +274,6 @@ pub async fn intake_loop(app: Arc<App>) {
     }
 }
 
-fn still_wanted(app: &App, id: i64) -> bool {
-    app.store.job(id).ok().flatten().is_some_and(|j| j.cancel_requested_by.is_none() && j.state.is_pre_start())
-}
-
 /// Fetch, pin, intake checks, plan, merge — then provisioning and ready.
 pub fn intake_one(app: &Arc<App>, id: i64) {
     let Ok(job) = app.store.require_job(id) else { return };
@@ -233,11 +292,14 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     let project = request.project.clone();
     let mirror_dir = app.layout.mirror(&job.project_key);
     let auth = crate::git_auth(app);
+    // the mirror lock keeps GC away while intake fetches and reads (design §11.1)
+    let lock = app.engine.mirror_lock(&job.project_key);
+    let _mirror_guard = lock.lock().unwrap_or_else(|p| p.into_inner());
     let mirror = match Mirror::fetch_with(&mirror_dir, &project.repo, &auth) {
         Ok(m) => m,
         Err(e) => return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "fetch_failed", &format!("git fetch {}: {e}", project.repo)),
     };
-    if !still_wanted(app, id) {
+    if abandon_if_unwanted(app, id) {
         return;
     }
     let ref_ = job.ref_.clone().unwrap_or_else(|| project.default_ref.clone());
@@ -247,6 +309,10 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
         Err(ResolveError::RefNotFound(m)) => return fail_intake(app, id, Verdict::Fail, FailureClass::Request, "ref_not_found", &m),
         Err(ResolveError::CommitNotAllowed(m)) => return fail_intake(app, id, Verdict::Fail, FailureClass::Request, "commit_not_allowed", &m),
     };
+    // protect the pinned commit from GC until the job ends (released on every terminal path)
+    if let Err(e) = mirror.keep(&format!("j{id}"), &commit) {
+        return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "git_error", &format!("keep ref: {e}"));
+    }
 
     // siblings (from main's registration)
     let mut siblings = vec![];
@@ -260,6 +326,8 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
             Ok(p) => p,
             Err(d) => return fail_intake(app, id, Verdict::Fail, FailureClass::Recipe, "sibling_invalid", &d.to_string()),
         };
+        let slock = app.engine.mirror_lock(&s.project);
+        let _sibling_guard = if s.project == job.project_key { None } else { Some(slock.lock().unwrap_or_else(|p| p.into_inner())) };
         let sm = match Mirror::fetch_with(&app.layout.mirror(&s.project), &sp.repo, &auth) {
             Ok(m) => m,
             Err(e) => return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "fetch_failed", &format!("sibling {}: {e}", s.project)),
@@ -271,6 +339,7 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
                 return fail_intake(app, id, Verdict::Fail, FailureClass::Recipe, "sibling_ref_not_found", &format!("sibling {}: {m}", s.project))
             }
         };
+        let _ = sm.keep(&format!("j{id}-sibling"), &sc);
         siblings.push(SiblingPin {
             project: s.project.clone(),
             project_key: s.project.clone(),
@@ -324,30 +393,50 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     let merge_key = merge_key(&job, &commit, &siblings, &plan, request.args.clean, &request.args);
     let _ = app.store.set_intake(id, &commit, &serde_json::to_string(&siblings).unwrap(), &serde_json::to_string(&job_plan).unwrap(), &merge_key);
     let _ = app.store.set_excluded(id, &plan.excluded);
-    if !still_wanted(app, id) {
+    drop(_mirror_guard);
+    if abandon_if_unwanted(app, id) {
         return;
     }
-    if let Ok(Some(target)) = app.store.merge_target(&merge_key, id) {
-        let _ = app.store.merge_job(id, target, &format!("{} 과 같은 요청 — 그 작업을 따른다", job_label(target)));
+    if try_merge(app, id, &merge_key) {
         return;
     }
 
     // provisioning (design §10.4)
-    let _ = app.store.set_state(id, JobState::Provisioning, "툴체인 확인");
+    if !app.store.transition(id, &[JobState::Intake], JobState::Provisioning, "툴체인 확인").unwrap_or(false) {
+        abandon_if_unwanted(app, id);
+        return;
+    }
     match crate::toolchains::provide(app, id, &job, &resolved, &job_plan) {
         Ok(()) => {}
         Err(p) => return fail_intake(app, id, p.verdict, p.class, p.code, &p.message),
     }
-    if !still_wanted(app, id) {
+    if abandon_if_unwanted(app, id) {
         return;
     }
     // a duplicate may have become ready while this one provisioned
-    if let Ok(Some(target)) = app.store.merge_target(&merge_key, id) {
-        let _ = app.store.merge_job(id, target, &format!("{} 과 같은 요청 — 그 작업을 따른다", job_label(target)));
+    if try_merge(app, id, &merge_key) {
         return;
     }
-    let _ = app.store.set_state(id, JobState::Ready, "대기열");
+    if !app.store.transition(id, &[JobState::Provisioning], JobState::Ready, "대기열").unwrap_or(false) {
+        abandon_if_unwanted(app, id);
+        return;
+    }
     refresh_queue_positions(app);
+}
+
+/// Merges `id` into a ready/running job with the same key, if there is one and both
+/// sides are still eligible (checked inside the store transaction).
+fn try_merge(app: &App, id: i64, merge_key: &str) -> bool {
+    let Ok(Some(target)) = app.store.merge_target(merge_key, id) else { return false };
+    match app.store.merge_job(id, target, &format!("{} 과 같은 요청 — 그 작업을 따른다", job_label(target))) {
+        Ok(true) => {
+            if let Ok(Some(j)) = app.store.job(id) {
+                release_keeps(app, &j);
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Merge key (design §8.3): everything that changes the result.
@@ -511,7 +600,7 @@ pub fn tick(app: &App) {
         for j in jobs {
             if let Some(t) = cimon_core::parse_time(&j.created_at) {
                 if (chrono::Utc::now() - t).num_seconds() > limit {
-                    finish_simple(app, j.id, JobState::QueueTimeout, None, None, Some("queue_timeout"), &format!("{}시간 동안 시작하지 못해 취소함", app.config.queue.max_queue_hours));
+                    finish_simple_if(app, j.id, Some(PRE_START), JobState::QueueTimeout, None, None, Some("queue_timeout"), &format!("{}시간 동안 시작하지 못해 취소함", app.config.queue.max_queue_hours));
                 }
             }
         }
@@ -532,12 +621,17 @@ pub fn recover(app: &App) -> Vec<String> {
                 finish_simple(app, j.id, JobState::Interrupted, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("interrupted"), "서비스 재시작으로 중단됨");
             }
             crate::run::cleanup_job_dirs(app, j.id);
+            let _ = cimon_workspace::remove_dir_all_robust(&app.layout.sibling_isolated(&j.project_key, j.id));
+            if j.workspace_mode.as_deref() == Some("clean") {
+                let _ = cimon_workspace::remove_dir_all_robust(&app.layout.clean_clone(&j.project_key, j.id));
+            }
+            release_keeps(app, &j);
             notes.push(format!("{} interrupted by the restart", job_label(j.id)));
         }
     }
     if let Ok(jobs) = app.store.jobs_in_states(&[JobState::Provisioning]) {
         for j in jobs {
-            let _ = app.store.set_state(j.id, JobState::Intake, "접수: 서비스 재시작으로 다시");
+            let _ = app.store.transition(j.id, &[JobState::Provisioning], JobState::Intake, "접수: 서비스 재시작으로 다시");
         }
     }
     notes

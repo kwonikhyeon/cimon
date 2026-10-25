@@ -20,14 +20,26 @@ fn requested<'a>(ctx: &'a JobCtx<'_>, step: &'a cimon_recipe::Step) -> Vec<&'a A
     step.def.artifact.iter().filter(|a| ctx.plan.plan.artifacts.contains(&a.name)).collect()
 }
 
-fn expand_vars(ctx: &JobCtx<'_>, s: &str) -> String {
-    cimon_recipe::vars::expand(s, &|n| match n {
-        "job.id" => Some(job_label(ctx.job.id)),
-        "job.commit" => Some(ctx.commit.clone()),
-        "job.commit_short" => Some(ctx.commit.chars().take(10).collect()),
-        _ => n.strip_prefix("vars.").and_then(|k| ctx.resolved.vars.get(k).cloned()),
-    })
-    .unwrap_or_else(|_| s.to_string())
+/// Expands a recipe string the way the step's own command line is expanded, so a glob
+/// written with `${ws}` or `${param.x}` means the same thing for pre-clean, collection
+/// and the judge. Globs come back relative to the work tree.
+fn expand_globs(ctx: &JobCtx<'_>, step: &str, globs: &[String]) -> Result<Vec<String>, Outcome> {
+    let out = ctx.app.layout.step_out(ctx.job.id, step);
+    let lookup = ctx.lookup(step, &out);
+    globs
+        .iter()
+        .map(|g| {
+            cimon_recipe::vars::expand(g, &lookup)
+                .map(|e| crate::run::relative_to_ws(&ctx.ws, &e))
+                .map_err(|e| Outcome::inconclusive(FailureClass::Recipe, format!("{step}: cannot expand {g:?}: {e}")))
+        })
+        .collect()
+}
+
+fn expand_one(ctx: &JobCtx<'_>, step: &str, s: &str) -> Result<String, Outcome> {
+    let out = ctx.app.layout.step_out(ctx.job.id, step);
+    let lookup = ctx.lookup(step, &out);
+    cimon_recipe::vars::expand(s, &lookup).map_err(|e| Outcome::inconclusive(FailureClass::Recipe, format!("{step}: cannot expand {s:?}: {e}")))
 }
 
 fn matches(ws: &Path, globs: &[String], exclude: &[String]) -> Vec<PathBuf> {
@@ -46,15 +58,17 @@ fn matches(ws: &Path, globs: &[String], exclude: &[String]) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Deletes files the producing step must recreate. Returns log preamble lines.
-pub fn pre_clean(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> Result<Vec<String>, String> {
+/// Deletes files the producing step must recreate. Returns log preamble lines. A file
+/// that cannot be deleted stops the step: an old copy left in place would be collected
+/// (or read as a report) as if this run had made it.
+pub fn pre_clean(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> Result<Vec<String>, Outcome> {
     let mut globs: Vec<(String, Vec<String>, Vec<String>)> = vec![];
     for a in requested(ctx, step) {
-        globs.push((format!("artifact {}", a.name), a.glob.to_vec().iter().map(|g| expand_vars(ctx, g)).collect(), a.exclude.clone()));
+        globs.push((format!("artifact {}", a.name), expand_globs(ctx, step.id(), &a.glob.to_vec())?, expand_globs(ctx, step.id(), &a.exclude)?));
     }
     if let Some(j) = &step.def.judge {
         if j.type_ == "junit" {
-            globs.push(("junit reports".into(), j.reports.as_ref().map(|r| r.to_vec()).unwrap_or_default().iter().map(|g| expand_vars(ctx, g)).collect(), vec![]));
+            globs.push(("junit reports".into(), expand_globs(ctx, step.id(), &j.reports.as_ref().map(|r| r.to_vec()).unwrap_or_default())?, vec![]));
         }
     }
     if globs.is_empty() {
@@ -67,11 +81,13 @@ pub fn pre_clean(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> Result<Vec<Stri
         let mut removed = vec![];
         for f in files {
             let rel = f.strip_prefix(&ctx.ws).unwrap_or(&f).to_string_lossy().replace('\\', "/");
-            if tracked.contains(&rel) {
-                return Err(format!("{what}: glob matches the tracked file {rel} — pre-clean never deletes tracked files; narrow the glob"));
+            if tracked.iter().any(|t| t.eq_ignore_ascii_case(&rel)) {
+                return Err(Outcome::inconclusive(FailureClass::Recipe, format!("{what}: glob matches the tracked file {rel} — pre-clean never deletes tracked files; narrow the glob")));
             }
-            if std::fs::remove_file(&f).is_ok() {
-                removed.push(rel);
+            match std::fs::remove_file(&f) {
+                Ok(()) => removed.push(rel),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(Outcome::inconclusive(FailureClass::Infra, format!("{what}: pre-clean could not delete {rel}: {e} — an old copy would be taken for this run's output"))),
             }
         }
         if !removed.is_empty() {
@@ -92,8 +108,9 @@ pub fn collect(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step) -> Result<(), Ou
     let defs: Vec<ArtifactDef> = requested(ctx, step).into_iter().cloned().collect();
     for a in defs {
         let _ = app.store.set_status(id, &format!("산출물 수집: {}", a.name));
-        let globs: Vec<String> = a.glob.to_vec().iter().map(|g| expand_vars(ctx, g)).collect();
-        let files = matches(&ctx.ws, &globs, &a.exclude);
+        let globs = expand_globs(ctx, step.id(), &a.glob.to_vec())?;
+        let exclude = expand_globs(ctx, step.id(), &a.exclude)?;
+        let files = matches(&ctx.ws, &globs, &exclude);
         let n = files.len() as u32;
         let ok = match (a.expect, a.expect_min) {
             (Some(e), _) => n == e,
@@ -110,14 +127,14 @@ pub fn collect(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step) -> Result<(), Ou
         }
         std::fs::create_dir_all(&dest_dir).map_err(|e| Outcome::inconclusive(FailureClass::Infra, e.to_string()))?;
         let file_name = match &a.pack_name {
-            Some(p) => expand_vars(ctx, p),
+            Some(p) => expand_one(ctx, step.id(), p)?,
             None => a.name.clone(),
         };
         let dest = dest_dir.join(&a.name);
         let res = if a.pack.as_deref() == Some("zip") {
             pack_zip(&ctx.ws, &globs, &files, &dest)
         } else {
-            std::fs::copy(&files[0], &dest).map(|_| ()).map_err(|e| e.to_string())
+            copy_within(&ctx.ws, &files[0], &dest)
         };
         res.map_err(|e| Outcome::inconclusive(FailureClass::Infra, format!("artifact {}: copy failed: {e}", a.name)))?;
         let data_len = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -192,7 +209,7 @@ fn run_inspect_script(ctx: &JobCtx<'_>, run: &[String], file: &Path) -> Result<V
         capture_prefixes: vec!["{".into()],
         preamble: vec![],
     };
-    let r = cimon_runner::execute(&spec, &ctx.account, &std::sync::atomic::AtomicBool::new(false));
+    let r = cimon_runner::execute(&spec, &ctx.account, ctx.cancel);
     if r.exit_code != Some(0) {
         return Err(format!("exited with {:?}", r.exit_code));
     }
@@ -207,12 +224,20 @@ fn pack_zip(ws: &Path, globs: &[String], files: &[PathBuf], dest: &Path) -> Resu
     let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated).large_file(true);
     for file in files {
         let rel = file.strip_prefix(&base).or_else(|_| file.strip_prefix(ws)).unwrap_or(file).to_string_lossy().replace('\\', "/");
+        let mut src = cimon_runner::open_within(ws, file).map_err(|e| e.to_string())?;
         z.start_file(rel, opts).map_err(|e| e.to_string())?;
-        let data = std::fs::read(file).map_err(|e| e.to_string())?;
-        z.write_all(&data).map_err(|e| e.to_string())?;
+        std::io::copy(&mut src, &mut z).map_err(|e| e.to_string())?;
     }
-    z.finish().map_err(|e| e.to_string())?;
+    z.finish().map_err(|e| e.to_string())?.flush().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Copies one file out of the work tree, refusing anything that leads outside it.
+fn copy_within(ws: &Path, src: &Path, dest: &Path) -> Result<(), String> {
+    let mut from = cimon_runner::open_within(ws, src).map_err(|e| e.to_string())?;
+    let mut to = std::fs::File::create(dest).map_err(|e| e.to_string())?;
+    std::io::copy(&mut from, &mut to).map_err(|e| e.to_string())?;
+    to.sync_all().map_err(|e| e.to_string())
 }
 
 /// The directory before the first wildcard of the first glob.

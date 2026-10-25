@@ -93,7 +93,7 @@ async fn draining_refuses_new_jobs() {
 }
 
 #[tokio::test]
-async fn disk_floor_refuses_after_cleanup() {
+async fn disk_floor_refuses_and_starts_cleanup() {
     repos_dir();
     let h = Harness::start("[disk]\nmin_free_gb = 100000000\n").await;
     h.app.recipes.import_init(&small_tree(), "admin-a", "init").unwrap();
@@ -101,7 +101,7 @@ async fn disk_floor_refuses_after_cleanup() {
     let (v, err) = call(&c, "build", json!({"project": "m8"})).await;
     assert!(err);
     assert_eq!(v["error"], "disk_low");
-    assert!(v["message"].as_str().unwrap().contains("even after cleanup"), "{v}");
+    assert!(v["message"].as_str().unwrap().contains("cleanup has started"), "{v}");
     c.cancel().await.unwrap();
 }
 
