@@ -42,5 +42,5 @@ Tailscale(`tailscale serve --bg --https=443 http://127.0.0.1:8770`, Funnel 금�
 ## 검증 상태
 
 - ✅ M0~M9 의 완료 기준을 단위·통합 시험으로 확인 — 로컬 Windows 개발 PC, 단일 계정 모드.
-- ✅ 구현 뒤 객관 리뷰 4갈래(작업 수명주기·레시피 저장소·Windows 러너·보안)에서 나온 결함을 고치고 회귀 시험을 더했다 — `cargo test --workspace` 133개.
+- ✅ 구현 뒤 객관 리뷰 4갈래(작업 수명주기·레시피 저장소·Windows 러너·보안)에서 나온 결함을 고치고 회귀 시험을 더했다 — `cargo test --workspace` 134개.
 - ⚠️ 아직 돌려 보지 않은 것: 빌드 계정 모드(`LogonUser`·`LoadUserProfile` 의 백업·복원 권한·`CreateProcessAsUserW`·빈 `lpDesktop`·`__sweep`·`__account-env`), `cimon setup` 실제 실행(PowerShell 계정 생성·LSA 권한·ACL·서비스 등록), Windows 서비스로 기동·중지, Tailscale 경로, rustup·uv·script 설치기와 Adoptium 체크섬 API, 실제 프로젝트 레시피로 빌드.
