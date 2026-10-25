@@ -214,6 +214,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bstr"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
+dependencies = [
+ "memchr",
+ "serde_core",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -281,6 +291,8 @@ dependencies = [
  "cimon-core",
  "cimon-engine",
  "cimon-mcp",
+ "cimon-recipe",
+ "cimon-recipestore",
  "cimon-store",
  "clap",
  "reqwest 0.12.28",
@@ -314,7 +326,10 @@ name = "cimon-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "cimon-core",
+ "cimon-recipe",
+ "cimon-recipestore",
  "cimon-store",
  "serde",
  "serde_json",
@@ -350,10 +365,32 @@ dependencies = [
 [[package]]
 name = "cimon-recipe"
 version = "0.1.0"
+dependencies = [
+ "cimon-core",
+ "globset",
+ "hex",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "toml",
+]
 
 [[package]]
 name = "cimon-recipestore"
 version = "0.1.0"
+dependencies = [
+ "cimon-core",
+ "cimon-recipe",
+ "cimon-store",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "cimon-runner"
@@ -743,6 +780,19 @@ dependencies = [
  "r-efi",
  "rand_core 0.10.1",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "globset"
+version = "0.4.20"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+dependencies = [
+ "aho-corasick",
+ "bstr",
+ "log",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]
@@ -1479,6 +1529,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "regex"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f020237b6c8eed93db2e2cb53c00c60a8e1bc73da7d073199a1180401450218d"
+dependencies = [
+ "aho-corasick",
+ "memchr",
+ "regex-automata",
+ "regex-syntax",
 ]
 
 [[package]]

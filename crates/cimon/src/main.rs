@@ -1,6 +1,8 @@
 //! `cimon` — service and admin commands in one executable (design §4.2).
 
-use cimon::{serve, init_tracing};
+use cimon::{init_tracing, serve};
+
+mod recipe_cli;
 
 use anyhow::{bail, Context, Result};
 use cimon_core::{Config, Role};
@@ -30,6 +32,11 @@ enum Command {
     User {
         #[command(subcommand)]
         action: UserCmd,
+    },
+    /// Recipe repository: check, show, import, export, restore.
+    Recipe {
+        #[command(subcommand)]
+        action: recipe_cli::RecipeCmd,
     },
 }
 
@@ -108,6 +115,10 @@ fn main() -> Result<()> {
                 }
             }
             Ok(())
+        }
+        Command::Recipe { action } => {
+            let code = recipe_cli::run(action, &cli.config)?;
+            std::process::exit(code);
         }
         Command::User { action: UserCmd::Role { name, role } } => {
             let cfg = load_config(&cli.config)?;
