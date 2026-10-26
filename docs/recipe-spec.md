@@ -197,8 +197,8 @@ SOME_PATH = "${ws}/tools"
 id = "conan-login"
 kind = "setup"
 # 익명 접근을 받는 서버에는 conan 이 스스로 로그인하지 않는다(로그인해야 보이는 패키지는 404) — 먼저 로그인한다
-run = ["conan", "remote", "login", "digitrack"]
-env = { CONAN_LOGIN_USERNAME_DIGITRACK = "cimon-build", CONAN_PASSWORD_DIGITRACK = "${secret.artifactory-conan}" }
+run = ["conan", "remote", "login", "company"]
+env = { CONAN_LOGIN_USERNAME_COMPANY = "cimon-build", CONAN_PASSWORD_COMPANY = "${secret.artifactory-conan}" }
 when = "always"
 ```
 
