@@ -185,7 +185,12 @@ pub fn env_for(app: &App, id: i64, r: &Resolved, plan: &JobPlan) -> Result<ToolE
         } else {
             let inst = app.store.install(kind, vkey, entry).map_err(|e| e.to_string())?.ok_or_else(|| format!("{kind} {vkey} is not installed"))?;
             let root = PathBuf::from(&inst.root);
-            let layout = cimon_toolchain::layout_of(&installer_ctx(app), kind, def, version, &root, &req);
+            let ctx = installer_ctx(app);
+            let layout = cimon_toolchain::layout_of(&ctx, kind, def, version, &root, &req);
+            // the probe runs as the build account at every job (recipe-spec §16): an
+            // install the build account cannot use — one an admin's `provision` made and
+            // could only probe as the admin — fails here as environment, not in a step
+            cimon_toolchain::probe(&ctx, def, version, &root, &layout).map_err(|e| format!("{kind} {vkey} does not work for the build account — {}", e.message))?;
             (root, layout.bins, layout.home)
         };
         for b in &bins {

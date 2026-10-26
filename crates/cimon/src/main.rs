@@ -207,14 +207,21 @@ fn main() -> Result<()> {
         Command::Provision { project, kind, version, recipe_ref, from, admin } => {
             let cfg = load_config(&cli.config)?;
             let app = cimon_engine::App::open(cfg)?;
-            // install scripts and probes run as the build account, as in the service
-            app.logon_build_account()?;
             let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, from, admin })
                 .map_err(|e| anyhow::anyhow!(e))?;
             let mut failed = false;
             for l in &lines {
                 println!("{}	{}	{}", l.kind, l.version, l.outcome);
                 failed |= !l.ok;
+            }
+            if !app.config.accounts.single_account() {
+                // starting a process as another account needs "replace a process level
+                // token", which `cimon setup` gives the service account and an admin
+                // does not hold
+                eprintln!(
+                    "note: probes and install scripts ran as {} — an admin cannot start processes as the build account. The service probes every toolchain as the build account at each job",
+                    whoami()
+                );
             }
             std::process::exit(if failed { 1 } else { 0 });
         }

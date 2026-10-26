@@ -233,6 +233,14 @@ async fn provision_from_a_local_copy_when_the_source_is_down() {
     let c = h.task_client(&h.member_token).await;
     let v = run_build(&c, json!({"project": "m3local"})).await;
     assert_eq!(v["verdict"], "pass", "{v:#}");
+
+    // an install that stops working is caught by the probe at job start, as
+    // environment — not halfway through a step
+    std::fs::write(std::path::Path::new(&inst.root).join("hello-1.2.3").join("bin").join("hello.cmd"), "@echo broken\r\n").unwrap();
+    let v = run_build(&c, json!({"project": "m3local"})).await;
+    assert_eq!(v["verdict"], "inconclusive", "{v:#}");
+    assert_eq!(v["failure_class"], "environment", "{v:#}");
+    assert!(v["summary"].as_str().unwrap().contains("does not work for the build account"), "{}", v["summary"]);
 }
 
 #[tokio::test]
