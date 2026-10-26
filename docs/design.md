@@ -11,6 +11,8 @@
 | **design.md**(이 문서) | 서비스 구조 · MCP 인터페이스 · 작업 모델 · 실행 · 저장 · 보안 · 운영 |
 | [recipe-spec.md](recipe-spec.md) | 레시피 파일 형식(정본) |
 | [review-ui.md](review-ui.md) | 레시피 리뷰 웹 화면 — 구현은 마지막(M9) |
+| [setup.md](setup.md) | 빌드 머신 셋업 절차(관리자) |
+| [remote-use.md](remote-use.md) | 외부에서 cimon 쓰기(팀원) |
 | [`examples/recipes/`](../examples/recipes/) | 형식 예시이자 레시피 검사기의 시험 입력 |
 
 **이 저장소는 어떤 프로젝트를 빌드하는지 모른다.** 실제 프로젝트의 레시피·툴체인 카탈로그·프로젝트별 사실과 결정은 **cimon 이 빌드 머신 안에 직접 갖는 레시피 저장소**(`D:\cimon\recipes.git`)에 있다. GitHub 등 외부에 올리지 않는다. 사람은 MCP 도구로 고친다(§6.4).
@@ -198,6 +200,8 @@ D:\cimon\                              서비스  빌드
 ```
 
 `*` `logs\j<id>\<step>\` 안에서 빌드 계정이 쓸 수 있는 것은 `out\` 하위뿐이다 — `logs\` 는 서비스 전용이고, 러너가 단계마다 그 단계의 `out\` 에만 쓰기 권한을 준다. `toolchains\_staging\` 도 서비스 전용(빌드 계정은 읽기)이고, `script` 설치기의 staging 폴더만 그 설치 동안 쓰기 권한을 받는다 — 확인한 내려받기를 푸는 사이에 빌드 단계가 바꿔치지 못하게. script 가 만든 파일은 빌드 계정 소유라(소유자는 ACL 을 다시 쓸 수 있다) 옮기지 않고, 서비스가 링크·정션을 거부하며 최종 폴더로 **복사**한 뒤 그 복사본을 probe 한다.
+
+`ws\` 아래 클론(`.git` 포함)은 빌드 계정이 만들고 다룬다 — 서비스는 그 안에서 git 을 돌리지 않는다(§11.1).
 
 시도 브랜치에만 있는 새 프로젝트는 `<project>` 자리에 `<id>@<repo 해시 8자>` 를 쓴다 — 두 시도 브랜치가 같은 id 로 다른 저장소를 가리켜도 섞이지 않는다.
 
@@ -587,7 +591,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 1. **접수**(러너 밖, §8.1). 여기까지 끝난 작업만 `ready` 가 된다.
 2. **시작 점검**(러너): 빌드 계정 잔류 프로세스·예약 작업이 없는지 확인하고, 있으면 정리하고 경고를 남긴다.
 3. **계정 환경**: 레시피의 `[account_env]` 값을 빌드 계정의 사용자 환경 변수로 쓴다(§9.2).
-4. **워크스페이스**: warm 슬롯 고르기·확인·갱신 또는 clean 클론, 형제 트리(§11).
+4. **워크스페이스**: warm 슬롯 고르기·확인·갱신 또는 clean 클론, 형제 트리(§11). 이 git 은 빌드 계정으로 돈다.
 5. **running**: 단계마다
    1. 환경 구성(§9.4)
    2. 요청된 산출물과 판정 리포트의 **사전 정리**(§12.2, §9.6)
@@ -607,7 +611,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 - 서비스 계정은 가상 계정 **`NT SERVICE\cimon`** 이다(관리할 비밀번호가 없다). 이 문서의 「서비스 계정 `cimon`」 은 이것을 가리킨다.
 - Job Object(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, breakaway 불허). 취소·시간 초과는 Job Object 통째로 종료. 단계가 끝난 뒤 남은 프로세스는 종료하고 경고로 남긴다.
 - **Job Object 로 못 잡는 것**: 작업 스케줄러·서비스로 띄운 프로세스. 프로젝트 도구가 스택을 「호출자보다 오래 살게」 띄우는 경우가 그렇다. 그래서:
-  - **작업이 끝날 때마다 빌드 계정이 소유한 모든 프로세스를 찾아 종료하고, 남은 것이 없는지 확인한다.** 빌드 계정이 등록한 예약 작업도 지운다. 남았던 것은 `warnings` 에 적는다. 프로세스는 Toolhelp 스냅숏과 각 프로세스 토큰의 SID 로 고른다(tasklist·wmic 은 출력이 지역화되고 wmic 은 현재 Windows 에 없다). 스윕과 빌드 계정으로 도는 설치 스크립트·probe 는 한 잠금으로 겹치지 않게 해 스윕이 설치를 죽이지 않는다 — 이 잠금은 `stateuild-account.lock` 을 독점으로 열어 프로세스 사이에도 걸린다(`cimon provision` 이 서비스 옆에서 돈다). 작업 전체가 아니라 스윕 동안만 잡으므로 접수를 막지 않고, 단일 계정 모드에서는 잡지 않는다.
+  - **작업이 끝날 때마다 빌드 계정이 소유한 모든 프로세스를 찾아 종료하고, 남은 것이 없는지 확인한다.** 빌드 계정이 등록한 예약 작업도 지운다. 남았던 것은 `warnings` 에 적는다. 프로세스는 Toolhelp 스냅숏과 각 프로세스 토큰의 SID 로 고른다(tasklist·wmic 은 출력이 지역화되고 wmic 은 현재 Windows 에 없다). 스윕과 빌드 계정으로 도는 설치 스크립트·probe 는 한 잠금으로 겹치지 않게 해 스윕이 설치를 죽이지 않는다 — 이 잠금은 `state\build-account.lock` 을 독점으로 열어 프로세스 사이에도 걸린다(`cimon provision` 이 서비스 옆에서 돈다). 작업 전체가 아니라 스윕 동안만 잡으므로 접수를 막지 않고, 단일 계정 모드에서는 잡지 않는다.
   - 다음 작업 시작 전에 다시 확인한다.
   - 빌드 계정은 빌드만 하는 계정이라, 그 계정의 프로세스를 모두 죽여도 다른 것이 깨지지 않는다 — 계정을 나눈 이유 중 하나다(러너가 하나라 성립한다).
 - **계정 환경(`[account_env]`)**: 예약 작업으로 뜬 프로세스는 호출자의 환경이 아니라 **계정에 저장된 사용자 환경**을 받는다. 레시피가 `[account_env]` 에 적은 변수는 작업 시작 전에 cimon 이 **빌드 계정으로 작은 도우미를 실행해** 그 계정의 사용자 환경 변수(HKCU\Environment)로 쓰고, 작업 끝에 지운다. 값은 같은 이름의 `[isolate]` 경로와 같게 해 직접 실행한 단계와 예약 작업이 같은 홈을 본다. 작업 스케줄러가 새 프로세스에 이 값을 넣어 주는지는 **확인 필요**(M7).
@@ -666,7 +670,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 ### 10.1 머신 준비 때 설치하는 것
 
-`cimon setup`(관리자 1회)이 `toolchains\_bootstrap\` 에 **rustup·uv** 를 설치한다. 버전은 `cimon.toml [bootstrap]`.
+`cimon setup`(관리자 1회)이 `toolchains\_bootstrap\` 에 **rustup·uv** 를 설치한다. 버전은 `cimon.toml [bootstrap]` 에 **반드시 고정**한다 — 비어 있거나 버전 모양이 아니면 setup 의 그 단계가 실패한다(「최신」 을 조용히 받지 않는다). rustup-init 은 `static.rust-lang.org/rustup/archive/<버전>/` 에서 같은 자리의 sha256 으로, uv 는 그 버전의 GitHub 릴리스 자산 digest 로 확인한다.
 
 ### 10.2 두 층
 
@@ -717,11 +721,16 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 - **bare mirror**: 프로젝트마다 `mirrors\<project>.git`. 접수에서 `git fetch --prune`(서비스 계정, GitHub 토큰).
 - **ref 해석**: fetch 뒤 커밋으로 고정. 작업 도중 브랜치가 움직여도 그 커밋을 짓는다.
-- **작업 트리는 독립 클론**이다 — mirror 를 alternates 로 참조해(`git clone --reference`) 객체는 mirror 의 것을 읽기만 하고, 인덱스·작업 트리는 클론 자신의 것이다(빌드 계정이 mirror 에 쓸 필요가 없다).
+- **작업 트리는 독립 클론**이다 — mirror 를 alternates 로 참조해(`git clone --shared`) 객체는 mirror 의 것을 읽기만 하고, 인덱스·작업 트리는 클론 자신의 것이다(빌드 계정이 mirror 에 쓸 필요가 없다).
+- **작업 트리의 git 은 빌드 계정으로 돈다.** clone·checkout·clean 을 러너가 단계와 같은 경로(`__exec`, Job Object)로 띄우고, 명령마다 `logs\j<id>\_workspace\` 에 로그를 남긴다. 빌드 단계는 작업 트리 전부 — `.git` 의 훅·설정·alternates 까지 — 를 쓸 수 있어서, 서비스가 거기서 git 을 돌리면 지난 작업이 심어 둔 훅이 **서비스 권한으로** 돈다. 그래서 서비스는 작업 트리에서 git 을 돌리지 않는다.
+  - 사전 정리의 「추적 파일은 지우지 않는다」 규칙은 추적 파일 목록을 작업 트리 index 가 아니라 **mirror** 에서 읽는다(못 읽으면 `inconclusive`).
+  - 사전 정리의 삭제는 연 핸들의 실제 경로가 작업 트리 안일 때만 **그 핸들로** 한다 — 확인 뒤 부모를 정션으로 바꿔치기해도 서비스 전용 파일로 돌려지지 않는다(읽기의 같은 규칙은 §15.1).
+  - `ws\` 아래 폴더를 만들거나 지우기 전에, 그 사이 부모 경로에 링크·정션이 있으면 거절한다.
+- **git 소유자 검사(`safe.directory`)**: git 은 다른 사용자가 소유한 저장소를 열지 않는데, cimon 은 계정끼리 서로 만든 저장소를 연다 — 관리자의 `cimon recipe import` 가 만든 `recipes.git` 을 서비스가, 서비스의 mirror 를 빌드 계정(clone 원본)과 관리자(`cimon provision`)가. cimon 의 git 호출은 저장소를 **명시**하고(bare 는 `--git-dir`, 작업 트리는 빌드 계정의 `-C`) `safe.directory=*` 를 붙인다. bare 저장소는 서비스·관리자만 쓸 수 있고 위로 찾아 올라가는 탐색을 하지 않으므로, 다른 사람이 심은 저장소를 열 일이 없다 — 이 검사가 막으려는 상황이 생기지 않는다.
 - **mirror 의 객체를 지키기**: 클론은 객체를 mirror 에서 빌려 쓰므로, mirror 에서 객체가 정리되면 클론이 깨진다.
   - mirror 는 `gc.auto=0`. GC 는 정리기가 **러너가 쉴 때만** 돌린다.
   - warm 슬롯·끝나지 않은 작업이 쓰는 커밋은 `refs/cimon/keep/<슬롯 또는 작업>` 으로 고정한다 — 브랜치가 지워지거나 force-push 돼도 그 커밋의 객체는 남는다.
-  - warm 슬롯을 쓰기 전에 지난 커밋이 mirror 에 있는지 확인하고, checkout 이 객체 문제로 실패하면 그 슬롯을 다시 만든다(경고, 다음 작업은 cold).
+  - warm 슬롯의 checkout·clean 이 실패하면(객체가 없거나 `.git` 이 망가졌으면) 그 슬롯을 다시 만든다(경고, 그 작업은 cold).
 - 클론의 원격은 로컬 mirror 다. 빌드 계정은 GitHub 자격 증명 없이 작업 트리를 다룬다.
 
 ### 11.2 warm 슬롯
@@ -956,9 +965,9 @@ git = 'C:\Program Files\Git'
 android_sdk = 'C:\Android\Sdk'
 inno_setup = 'C:\Program Files (x86)\Inno Setup 6'
 
-[bootstrap]
-rustup = "<고정 필요>"
-uv = "<고정 필요>"
+[bootstrap]                                        # 필수 — setup 이 이 버전을 받는다(§10.1)
+rustup = "1.29.2"                                  # rustup-init
+uv = "0.13.5"
 
 [toolchains]
 auto_approve = ["rust", "node", "python", "cmake", "task"]
@@ -1010,7 +1019,8 @@ login_code_minutes = 5
 | 레시피를 고칠 수 있는 사람 | 레시피 = 빌드 머신 명령. 시도 브랜치는 팀원 누구나 — 토큰을 가진 팀원을 그만큼 믿는 전제. `main` 은 아무도 직접 고치지 않고, 반영·되돌리기는 관리자만. 조건을 덮어쓴 반영·되돌리기는 사유와 함께 영구히 보인다 |
 | 리뷰어가 본 것과 다른 레시피가 반영된다 | `recipe_promote` 에 head 필수, 반영 순간 조건 재계산, ref 비교 후 갱신(§6.5) |
 | 설치 스크립트가 서비스 계정으로 돈다 | 서비스 계정은 받은 것을 실행하지 않는다 — 설치 스크립트·probe 는 빌드 계정으로 staging 에서. 스크립트 위치는 커밋 SHA 로 고정(§10.3) |
-| 빌드 스크립트가 다른 프로젝트를 오염시킨다 | 캐시를 프로젝트별로 |
+| 빌드 스크립트가 작업 트리의 `.git`(훅·설정)을 심어 서비스 계정으로 실행시킨다 | 작업 트리의 git 은 빌드 계정으로 돈다. 서비스는 작업 트리에서 git 을 돌리지 않고, 거기서 읽거나 지우는 파일은 연 핸들의 실제 경로로 확인한다(§11.1) |
+| 빌드 스크립트가 다른 프로젝트를 오염시킨다 | 캐시를 프로젝트별로. 남는 위험은 아래 「받아들이는 위험」 |
 | 빌드 스크립트가 비밀을 훔친다 | 서명 키·배포 자격 증명을 두지 않는다. 빌드 계정에는 기본적으로 GitHub 자격 증명도 없다 |
 | 빌드 스크립트가 네트워크로 퍼진다 | tailnet 에서 `tag:cimon` 이 출발하는 grant 없음, 기본 규칙(모두→모두) 삭제(§15.3). 빌드 계정 아웃바운드는 Windows 방화벽으로 GitHub·패키지 레지스트리·사내 아티팩트 저장소만 |
 | 파라미터로 명령을 주입한다 · 저장소가 도구를 가로챈다 | 선언된 파라미터만, 모양 검증, argv 로(§9.3). 경로 구분자 없는 명령은 구성한 `PATH` 에서만 |
@@ -1020,7 +1030,7 @@ login_code_minutes = 5
 | 빌드 머신의 다른 프로세스가 `127.0.0.1:8770` 을 부른다 | 토큰이 없으면 401. Tailscale 신원 헤더는 **인증에 쓰지 않는다** |
 | 리뷰 화면 공격(XSS·CSRF·세션) | review-ui §10.3 |
 
-**두 겹**: 네트워크(Tailscale 기기 인증 + ACL)와 서버(사용자 토큰). **받아들이는 위험**: 빌드 계정은 모든 프로젝트의 작업 트리를 읽을 수 있다 — 등록된 팀 내부 저장소만 짓는다는 전제로 받아들인다. 줄이려면 프로젝트별 빌드 계정이나 VM(§17).
+**두 겹**: 네트워크(Tailscale 기기 인증 + ACL)와 서버(사용자 토큰). **받아들이는 위험**: 빌드 계정은 모든 프로젝트의 작업 트리를 읽고 **쓸 수 있다** — 한 작업이 다른 브랜치·프로젝트의 warm 슬롯(`keep` 으로 남는 빌드 결과 포함)과 캐시를 바꿔 다음 작업의 산출물을 오염시킬 수 있다는 뜻이다. 작업 사이에는 빌드 계정의 프로세스·예약 작업을 모두 정리하므로(§9.2) 오염은 파일로만 남는다. 등록된 팀 내부 저장소만 짓는다는 전제로 받아들인다. 의심되면 `clean = true` 로 짓는다. 줄이려면 프로젝트별 빌드 계정이나 VM(§17).
 
 ### 15.3 Tailscale
 
@@ -1069,10 +1079,11 @@ login_code_minutes = 5
    $token = [System.Net.NetworkCredential]::new('', $secure).Password
    @{ Authorization = "Bearer $token" } | ConvertTo-Json -Compress
    ```
-3. Claude Code 등록(절대 경로):
+3. Claude Code 등록(명령 프롬프트에서, 절대 경로 — Windows 기본 실행 정책은 `.ps1` 을 막으므로 `-ExecutionPolicy Bypass`):
    ```
-   claude mcp add-json cimon "{\"type\":\"http\",\"url\":\"https://cimon.<tailnet>.ts.net/mcp\",\"headersHelper\":\"powershell -NoProfile -File C:\\\\Users\\\\<me>\\\\.cimon\\\\header.ps1\"}"
+   claude mcp add-json --scope user cimon "{\"type\":\"http\",\"url\":\"https://cimon.<tailnet>.ts.net/mcp\",\"headersHelper\":\"powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<me>/.cimon/header.ps1\"}"
    ```
+   팀원용 전체 안내(macOS·Linux 포함)는 [remote-use.md](remote-use.md).
 
 ---
 
@@ -1080,7 +1091,9 @@ login_code_minutes = 5
 
 ### 16.1 설치 — 처음 한 번
 
-1. `cimon setup`(관리자, `--dry-run` 으로 미리 보기): 디렉터리, `config\link.key` 생성, **Windows 서비스 등록**(sc.exe, 절대 경로, 자동 시작·실패 시 재시작 — `NT SERVICE\cimon` 은 서비스가 있어야 해석되므로 먼저), 빌드 계정 생성(PowerShell, 비밀번호는 stdin 으로, 「비밀번호 만료 없음」 을 같은 호출에서)과 DPAPI 비밀번호 파일, 권한(`NT SERVICE\cimon` 「서비스로 로그온」·토큰 바꾸기·할당량·백업·복원, 빌드 계정 「일괄 작업으로 로그온」), ACL(§5, icacls), rustup·uv bootstrap(체크섬 확인). **빌드 계정 아웃바운드 제한은 자동화하지 않았다** — Windows 방화벽은 사용자별 아웃바운드 규칙이 약해 수동 단계로 남기고 `setup` 이 안내한다.
+명령 단위의 절차는 [setup.md](setup.md). 요약:
+
+1. `cimon setup`(관리자, `--dry-run` 으로 미리 보기): 디렉터리, `config\link.key` 생성, **Windows 서비스 등록**(sc.exe, 절대 경로, 자동 시작·실패 시 재시작 — `NT SERVICE\cimon` 은 서비스가 있어야 해석되므로 먼저), 빌드 계정 생성(PowerShell, 비밀번호는 stdin 으로, 「비밀번호 만료 없음」 을 같은 호출에서)과 DPAPI 비밀번호 파일, 권한(`NT SERVICE\cimon` 「서비스로 로그온」·토큰 바꾸기·할당량·백업·복원, 빌드 계정 「일괄 작업으로 로그온」), ACL(§5, icacls), rustup·uv bootstrap(`[bootstrap]` 버전, 체크섬 확인). **빌드 계정 아웃바운드 제한은 자동화하지 않았다** — Windows 방화벽은 사용자별 아웃바운드 규칙이 약해 수동 단계로 남기고 `setup` 이 안내한다.
 2. Tailscale(§15.3).
 3. 첫 관리자: `cimon token create <이름> --admin`.
 4. 레시피 저장소: `cimon recipe import --init <사내 레시피 폴더> --author <이름>` — 저장소와 `main` 을 한 번 만든다(정적 검사를 통과해야 하고, `main` 이 있으면 거절). 바로 번들 백업.
@@ -1105,6 +1118,8 @@ login_code_minutes = 5
 | 백업 대상 | `[backup].offsite` 에 쓸 수 있는 빌드 머신 밖 위치 |
 
 ### 16.3 팀원 PC 준비
+
+팀원용 안내는 [remote-use.md](remote-use.md). 요약:
 
 1. Tailscale 설치 → 회사 계정 로그인 → tailnet 관리자가 `group:cimon-users` 에 넣는다.
 2. Claude Code v2.1.304 이상.
