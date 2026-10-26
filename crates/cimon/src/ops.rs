@@ -399,7 +399,7 @@ pub fn doctor(cfg: &Config, network: bool) -> Result<usize> {
                 }
                 // as a build step sends it: the one header, no credential helper
                 let mut env = std::collections::BTreeMap::new();
-                cimon_engine::build_git::apply(&std::iter::once((url.clone(), token.clone())).collect(), &mut env);
+                cimon_engine::build_git::apply(&std::iter::once((url.clone(), token.clone())).collect(), &[], &mut env);
                 let ok = std::process::Command::new("git")
                     .args(["-c", "credential.helper=", "ls-remote", "--heads", url])
                     .envs(&env)

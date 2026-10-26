@@ -125,7 +125,7 @@ setup 이 자동화하지 않는다. Windows 방화벽(또는 WFP)으로 `cimon-
 - `echo <토큰> | cimon github-token` 처럼 넘기지 않는다 — PowerShell 명령 기록에 남는다. 클립보드나 `gh` 에서 바로 파이프하면 남지 않는다: `Get-Clipboard | & $c github-token` 또는 `gh auth token | & $c github-token`(PowerShell 이 앞에 붙이는 BOM 은 cimon 이 뗀다).
 - `doctor --network` 의 `GitHub access` 가 모두 OK 여야 한다.
 
-빌드 중에 **비공개 저장소를 git 으로 받는** 프로젝트(cargo `git` 의존성 등 — 레시피 저장소의 프로젝트 노트에 적혀 있다)는 빌드 계정에도 그 저장소 하나만 읽는 토큰이 필요하다. 모든 빌드 단계가 볼 수 있으니 fine-grained 로 그 저장소의 Contents 읽기만 준다.
+빌드 중에 **다른 저장소를 git 으로 받는** 프로젝트(cargo `git` 의존성 등 — 레시피 저장소의 프로젝트 노트에 적혀 있다)는 그 저장소가 **cimon 에 등록된 프로젝트면 아무것도 할 필요가 없다** — 빌드 단계는 cimon 의 mirror 에서 받는다(design §11.6). 등록되지 않은 비공개 저장소일 때만 빌드 계정에 그 저장소 하나를 읽는 토큰을 둔다. 모든 빌드 단계가 볼 수 있으니 fine-grained 로 그 저장소의 Contents 읽기만 준다.
 
 ```powershell
 Get-Clipboard | & $c build-git-token https://github.com/<org>/<repo>.git   # URL 은 빌드가 받는 주소 그대로(ssh 주소는 https 로 바뀐 뒤의 모양)

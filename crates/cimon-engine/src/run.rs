@@ -1047,7 +1047,11 @@ impl JobCtx<'_> {
         // git credentials for private dependencies (design §11.6) — after the recipe's
         // layers, which it adds to rather than replaces
         let tokens = crate::build_git::load(&app.layout)?;
-        crate::build_git::apply(&tokens, &mut env);
+        let mirrors = match self.job.recipe_commit.as_deref().map(|c| app.recipes.tree(c)) {
+            Some(Ok(t)) => crate::build_git::mirrors(&app.layout, &*t),
+            _ => vec![],
+        };
+        crate::build_git::apply(&tokens, &mirrors, &mut env);
         Ok(env)
     }
 }

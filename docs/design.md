@@ -762,7 +762,11 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 ### 11.6 자격 증명
 
 - 서비스 계정: 등록된 저장소를 읽는 GitHub fine-grained 토큰. `cimon github-token`(표준 입력)이 DPAPI 로 암호화해 `config\github-token.dpapi` 에 두고, fetch 할 때 **`GIT_CONFIG_*` 환경 변수의 `http.https://github.com/.extraheader`** 로만 넘긴다 — 명령줄·설정 파일에 남지 않는다. **SSH 키는 두지 않는다** — git 설정 `url."https://github.com/".insteadOf "ssh://git@github.com/"`.
-- 빌드 계정: 기본은 **GitHub 자격 증명이 없다.** 빌드 중에 비공개 저장소를 git 으로 받는 프로젝트(cargo 의 `git` 의존성 등)가 있으면 관리자가 그 저장소만 읽는 **별도 토큰**을 `cimon build-git-token <저장소 URL>`(표준 입력)로 둔다 — DPAPI 로 `config\build-git.dpapi` 에. cimon 은 단계마다 `GIT_CONFIG_*` 로 ① GitHub `ssh://`·`git@github.com:` 주소를 https 로 바꾸고 ② 저장된 URL **에만** 그 토큰을 HTTP 헤더(`http.<url>.extraheader`)로 붙인다 — 환경 변수라 레시피가 HOME 을 격리해도 적용되고, git CLI 를 부르는 도구에만 듣는다(cargo 는 `git-fetch-with-cli = true`). 모든 빌드 단계가 이 토큰을 볼 수 있으므로 저장소 하나 읽기 전용이어야 한다. `doctor --network` 가 토큰마다 접근을 확인한다. 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
+- 빌드 계정: **GitHub 자격 증명이 없다.** 빌드 중에 저장소를 git 으로 받는 프로젝트(cargo 의 `git` 의존성 등)를 위해 cimon 은 단계마다 `GIT_CONFIG_*` 로 git 설정을 넣는다 — 환경 변수라 레시피가 HOME 을 격리해도 적용되고, git CLI 를 부르는 도구에만 듣는다(cargo 는 `git-fetch-with-cli = true`).
+  - GitHub `ssh://`·`git@github.com:` 주소는 https 로 바꾼다(SSH 키가 없다).
+  - **등록된 프로젝트의 저장소는 cimon 의 mirror 에서 받는다** — 레시피 트리의 각 프로젝트 `repo`(https 와 두 ssh 표기)를 `url.<mirror>.insteadOf` 로. 자격 증명이 빌드에 들어가지 않고 네트워크를 타지 않는다. cargo 가 `rev` 로 고정한 커밋은 mirror 가 광고하지 않는 객체라 `uploadpack.allowAnySHA1InWant`, 서비스 소유 mirror 를 빌드 계정이 열도록 `safe.directory` 도 함께 둔다(빌드 계정은 mirror 에 쓸 수 없다). mirror 는 그 프로젝트를 마지막으로 받은 만큼 새롭다 — 접수가 작업의 프로젝트와 형제를 받으므로, 의존 저장소를 형제로 두면 늘 최신이다. 더 새 커밋을 원하면 git 이 mirror 경로와 함께 `not our ref` 로 실패한다.
+  - 등록되지 않은 비공개 저장소만 관리자가 그 저장소 하나를 읽는 **별도 토큰**을 `cimon build-git-token <저장소 URL>`(표준 입력)로 둔다 — DPAPI 로 `config\build-git.dpapi`, 저장된 URL **에만** HTTP 헤더(`http.<url>.extraheader`)로. 모든 빌드 단계가 볼 수 있으므로 읽기 전용이어야 하고, `doctor --network` 가 접근을 확인한다.
+  - 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
 - `core.longpaths=true`.
 
 ---
