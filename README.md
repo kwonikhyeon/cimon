@@ -50,5 +50,5 @@ cargo test --workspace         # 단위 + 통합(서버를 프로세스 안에�
 ## 검증 상태
 
 - ✅ M0~M9 의 완료 기준을 단위·통합 시험으로 확인 — 로컬 Windows 개발 PC, 단일 계정 모드.
-- ✅ 구현 뒤 객관 리뷰(작업 수명주기·레시피 저장소·Windows 러너·보안)와 셋업 절차 점검에서 나온 결함을 고치고 회귀 시험을 더했다 — 작업 트리 git 을 빌드 계정으로, 계정 사이 git 소유자 검사, `[bootstrap]` 버전 고정 포함. `cargo test --workspace` 135개.
+- ✅ 구현 뒤 객관 리뷰(작업 수명주기·레시피 저장소·Windows 러너·보안)와 셋업 절차 점검에서 나온 결함을 고치고 회귀 시험을 더했다 — 작업 트리 git 을 빌드 계정으로, 계정 사이 git 소유자 검사, `[bootstrap]` 버전 고정 포함. `cargo test --workspace` 136개.
 - ⚠️ 아직 돌려 보지 않은 것: 빌드 계정 모드(`LogonUser`·`LoadUserProfile` 의 백업·복원 권한·`CreateProcessAsUserW`·빈 `lpDesktop`·`__sweep`·`__account-env`·작업 트리 git), `cimon setup` 실제 실행(PowerShell 계정 생성·LSA 권한·ACL·서비스 등록), Windows 서비스로 기동·중지, 서비스 계정의 `tailscale serve status` 실행, Tailscale 경로, rustup·uv·script 설치기와 Adoptium 체크섬 API, 실제 프로젝트 레시피로 빌드.

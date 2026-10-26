@@ -52,7 +52,9 @@ pub fn startup(app: &App) {
                 for e in inner.flatten() {
                     let name = e.file_name().to_string_lossy().to_string();
                     if let Some(id) = name.strip_prefix('j').and_then(|n| n.parse::<i64>().ok()) {
-                        if !live.contains(&id) {
+                        // ws\ is build-writable: a project folder swapped for a junction
+                        // would point this at logs\ or artifacts\ (j<id> there too)
+                        if !live.contains(&id) && inside(&app.layout.ws(), &e.path()) {
                             let _ = cimon_workspace::remove_dir_all_robust(&e.path());
                         }
                     }
@@ -224,6 +226,10 @@ fn cache_limits(app: &App) {
         let mut total = 0u64;
         for sub in std::fs::read_dir(project.path()).into_iter().flatten().flatten() {
             for e in std::fs::read_dir(sub.path()).into_iter().flatten().flatten() {
+                // caches\ is build-writable: never evict through a linked parent
+                if !inside(&app.layout.root.join("caches"), &e.path()) {
+                    continue;
+                }
                 let size = dir_size(&e.path());
                 let m = e.metadata().ok().and_then(|m| m.modified().ok()).unwrap_or(std::time::UNIX_EPOCH);
                 total += size;
@@ -241,6 +247,18 @@ fn cache_limits(app: &App) {
             if cimon_workspace::remove_dir_all_robust(&p).is_ok() || std::fs::remove_file(&p).is_ok() {
                 total = total.saturating_sub(size);
             }
+        }
+    }
+}
+
+/// `p` is under `root` with no link or junction between them — for deletes in trees
+/// the build account can change (design §11.1).
+fn inside(root: &std::path::Path, p: &std::path::Path) -> bool {
+    match cimon_runner::link_on_path(root, p) {
+        None => true,
+        Some(l) => {
+            tracing::warn!("{} skipped: {} is a link or junction", p.display(), l.display());
+            false
         }
     }
 }
@@ -312,10 +330,11 @@ pub fn free_space(app: &App) {
         if cimon_runner::free_bytes(&app.layout.root).unwrap_or(u64::MAX) >= min {
             break;
         }
-        if busy.contains(&(project.clone(), slot)) {
+        let dir = app.layout.warm_slot(&project, slot as u32);
+        if busy.contains(&(project.clone(), slot)) || !inside(&app.layout.ws(), &dir) {
             continue;
         }
-        let _ = cimon_workspace::remove_dir_all_robust(&app.layout.warm_slot(&project, slot as u32));
+        let _ = cimon_workspace::remove_dir_all_robust(&dir);
         let _ = app.store.delete_warm_slot(&project, slot);
         if let Some(m) = cimon_workspace::Mirror::open(&app.layout.mirror(&project)) {
             m.unkeep(&format!("slot-{slot}"));

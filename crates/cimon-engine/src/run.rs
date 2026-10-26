@@ -275,15 +275,23 @@ pub(crate) struct BuildGit<'a> {
     app: &'a App,
     job: i64,
     account: cimon_runner::Account,
+    program: PathBuf,
     env: BTreeMap<String, String>,
     n: std::sync::atomic::AtomicUsize,
 }
 
 impl<'a> BuildGit<'a> {
     pub(crate) fn new(app: &'a App, job: i64, build: Option<&cimon_runner::BuildAccount>) -> Self {
+        let program = git_program(app);
+        let tmp = app.layout.root.join("tmp").to_string_lossy().into_owned();
         let mut env = cimon_runner::base_env(build.map(|b| b.profile_dir.as_path()), build.map(|b| b.name.as_str()));
+        let mut path: Vec<PathBuf> = program.parent().map(|p| vec![p.to_path_buf()]).unwrap_or_default();
+        path.extend(cimon_runner::system_path());
+        env.insert("PATH".into(), cimon_runner::join_path(&path));
+        env.insert("TEMP".into(), tmp.clone());
+        env.insert("TMP".into(), tmp);
         env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
-        BuildGit { app, job, account: build.map(|b| b.account()).unwrap_or(cimon_runner::Account::Current), env, n: Default::default() }
+        BuildGit { app, job, account: build.map(|b| b.account()).unwrap_or(cimon_runner::Account::Current), program, env, n: Default::default() }
     }
 }
 
@@ -292,7 +300,7 @@ impl cimon_workspace::TreeGit for BuildGit<'_> {
         let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
         let sub = args.iter().skip(cimon_workspace::GIT_OPTIONS.len()).find(|a| !a.starts_with('-') && !std::path::Path::new(a).is_absolute()).cloned().unwrap_or_default();
         let spec = ExecSpec {
-            program: git_program(self.app),
+            program: self.program.clone(),
             args: args.to_vec(),
             cwd: self.app.layout.root.join("tmp"),
             env: self.env.clone(),

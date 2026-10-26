@@ -135,3 +135,26 @@ async fn stale_offsite_copy_warns_on_recipe_tools() {
     assert!(health["warnings"][0].as_str().unwrap().contains("30시간 전"));
     c.cancel().await.unwrap();
 }
+
+#[tokio::test]
+async fn janitor_does_not_follow_junctions_out_of_build_trees() {
+    repos_dir();
+    // cache limit 0: every cache entry is over the limit and would be evicted
+    let h = Harness::start("[disk]\ncache_max_gb_per_project = 0\n").await;
+    let l = &h.app.layout;
+    // a finished job's artifacts, which only retention may delete
+    let art = l.job_artifacts(999_999);
+    std::fs::create_dir_all(&art).unwrap();
+    std::fs::write(art.join("app.zip"), "x").unwrap();
+    let junction = |link: &std::path::Path, target: &std::path::Path| {
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        assert!(Command::new("cmd").args(["/c", "mklink", "/J"]).arg(link).arg(target).output().unwrap().status.success(), "mklink /J needs no privilege");
+    };
+    // build steps swap a project folder under ws\ and a tool folder under caches\
+    // for junctions to artifacts\ (where j<id> folders also live)
+    junction(&l.ws().join("evil"), &l.artifacts());
+    junction(&l.root.join("caches").join("p").join("npm"), &l.artifacts());
+    cimon_engine::janitor::startup(&h.app);
+    cimon_engine::janitor::retention_pass(&h.app);
+    assert!(art.join("app.zip").exists(), "the janitor followed a junction out of a build-writable tree");
+}
