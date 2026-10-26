@@ -521,6 +521,7 @@ dependencies = [
  "cimon-recipe",
  "cimon-runner",
  "cimon-store",
+ "cimon-workspace",
  "hex",
  "reqwest 0.12.28",
  "serde",

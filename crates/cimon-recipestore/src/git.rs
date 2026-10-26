@@ -31,8 +31,12 @@ impl Git {
 
     fn command(&self) -> Command {
         let mut c = Command::new("git");
+        // safe.directory=*: an admin's `cimon recipe import` creates the repository and
+        // the service reads it (and the other way round); git's owner check would
+        // refuse one of them. The repository is named explicitly (--git-dir) and only
+        // the service and admins can write it.
         c.arg(format!("--git-dir={}", self.git_dir.display()))
-            .args(["-c", "core.autocrlf=false", "-c", "core.quotepath=false", "-c", "gc.auto=0", "-c", "advice.detachedHead=false"])
+            .args(["-c", "safe.directory=*", "-c", "core.autocrlf=false", "-c", "core.quotepath=false", "-c", "gc.auto=0", "-c", "advice.detachedHead=false"])
             .env("GIT_TERMINAL_PROMPT", "0")
             .env_remove("GIT_DIR")
             .env_remove("GIT_INDEX_FILE")

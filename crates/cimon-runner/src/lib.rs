@@ -342,13 +342,47 @@ pub fn open_within(root: &Path, path: &Path) -> std::io::Result<std::fs::File> {
     let real = win::final_path(&f)?;
     #[cfg(not(windows))]
     let real = std::fs::canonicalize(path)?;
+    ensure_within(root, &real, path)?;
+    Ok(f)
+}
+
+/// Deletes the file `path` only if, on the open handle, it is inside `root` — the
+/// counterpart of [`open_within`] for pre-clean, which deletes as the service account
+/// in a tree build steps can change. A link is opened as itself (not its target), and
+/// the delete goes through the same handle, so a parent directory swapped for a
+/// junction after the check does not redirect it to a service-only file.
+pub fn remove_within(root: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const DELETE: u32 = 0x0001_0000;
+        const FILE_READ_ATTRIBUTES: u32 = 0x80;
+        const FILE_SHARE_ALL: u32 = 0x7;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let f = std::fs::OpenOptions::new()
+            .access_mode(DELETE | FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        ensure_within(root, &win::final_path(&f)?, path)?;
+        win::delete_on_close(&f)
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = std::fs::canonicalize(path.parent().unwrap_or(Path::new(".")))?;
+        ensure_within(root, &parent.join(path.file_name().unwrap_or_default()), path)?;
+        std::fs::remove_file(path)
+    }
+}
+
+fn ensure_within(root: &Path, real: &Path, shown: &Path) -> std::io::Result<()> {
     let root = std::fs::canonicalize(root)?;
     let norm = |p: &Path| p.to_string_lossy().replace('/', "\\").to_lowercase();
-    let (r, f_) = (norm(&root), norm(&real));
-    if f_.starts_with(&format!("{}\\", r.trim_end_matches('\\'))) {
-        Ok(f)
+    let (r, f) = (norm(&root), norm(real));
+    if f.starts_with(&format!("{}\\", r.trim_end_matches('\\'))) {
+        Ok(())
     } else {
-        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{} leads outside {} (to {})", path.display(), root.display(), real.display())))
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, format!("{} leads outside {} (to {})", shown.display(), root.display(), real.display())))
     }
 }
 
@@ -370,6 +404,28 @@ pub fn find_reparse_point(dir: &Path) -> Option<PathBuf> {
         None
     }
     walk(dir)
+}
+
+/// The first link or junction among the directories between `root` and `path` (not
+/// `root`, not `path` itself), or `path` when it is not under `root`. The service
+/// creates and deletes directories in trees build steps can change; a parent swapped
+/// for a junction would move that work into a service-only folder.
+pub fn link_on_path(root: &Path, path: &Path) -> Option<PathBuf> {
+    let Ok(rel) = path.strip_prefix(root) else { return Some(path.to_path_buf()) };
+    let comps: Vec<_> = rel.components().collect();
+    if comps.iter().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+        return Some(path.to_path_buf());
+    }
+    let mut cur = root.to_path_buf();
+    for c in &comps[..comps.len().saturating_sub(1)] {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if is_reparse(&m) => return Some(cur),
+            Ok(_) => {}
+            Err(_) => return None, // nothing below a missing directory exists yet
+        }
+    }
+    None
 }
 
 fn is_reparse(m: &std::fs::Metadata) -> bool {
@@ -494,6 +550,36 @@ mod tests {
                 assert!(open_within(&ws, &j.join("key")).is_err());
             }
         }
+    }
+
+    #[test]
+    fn remove_within_refuses_links_out() {
+        let d = tempfile::tempdir().unwrap();
+        let ws = d.path().join("ws");
+        let outside = d.path().join("secret");
+        std::fs::create_dir_all(ws.join("out")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(ws.join("out/old.zip"), "a").unwrap();
+        std::fs::write(outside.join("cimon.db"), "k").unwrap();
+        remove_within(&ws, &ws.join("out/old.zip")).unwrap();
+        assert!(!ws.join("out/old.zip").exists());
+        assert!(remove_within(&ws, &outside.join("cimon.db")).is_err());
+        assert!(remove_within(&ws, &ws.join("out/../../secret/cimon.db")).is_err());
+        #[cfg(windows)]
+        {
+            // a build step swaps a directory for a junction to a service-only folder
+            let j = ws.join("dist");
+            let made = std::process::Command::new("cmd").args(["/c", "mklink", "/J"]).arg(&j).arg(&outside).output().map(|o| o.status.success()).unwrap_or(false);
+            assert!(made, "mklink /J needs no privilege");
+            assert!(remove_within(&ws, &j.join("cimon.db")).is_err());
+            assert!(outside.join("cimon.db").exists());
+            assert_eq!(link_on_path(&ws, &j.join("j7")), Some(j.clone()));
+            assert_eq!(link_on_path(&ws, &j), None, "the last component may be a link");
+        }
+        assert_eq!(link_on_path(&ws, &ws.join("out").join("warm-1")), None);
+        assert_eq!(link_on_path(&ws, &ws.join("new").join("deeper").join("j1")), None);
+        assert!(link_on_path(&ws, &outside.join("x")).is_some());
+        assert!(link_on_path(&ws, &ws.join("..").join("secret").join("x")).is_some());
     }
 
     #[test]

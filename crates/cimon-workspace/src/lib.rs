@@ -17,14 +17,38 @@ pub enum WsError {
 
 pub type Result<T> = std::result::Result<T, WsError>;
 
-/// Runs git in `dir` (a work tree or a bare repository).
-pub fn git(dir: &Path, args: &[&str]) -> Result<String> {
+/// Options on every git command cimon starts.
+///
+/// `safe.directory=*`: git refuses a repository another user owns, and cimon's
+/// repositories are made by one of its accounts and used by another — an admin's
+/// `cimon recipe import` creates the recipe repository the service reads, the
+/// service's mirrors are the build account's clone source. The check protects against
+/// a repository planted where git searches; cimon names each repository instead —
+/// `--git-dir` for the bare ones (writable only by the service and admins), `-C` only
+/// for work trees, whose git runs as the build account ([`TreeGit`]).
+pub const GIT_OPTIONS: &[&str] = &[
+    "-c",
+    "safe.directory=*",
+    "-c",
+    "core.longpaths=true",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "gc.auto=0",
+    "-c",
+    "advice.detachedHead=false",
+    "-c",
+    "url.https://github.com/.insteadOf=ssh://git@github.com/",
+];
+
+/// Runs git on the bare repository `dir`.
+fn git(dir: &Path, args: &[&str]) -> Result<String> {
     git_env(dir, args, &[])
 }
 
 /// Like [`git`] with extra environment (credentials for fetch go here, never on the
 /// command line).
-pub fn git_env(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String> {
+fn git_env(dir: &Path, args: &[&str], env: &[(String, String)]) -> Result<String> {
     let mut c = git_cmd(Some(dir));
     c.args(args);
     for (k, v) in env {
@@ -49,14 +73,21 @@ fn git_ok(dir: &Path, args: &[&str]) -> bool {
     git_cmd(Some(dir)).args(args).stdout(Stdio::null()).stderr(Stdio::null()).status().map(|s| s.success()).unwrap_or(false)
 }
 
-fn git_cmd(dir: Option<&Path>) -> Command {
-    let mut c = Command::new("git");
-    if let Some(d) = dir {
-        c.arg("-C").arg(d);
+/// git with [`GIT_OPTIONS`], on the bare repository `git_dir` if given (`--git-dir`:
+/// no search upwards).
+fn git_cmd(git_dir: Option<&Path>) -> Command {
+    let mut c = bare_process();
+    c.args(GIT_OPTIONS);
+    if let Some(d) = git_dir {
+        c.arg(format!("--git-dir={}", d.display()));
     }
-    c.args(["-c", "core.longpaths=true", "-c", "core.autocrlf=false", "-c", "gc.auto=0", "-c", "advice.detachedHead=false"])
-        .args(["-c", "url.https://github.com/.insteadOf=ssh://git@github.com/"])
-        .env("GIT_TERMINAL_PROMPT", "0")
+    c
+}
+
+/// The git process without arguments: no prompts, no inherited repository variables.
+fn bare_process() -> Command {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
@@ -229,6 +260,41 @@ pub enum ResolveError {
     CommitNotAllowed(String),
 }
 
+/// Runs git commands on work trees. The engine runs them as the build account (design
+/// §11.1): build steps can write the whole work tree, `.git` included — hooks, config,
+/// alternates — so git started there by the service would run what a step planted,
+/// with the service's rights. The service itself never runs git in a work tree.
+pub trait TreeGit {
+    /// `git <args>` (`args` from [`tree_args`]); an error carries git's message.
+    fn run(&self, args: &[String]) -> Result<()>;
+}
+
+/// [`TreeGit`] that starts git as the current process's user — for tests and for a
+/// single-account development machine.
+pub struct LocalGit;
+
+impl TreeGit for LocalGit {
+    fn run(&self, args: &[String]) -> Result<()> {
+        let out = bare_process().args(args).output()?;
+        if !out.status.success() {
+            return Err(WsError::Git { args: args.join(" "), stderr: String::from_utf8_lossy(&out.stderr).trim().to_string() });
+        }
+        Ok(())
+    }
+}
+
+/// The full argument list of a work-tree git command: [`GIT_OPTIONS`], `-C dir` when
+/// given, then `args`.
+pub fn tree_args(dir: Option<&Path>, args: &[&str]) -> Vec<String> {
+    let mut v: Vec<String> = GIT_OPTIONS.iter().map(|s| s.to_string()).collect();
+    if let Some(d) = dir {
+        v.push("-C".into());
+        v.push(d.to_string_lossy().into_owned());
+    }
+    v.extend(args.iter().map(|s| s.to_string()));
+    v
+}
+
 /// A work tree checked out from a mirror.
 #[derive(Debug, Clone)]
 pub struct WorkTree {
@@ -237,22 +303,18 @@ pub struct WorkTree {
 
 impl WorkTree {
     /// Clones `mirror` into `dir` without copying objects (`--shared`), then checks out
-    /// `commit` detached.
-    pub fn create(mirror: &Mirror, dir: &Path, commit: &str) -> Result<WorkTree> {
+    /// `commit` detached. The clone (and so its `.git`) belongs to whoever `git` runs as.
+    pub fn create(git: &dyn TreeGit, mirror: &Mirror, dir: &Path, commit: &str) -> Result<WorkTree> {
         if dir.exists() {
             remove_dir_all_robust(dir)?;
         }
         if let Some(p) = dir.parent() {
             std::fs::create_dir_all(p)?;
         }
-        let out = git_cmd(None).args(["clone", "--quiet", "--shared", "--no-checkout"]).arg(&mirror.dir).arg(dir).output()?;
-        if !out.status.success() {
-            return Err(WsError::Git { args: "clone --shared".into(), stderr: String::from_utf8_lossy(&out.stderr).into() });
-        }
-        git(dir, &["config", "core.longpaths", "true"])?;
-        git(dir, &["config", "core.autocrlf", "false"])?;
+        let (src, dst) = (mirror.dir.to_string_lossy(), dir.to_string_lossy());
+        git.run(&tree_args(None, &["clone", "--quiet", "--shared", "--no-checkout", "-c", "core.longpaths=true", "-c", "core.autocrlf=false", &src, &dst]))?;
         let wt = WorkTree { dir: dir.to_path_buf() };
-        wt.checkout(commit)?;
+        wt.checkout(git, commit)?;
         Ok(wt)
     }
 
@@ -260,55 +322,35 @@ impl WorkTree {
         dir.join(".git").exists().then(|| WorkTree { dir: dir.to_path_buf() })
     }
 
-    pub fn checkout(&self, commit: &str) -> Result<()> {
-        git(&self.dir, &["checkout", "--quiet", "--force", "--detach", commit]).map(|_| ())
+    pub fn checkout(&self, git: &dyn TreeGit, commit: &str) -> Result<()> {
+        git.run(&tree_args(Some(&self.dir), &["checkout", "--quiet", "--force", "--detach", commit]))
     }
 
     /// `git clean -ffdx` except the `keep` patterns (gitignore syntax).
-    pub fn clean(&self, keep: &[String]) -> Result<()> {
-        let mut args: Vec<String> = vec!["clean".into(), "-ffdxq".into()];
+    pub fn clean(&self, git: &dyn TreeGit, keep: &[String]) -> Result<()> {
+        let mut args: Vec<&str> = vec!["clean", "-ffdxq"];
         for k in keep {
-            args.push("-e".into());
-            args.push(k.clone());
+            args.push("-e");
+            args.push(k);
         }
-        let argv: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-        git(&self.dir, &argv).map(|_| ())
+        git.run(&tree_args(Some(&self.dir), &args))
     }
 
-    pub fn head(&self) -> Option<String> {
-        git(&self.dir, &["rev-parse", "HEAD"]).ok()
-    }
-
-    pub fn has_commit(&self, commit: &str) -> bool {
-        git_ok(&self.dir, &["cat-file", "-e", &format!("{commit}^{{commit}}")])
-    }
-
-    /// Tracked files (for the "never delete tracked files" rule of pre-clean).
-    pub fn tracked(&self) -> Result<Vec<String>> {
-        let out = git_bytes(&self.dir, &["ls-files", "-z"])?;
-        Ok(out.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect())
-    }
-
-    /// Prepares a warm slot for `commit`: reuse when healthy, otherwise recreate.
-    /// Returns (tree, recreated, note).
-    pub fn prepare_warm(mirror: &Mirror, dir: &Path, commit: &str, keep: &[String]) -> Result<(WorkTree, bool, Option<String>)> {
+    /// Prepares a warm slot for `commit`: reuse when checkout and clean succeed (the
+    /// clone borrows the mirror's objects, which a keep ref protects), otherwise
+    /// recreate. Returns (tree, recreated, note).
+    pub fn prepare_warm(git: &dyn TreeGit, mirror: &Mirror, dir: &Path, commit: &str, keep: &[String]) -> Result<(WorkTree, bool, Option<String>)> {
         if let Some(wt) = WorkTree::open(dir) {
-            let reuse = wt.has_commit(commit).then(|| wt.checkout(commit).and_then(|_| wt.clean(keep)));
-            match reuse {
-                Some(Ok(())) => return Ok((wt, false, None)),
-                Some(Err(e)) => {
+            match wt.checkout(git, commit).and_then(|_| wt.clean(git, keep)) {
+                Ok(()) => return Ok((wt, false, None)),
+                Err(e) => {
                     let note = format!("warm slot could not be reused ({e}) — recreated, this job starts cold");
-                    let wt = WorkTree::create(mirror, dir, commit)?;
-                    return Ok((wt, true, Some(note)));
-                }
-                None => {
-                    let note = "warm slot is missing the commit's objects — recreated, this job starts cold".to_string();
-                    let wt = WorkTree::create(mirror, dir, commit)?;
+                    let wt = WorkTree::create(git, mirror, dir, commit)?;
                     return Ok((wt, true, Some(note)));
                 }
             }
         }
-        Ok((WorkTree::create(mirror, dir, commit)?, true, None))
+        Ok((WorkTree::create(git, mirror, dir, commit)?, true, None))
     }
 }
 
@@ -355,6 +397,13 @@ pub fn glob_set(patterns: &[String]) -> std::result::Result<globset::GlobSet, St
 mod tests {
     use super::*;
 
+    /// git in the work tree `dir` (test repositories only).
+    fn wgit(dir: &Path, args: &[&str]) -> String {
+        let out = bare_process().args(tree_args(Some(dir), args)).output().unwrap();
+        assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).trim_end().to_string()
+    }
+
     pub fn make_repo(dir: &Path, files: &[(&str, &str)]) -> String {
         std::fs::create_dir_all(dir).unwrap();
         let w = dir.join("work");
@@ -364,9 +413,19 @@ mod tests {
             std::fs::create_dir_all(fp.parent().unwrap()).unwrap();
             std::fs::write(fp, c).unwrap();
         }
-        git(&w, &["add", "-A"]).unwrap();
-        git(&w, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]).unwrap();
-        git(&w, &["rev-parse", "HEAD"]).unwrap()
+        wgit(&w, &["add", "-A"]);
+        wgit(&w, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        wgit(&w, &["rev-parse", "HEAD"])
+    }
+
+    /// Records what the work-tree side asks for, then runs it.
+    struct Recording(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl TreeGit for Recording {
+        fn run(&self, args: &[String]) -> Result<()> {
+            self.0.lock().unwrap().push(args.to_vec());
+            LocalGit.run(args)
+        }
     }
 
     #[test]
@@ -385,31 +444,40 @@ mod tests {
 
         // a commit only on a branch that is not allowed
         let w = d.path().join("src").join("work");
-        git(&w, &["checkout", "-q", "-b", "secret"]).unwrap();
+        wgit(&w, &["checkout", "-q", "-b", "secret"]);
         std::fs::write(w.join("b.txt"), "2").unwrap();
-        git(&w, &["add", "-A"]).unwrap();
-        git(&w, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "s"]).unwrap();
-        let c2 = git(&w, &["rev-parse", "HEAD"]).unwrap();
+        wgit(&w, &["add", "-A"]);
+        wgit(&w, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "s"]);
+        let c2 = wgit(&w, &["rev-parse", "HEAD"]);
         // a branch named like a hash is not a way around allowed_refs
-        git(&w, &["branch", "deadbeef"]).unwrap();
+        wgit(&w, &["branch", "deadbeef"]);
         let m = Mirror::fetch(&d.path().join("m.git"), &url).unwrap();
         assert!(matches!(m.resolve(&c2, allowed), Err(ResolveError::CommitNotAllowed(_))));
         assert!(matches!(m.resolve("deadbeef", allowed), Err(ResolveError::CommitNotAllowed(_))));
         assert!(matches!(m.resolve("secret", allowed), Err(ResolveError::CommitNotAllowed(_))));
 
-        // warm slot: create, add untracked files, reuse with keep
+        // warm slot: create, add untracked files, reuse with keep — every work-tree
+        // command goes through the TreeGit the caller passes (the build account)
         let slot = d.path().join("ws").join("warm-1");
-        let (wt, recreated, _) = WorkTree::prepare_warm(&m, &slot, &c1, &[]).unwrap();
+        let rec = Recording(Default::default());
+        let (_, recreated, _) = WorkTree::prepare_warm(&rec, &m, &slot, &c1, &[]).unwrap();
         assert!(recreated);
         std::fs::create_dir_all(slot.join("target")).unwrap();
         std::fs::write(slot.join("target").join("x.o"), "obj").unwrap();
         std::fs::write(slot.join("junk.txt"), "junk").unwrap();
-        let (_, recreated, _) = WorkTree::prepare_warm(&m, &slot, &c2, &["target".to_string()]).unwrap();
+        let (_, recreated, _) = WorkTree::prepare_warm(&rec, &m, &slot, &c2, &["target".to_string()]).unwrap();
         assert!(!recreated);
         assert!(slot.join("target/x.o").exists(), "kept");
         assert!(!slot.join("junk.txt").exists(), "cleaned");
         assert!(slot.join("b.txt").exists());
-        assert_eq!(wt.head().unwrap(), c2);
+        assert_eq!(wgit(&slot, &["rev-parse", "HEAD"]), c2);
+        let cmds: Vec<String> = rec.0.lock().unwrap().iter().map(|a| a[GIT_OPTIONS.len()..].iter().find(|s| ["clone", "checkout", "clean"].contains(&s.as_str())).cloned().unwrap_or_default()).collect();
+        assert_eq!(cmds, ["clone", "checkout", "checkout", "clean"]);
+        // a broken slot is recreated, not reused
+        std::fs::write(slot.join(".git").join("HEAD"), "garbage").unwrap();
+        let (_, recreated, note) = WorkTree::prepare_warm(&rec, &m, &slot, &c1, &[]).unwrap();
+        assert!(recreated && note.is_some());
+        assert_eq!(wgit(&slot, &["rev-parse", "HEAD"]), c1);
         m.keep("slot-1", &c2).unwrap();
         assert_eq!(m.keeps(), vec!["slot-1"]);
         m.unkeep("slot-1");

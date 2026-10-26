@@ -182,12 +182,13 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
                 if !mirror.join("HEAD").exists() {
                     return Err(err(format!("mirror of {} does not exist yet — run a job of that project first, or `cimon provision` fetches it", s.from_project)));
                 }
-                let out = std::process::Command::new("git").arg("-C").arg(&mirror).args(["show", &format!("{}:{}", s.ref_, s.path)]).output().map_err(|e| err(e.to_string()))?;
-                if !out.status.success() {
+                // the mirror's own git (--git-dir, the service's options), also when an
+                // admin runs `cimon provision` on a mirror the service created
+                let Some(body) = cimon_workspace::Mirror { dir: mirror.clone() }.show(&s.ref_, &s.path) else {
                     return Err(err(format!("{}:{} not found in the {} mirror", &s.ref_[..s.ref_.len().min(10)], s.path, s.from_project)));
-                }
+                };
                 let script = staging.join(Path::new(&s.path).file_name().unwrap_or_default());
-                std::fs::write(&script, &out.stdout).map_err(|e| err(e.to_string()))?;
+                std::fs::write(&script, &body).map_err(|e| err(e.to_string()))?;
                 let mut args = vec!["-NoProfile".to_string(), "-NonInteractive".into(), "-ExecutionPolicy".into(), "Bypass".into(), "-File".into(), script.to_string_lossy().into()];
                 for a in &s.args {
                     args.push(a.replace("{version}", version).replace("{root}", &root.to_string_lossy()));

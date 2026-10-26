@@ -160,8 +160,9 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     }
     let deadline = started + Duration::from_secs(resolved.project.max_job_minutes as u64 * 60);
 
-    // workspace (design §11)
-    let ws_res = prepare_workspace(app, &job, &request, &resolved, &plan, &commit, &mut warnings);
+    // workspace (design §11) — its git runs as the build account
+    let tree_git = BuildGit::new(app, id, build.as_deref());
+    let ws_res = prepare_workspace(app, &tree_git, &job, &request, &resolved, &plan, &commit, &mut warnings);
     let (ws, recreated, slot) = match ws_res {
         Ok(x) => x,
         Err(e) => {
@@ -176,7 +177,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     };
     let mut siblings = BTreeMap::new();
     for s in &plan.siblings {
-        match prepare_sibling(app, &job, s, &ws) {
+        match prepare_sibling(app, &tree_git, &job, s, &ws) {
             Ok(dir) => {
                 siblings.insert(s.project.clone(), dir);
             }
@@ -266,8 +267,86 @@ fn finish_infra(app: &App, job: &JobRow, msg: &str, warnings: &[Warning]) {
     jobs::finish_simple(app, job.id, JobState::Done, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("workspace_failed"), msg);
 }
 
+/// Work-tree git (clone, checkout, clean) run through the runner as the build account
+/// (design §11.1), each command logged under `logs\j<id>\_workspace\` — step ids cannot
+/// start with `_`. Not interrupted by a cancel: like the rest of the preparation, it
+/// finishes and the cancel takes effect at the first step.
+pub(crate) struct BuildGit<'a> {
+    app: &'a App,
+    job: i64,
+    account: cimon_runner::Account,
+    env: BTreeMap<String, String>,
+    n: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> BuildGit<'a> {
+    pub(crate) fn new(app: &'a App, job: i64, build: Option<&cimon_runner::BuildAccount>) -> Self {
+        let mut env = cimon_runner::base_env(build.map(|b| b.profile_dir.as_path()), build.map(|b| b.name.as_str()));
+        env.insert("GIT_TERMINAL_PROMPT".into(), "0".into());
+        BuildGit { app, job, account: build.map(|b| b.account()).unwrap_or(cimon_runner::Account::Current), env, n: Default::default() }
+    }
+}
+
+impl cimon_workspace::TreeGit for BuildGit<'_> {
+    fn run(&self, args: &[String]) -> cimon_workspace::Result<()> {
+        let n = self.n.fetch_add(1, Ordering::SeqCst) + 1;
+        let sub = args.iter().skip(cimon_workspace::GIT_OPTIONS.len()).find(|a| !a.starts_with('-') && !std::path::Path::new(a).is_absolute()).cloned().unwrap_or_default();
+        let spec = ExecSpec {
+            program: git_program(self.app),
+            args: args.to_vec(),
+            cwd: self.app.layout.root.join("tmp"),
+            env: self.env.clone(),
+            timeout: Duration::from_secs(30 * 60),
+            log_path: self.app.layout.job_logs(self.job).join("_workspace").join(format!("{n:02}-git-{sub}.log")),
+            log_cap: 4 << 20,
+            error_patterns: vec![],
+            fail_on_output: vec![],
+            capture_prefixes: vec![],
+            preamble: vec![format!("git {}", args[cimon_workspace::GIT_OPTIONS.len()..].join(" "))],
+        };
+        if let Some(p) = spec.log_path.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        let res = exec::execute(&spec, &self.account, &AtomicBool::new(false));
+        if res.exit_code == Some(0) {
+            return Ok(());
+        }
+        let why = res
+            .spawn_error
+            .clone()
+            .or_else(|| res.timed_out.then(|| "timed out after 30 minutes".to_string()))
+            .unwrap_or_else(|| format!("exit {:?}: {}", res.exit_code, res.tail.iter().rev().take(5).rev().cloned().collect::<Vec<_>>().join(" | ")));
+        Err(cimon_workspace::WsError::Git { args: sub, stderr: why })
+    }
+}
+
+/// git for work-tree commands: Git for Windows under `[base].git`, else the first git
+/// on the service's PATH (the build account gets the absolute path either way).
+fn git_program(app: &App) -> PathBuf {
+    if let Some(root) = app.config.base.get("git") {
+        let p = root.join("cmd").join("git.exe");
+        if p.is_file() {
+            return p;
+        }
+    }
+    let path: Vec<PathBuf> = std::env::var_os("PATH").map(|p| std::env::split_paths(&p).collect()).unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE".into());
+    cimon_runner::resolve_program("git", Path::new("."), &path, &pathext).unwrap_or_else(|_| PathBuf::from("git"))
+}
+
+/// Refuses a directory the service is about to create or delete under a tree the
+/// build account can change when a parent on the way is a link or junction.
+fn check_no_links(root: &Path, dir: &Path) -> Result<(), String> {
+    match cimon_runner::link_on_path(root, dir) {
+        Some(l) => Err(format!("{} is a link or junction — refusing to work under it", l.display())),
+        None => Ok(()),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn prepare_workspace(
     app: &App,
+    git: &dyn cimon_workspace::TreeGit,
     job: &JobRow,
     request: &JobRequest,
     r: &Resolved,
@@ -284,8 +363,9 @@ fn prepare_workspace(
     let _ = plan;
     if request.args.clean {
         let dir = app.layout.clean_clone(&job.project_key, job.id);
+        check_no_links(&app.layout.ws(), &dir)?;
         mirror.keep(&format!("j{}", job.id), commit).map_err(|e| e.to_string())?;
-        WorkTree::create(&mirror, &dir, commit).map_err(|e| e.to_string())?;
+        WorkTree::create(git, &mirror, &dir, commit).map_err(|e| e.to_string())?;
         let _ = app.store.set_workspace(job.id, "clean", None);
         return Ok((dir, true, None));
     }
@@ -300,8 +380,9 @@ fn prepare_workspace(
         .or_else(|| slots.iter().filter(|(s, ..)| *s <= n).min_by(|a, b| a.3.cmp(&b.3)).map(|(s, ..)| *s))
         .unwrap_or(1);
     let dir = app.layout.warm_slot(&job.project_key, slot as u32);
+    check_no_links(&app.layout.ws(), &dir)?;
     let _ = app.store.set_workspace(job.id, "warm", Some(slot));
-    let (_, recreated, note) = WorkTree::prepare_warm(&mirror, &dir, commit, &keep).map_err(|e| e.to_string())?;
+    let (_, recreated, note) = WorkTree::prepare_warm(git, &mirror, &dir, commit, &keep).map_err(|e| e.to_string())?;
     if let Some(note) = note {
         warnings.push(Warning::new("workspace", note));
     }
@@ -314,14 +395,15 @@ fn prepare_workspace(
     Ok((dir, recreated, Some(slot)))
 }
 
-fn prepare_sibling(app: &App, job: &JobRow, s: &jobs::SiblingPin, ws: &Path) -> Result<PathBuf, String> {
+fn prepare_sibling(app: &App, git: &dyn cimon_workspace::TreeGit, job: &JobRow, s: &jobs::SiblingPin, ws: &Path) -> Result<PathBuf, String> {
     let mirror = Mirror::open(&app.layout.mirror(&s.project_key)).ok_or("sibling mirror missing")?;
     let dir = if s.place == "beside" {
         ws.parent().ok_or("work tree has no parent")?.join(&s.project)
     } else {
         app.layout.sibling_isolated(&job.project_key, job.id).join(&s.project)
     };
-    let (_, _, _) = WorkTree::prepare_warm(&mirror, &dir, &s.commit, &[]).map_err(|e| e.to_string())?;
+    check_no_links(&app.layout.ws(), &dir)?;
+    let (_, _, _) = WorkTree::prepare_warm(git, &mirror, &dir, &s.commit, &[]).map_err(|e| e.to_string())?;
     mirror.keep(&format!("j{}-sibling", job.id), &s.commit).map_err(|e| e.to_string())?;
     Ok(dir)
 }
@@ -342,10 +424,18 @@ fn cleanup(app: &App, job: &JobRow, _slot: Option<i64>, clean: bool, plan: &JobP
             m.unkeep(&format!("j{}-sibling", job.id));
         }
     }
+    let mut dirs = vec![app.layout.sibling_isolated(&job.project_key, job.id)];
     if clean {
-        let _ = cimon_workspace::remove_dir_all_robust(&app.layout.clean_clone(&job.project_key, job.id));
+        dirs.push(app.layout.clean_clone(&job.project_key, job.id));
     }
-    let _ = cimon_workspace::remove_dir_all_robust(&app.layout.sibling_isolated(&job.project_key, job.id));
+    for d in dirs {
+        match check_no_links(&app.layout.ws(), &d) {
+            Ok(()) => {
+                let _ = cimon_workspace::remove_dir_all_robust(&d);
+            }
+            Err(e) => tracing::warn!("{} not removed: {e}", d.display()),
+        }
+    }
 }
 
 /// Build-account leftover sweep (design §9.2), run as that account.

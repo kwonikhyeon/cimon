@@ -381,6 +381,21 @@ pub fn free_bytes(path: &std::path::Path) -> Option<u64> {
     (unsafe { GetDiskFreeSpaceExW(p.as_ptr(), &mut avail, null_mut(), null_mut()) } != 0).then_some(avail)
 }
 
+/// Marks the file behind `f` for deletion when its last handle closes. `f` must have
+/// been opened with DELETE access.
+pub fn delete_on_close(f: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{FileDispositionInfo, SetFileInformationByHandle, FILE_DISPOSITION_INFO};
+    let info = FILE_DISPOSITION_INFO { DeleteFile: 1 };
+    let ok = unsafe {
+        SetFileInformationByHandle(f.as_raw_handle() as HANDLE, FileDispositionInfo, &info as *const _ as *const core::ffi::c_void, std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32)
+    };
+    if ok == 0 {
+        return Err(last_error("SetFileInformationByHandle"));
+    }
+    Ok(())
+}
+
 /// The path a handle really points at, after every link and junction.
 pub fn final_path(f: &std::fs::File) -> std::io::Result<std::path::PathBuf> {
     use std::os::windows::ffi::OsStringExt;

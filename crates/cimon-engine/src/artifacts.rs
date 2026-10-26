@@ -74,17 +74,24 @@ pub fn pre_clean(ctx: &JobCtx<'_>, step: &cimon_recipe::Step) -> Result<Vec<Stri
     if globs.is_empty() {
         return Ok(vec![]);
     }
-    let tracked: std::collections::BTreeSet<String> = cimon_workspace::WorkTree { dir: ctx.ws.clone() }.tracked().unwrap_or_default().into_iter().collect();
+    // tracked paths come from the mirror (service-only), not the work tree's index —
+    // build steps can rewrite that, and git must not run there as the service
+    let tracked: std::collections::BTreeSet<String> = match cimon_workspace::Mirror::open(&ctx.app.layout.mirror(&ctx.job.project_key)).map(|m| m.tracked(&ctx.commit)) {
+        Some(Ok(t)) => t.into_iter().map(|t| t.to_lowercase()).collect(),
+        Some(Err(e)) => return Err(Outcome::inconclusive(FailureClass::Infra, format!("pre-clean: cannot list tracked files: {e}"))),
+        None => return Err(Outcome::inconclusive(FailureClass::Infra, "pre-clean: the project mirror is missing")),
+    };
     let mut lines = vec![];
     for (what, g, ex) in globs {
         let files = matches(&ctx.ws, &g, &ex);
         let mut removed = vec![];
         for f in files {
             let rel = f.strip_prefix(&ctx.ws).unwrap_or(&f).to_string_lossy().replace('\\', "/");
-            if tracked.iter().any(|t| t.eq_ignore_ascii_case(&rel)) {
+            if tracked.contains(&rel.to_lowercase()) {
                 return Err(Outcome::inconclusive(FailureClass::Recipe, format!("{what}: glob matches the tracked file {rel} — pre-clean never deletes tracked files; narrow the glob")));
             }
-            match std::fs::remove_file(&f) {
+            // the service deletes here: only through a handle that is inside the tree
+            match cimon_runner::remove_within(&ctx.ws, &f) {
                 Ok(()) => removed.push(rel),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(Outcome::inconclusive(FailureClass::Infra, format!("{what}: pre-clean could not delete {rel}: {e} — an old copy would be taken for this run's output"))),

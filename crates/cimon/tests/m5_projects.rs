@@ -146,6 +146,12 @@ async fn warm_slot_survives_deleted_branch_and_gc() {
     assert_eq!(v["verdict"], "pass", "{v:#}");
     let warnings = v["warnings"].as_array().unwrap();
     assert!(!warnings.iter().any(|w| w["source"] == "workspace"), "slot was recreated: {v:#}");
+    // the work tree's git went through the runner (as the build account on a build
+    // machine), logged per command — the service never starts git in the tree
+    let job = cimon_core::parse_job_label(v["job_id"].as_str().unwrap()).unwrap();
+    let logs: Vec<String> = std::fs::read_dir(h.app.layout.job_logs(job).join("_workspace")).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+    assert_eq!(logs.len(), 2, "{logs:?}");
+    assert!(logs.iter().any(|l| l.ends_with("git-checkout.log")) && logs.iter().any(|l| l.ends_with("git-clean.log")), "{logs:?}");
     c.cancel().await.unwrap();
 }
 
