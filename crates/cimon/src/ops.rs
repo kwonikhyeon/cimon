@@ -141,6 +141,10 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         cmd("icacls", &[&r, "/inheritance:r", "/grant:r", "*S-1-5-32-544:(OI)(CI)F", "/grant:r", "*S-1-5-18:(OI)(CI)F", "/grant:r", &format!("{SERVICE_ACCOUNT}:(OI)(CI)F")])?;
         if !single {
             let layout = Layout::new(&root);
+            // build tools walk up from the work tree reading every directory (esbuild:
+            // "Cannot read directory ../../../..: Access is denied"), so the build account
+            // may list the root itself — this folder only: names, nothing below it
+            cmd("icacls", &[&r, "/grant", &format!("{b}:(RX)")])?;
             // not logs\ (the runner grants each step's out\ dir) and not toolchains\_staging
             // (a script installer's dir is granted for the install only): a step must not
             // rewrite another job's logs or a download between its check and extraction
