@@ -19,33 +19,11 @@ pub fn file(layout: &Layout) -> PathBuf {
 
 /// Repository URL → token. No file: none.
 pub fn load(layout: &Layout) -> Result<BTreeMap<String, String>, String> {
-    let p = file(layout);
-    let blob = match std::fs::read(&p) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(format!("{}: {e}", p.display())),
-    };
-    #[cfg(windows)]
-    let raw = cimon_runner::win::unprotect(&blob).map_err(|e| format!("{}: {e}", p.display()))?;
-    #[cfg(not(windows))]
-    let raw = blob;
-    serde_json::from_slice(&raw).map_err(|e| format!("{}: {e}", p.display()))
+    crate::protected::load(&file(layout))
 }
 
 pub fn save(layout: &Layout, tokens: &BTreeMap<String, String>) -> Result<(), String> {
-    let p = file(layout);
-    if tokens.is_empty() {
-        return match std::fs::remove_file(&p) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(format!("{}: {e}", p.display())),
-            _ => Ok(()),
-        };
-    }
-    let raw = serde_json::to_vec(tokens).map_err(|e| e.to_string())?;
-    #[cfg(windows)]
-    let blob = cimon_runner::win::protect(&raw).map_err(|e| e.to_string())?;
-    #[cfg(not(windows))]
-    let blob = raw;
-    std::fs::write(&p, blob).map_err(|e| format!("{}: {e}", p.display()))
+    crate::protected::save(&file(layout), tokens, tokens.is_empty())
 }
 
 /// A URL a token may be bound to: https, a host, an owner and a repository, and

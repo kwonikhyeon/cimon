@@ -125,6 +125,8 @@ pub struct JobCtx<'a> {
     pub cancel: &'a AtomicBool,
     pub deadline: Instant,
     pub clean: bool,
+    /// This project's `cimon build-secret`s (design §11.6) — or why they could not be read.
+    pub secrets: Result<BTreeMap<String, String>, String>,
 }
 
 pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
@@ -224,6 +226,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         cancel,
         deadline,
         clean: request.args.clean,
+        secrets: crate::build_secrets::load(&app.layout).map(|mut all| all.remove(&job.project).unwrap_or_default()),
     };
     crate::fixtures::account_env(&mut ctx, true);
 
@@ -629,6 +632,11 @@ fn run_one(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, label: &str, rec: &m
             return;
         }
     }
+    if let Err(o) = ctx.check_secrets(step) {
+        rec.result = o.verdict.as_str().into();
+        rec.outcome = Some(o);
+        return;
+    }
     // Everything that needs `${…}` expansion, while `ctx` is only borrowed.
     let prepared: Result<(BTreeMap<String, String>, PathBuf, Vec<String>, PathBuf, Vec<String>), String> = (|| {
         let lookup = ctx.lookup(&sid, &out_dir);
@@ -982,6 +990,30 @@ impl JobCtx<'_> {
         }
     }
 
+    /// [`Self::lookup`] plus `${secret.<name>}` — for environment values only (design §11.6).
+    pub fn env_lookup<'b>(&'b self, step: &str, out_dir: &'b Path) -> impl Fn(&str) -> Option<String> + 'b {
+        let lookup = self.lookup(step, out_dir);
+        move |name: &str| match name.strip_prefix("secret.") {
+            Some(s) => self.secrets.as_ref().ok().and_then(|m| m.get(s).cloned()),
+            None => lookup(name),
+        }
+    }
+
+    /// Every secret `step`'s environment names is stored: run_one checks before it
+    /// expands, so a missing one reads as the admin's to fix rather than an unknown
+    /// variable.
+    pub fn check_secrets(&self, step: &cimon_recipe::Step) -> Result<(), Outcome> {
+        let needs = crate::build_secrets::step_needs(&self.resolved, step, self.clean);
+        if needs.is_empty() {
+            return Ok(());
+        }
+        let have = self.secrets.as_ref().map_err(|e| Outcome::inconclusive(FailureClass::Environment, format!("비밀을 읽지 못했다: {e}")))?;
+        match needs.iter().find(|n| !have.contains_key(*n)) {
+            Some(n) => Err(Outcome::inconclusive(FailureClass::Environment, crate::build_secrets::missing(&self.job.project, n))),
+            None => Ok(()),
+        }
+    }
+
     /// The step environment, layered as design §9.4 lists.
     pub fn step_env(&self, step: &cimon_recipe::Step, out_dir: &Path) -> Result<BTreeMap<String, String>, String> {
         let app = self.app;
@@ -1019,7 +1051,7 @@ impl JobCtx<'_> {
                 }
             }
         }
-        let lookup = self.lookup(step.id(), out_dir);
+        let lookup = self.env_lookup(step.id(), out_dir);
         let ex = |v: &str| cimon_recipe::vars::expand(v, &lookup);
         for (k, v) in &self.resolved.env {
             cimon_runner::env_set(&mut env, k, ex(v)?);

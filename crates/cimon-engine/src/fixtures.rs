@@ -228,7 +228,7 @@ fn fixture_env(ctx: &JobCtx<'_>, def: &FixtureDef, out_dir: &std::path::Path) ->
         let _ = std::fs::create_dir_all(&d);
         cimon_runner::env_set(&mut env, name, d.to_string_lossy().into());
     }
-    let lookup = ctx.lookup("fixture", out_dir);
+    let lookup = ctx.env_lookup("fixture", out_dir);
     for (k, v) in &ctx.resolved.env {
         cimon_runner::env_set(&mut env, k, cimon_recipe::vars::expand(v, &lookup)?);
     }

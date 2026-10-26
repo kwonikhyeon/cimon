@@ -247,6 +247,26 @@ pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
     }
     let toolchains = crate::provision_needs(app, &v);
     let plan = &v.plan;
+    // the secrets the selected steps' environment names (design §11.6)
+    let stored = crate::build_secrets::load(&app.layout).map(|mut all| all.remove(&args.project).unwrap_or_default());
+    let needs: std::collections::BTreeSet<String> = plan
+        .setup
+        .iter()
+        .chain(plan.steps.iter().map(|s| &s.id))
+        .filter_map(|id| v.resolved.step(id))
+        .flat_map(|s| crate::build_secrets::step_needs(&v.resolved, s, args.clean))
+        .collect();
+    let secrets: Vec<Value> = needs
+        .iter()
+        .map(|n| {
+            let state = match &stored {
+                Ok(m) if m.contains_key(n) => "있음".to_string(),
+                Ok(_) => crate::build_secrets::missing(&args.project, n),
+                Err(e) => format!("읽지 못했다: {e}"),
+            };
+            json!({"name": n, "state": state})
+        })
+        .collect();
     let summary = format!(
         "{} {} — {}{}{}",
         args.project,
@@ -266,6 +286,7 @@ pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
         "artifacts": plan.artifacts,
         "params": plan.params,
         "toolchains": toolchains,
+        "secrets": secrets,
         "unknown": unknowns,
         "summary": summary,
     }))

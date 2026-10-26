@@ -286,6 +286,51 @@ pub fn build_git_token(cfg: &Config, url: Option<String>, remove: bool) -> Resul
     Ok(())
 }
 
+/// `cimon build-secret` (design §11.6): a credential `${secret.<name>}` hands that
+/// project's build steps through an environment value. Without a name, lists the
+/// project's secrets; without a project, every project's.
+pub fn build_secret(cfg: &Config, project: Option<String>, name: Option<String>, remove: bool) -> Result<()> {
+    let layout = Layout::new(&cfg.paths.root);
+    let mut secrets = cimon_engine::build_secrets::load(&layout).map_err(|e| anyhow::anyhow!(e))?;
+    let Some(name) = name else {
+        let mut any = false;
+        for (p, names) in secrets.iter().filter(|(p, _)| project.as_ref().is_none_or(|want| want == *p)) {
+            for n in names.keys() {
+                println!("{p} {n}");
+                any = true;
+            }
+        }
+        if !any {
+            eprintln!("no build secrets");
+        }
+        return Ok(());
+    };
+    let project = project.context("a project")?;
+    if !cimon_recipe::vars::valid_secret_name(&name) {
+        bail!("{name:?} is not a secret name — [a-z0-9][a-z0-9_-]*, as the recipe writes it in ${{secret.<name>}}");
+    }
+    if remove {
+        if secrets.get_mut(&project).and_then(|m| m.remove(&name)).is_none() {
+            bail!("{project} has no secret {name}");
+        }
+        secrets.retain(|_, m| !m.is_empty());
+        cimon_engine::build_secrets::save(&layout, &secrets).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("removed {project} {name}");
+        return Ok(());
+    }
+    // a typo would store a secret no job ever reads
+    let app = cimon_engine::App::open(cfg.clone())?;
+    let known = app.recipes.main_commit().and_then(|c| app.recipes.tree(&c).ok()).is_some_and(|t| cimon_recipe::Tree::exists(&*t, &format!("projects/{project}/project.toml")));
+    if !known {
+        bail!("{project:?} is not a project on recipes main");
+    }
+    let value = read_token_line()?;
+    secrets.entry(project.clone()).or_default().insert(name.clone(), value);
+    cimon_engine::build_secrets::save(&layout, &secrets).map_err(|e| anyhow::anyhow!(e))?;
+    eprintln!("{project}'s steps now get it where the recipe writes ${{secret.{name}}} in an env value — every such step can read it, so make it read-only");
+    Ok(())
+}
+
 /// One token line from stdin, checked to look like a token.
 fn read_token_line() -> Result<String> {
     let mut token = String::new();
@@ -297,7 +342,7 @@ fn read_token_line() -> Result<String> {
         bail!("no token on stdin");
     }
     if !token.chars().all(|c| c.is_ascii_graphic()) {
-        bail!("that is not a GitHub token (it has spaces or non-ASCII characters) — give the token alone on one line");
+        bail!("that is not a token (it has spaces or non-ASCII characters) — give the token alone on one line");
     }
     Ok(token.to_string())
 }
@@ -364,7 +409,19 @@ pub fn doctor(cfg: &Config, network: bool) -> Result<usize> {
                     report(r.ok(), &format!("recipes main {} static check", &main[..7]), format!("{} error(s), {} warning(s)", r.errors.len(), r.warnings.len()));
                     // base toolchains every project declares
                     let cat = cimon_recipe::Catalog::parse(cimon_recipe::Tree::read_str(&*t, "toolchains.toml").unwrap_or("")).ok();
+                    let secrets = cimon_engine::build_secrets::load(&layout);
+                    if let Err(e) = &secrets {
+                        report(false, "build secrets", e.clone());
+                    }
                     for (id, res) in &r.resolved {
+                        // every secret an env value of its recipe names (design §11.6)
+                        let needs: std::collections::BTreeSet<String> = res.steps.iter().flat_map(|s| cimon_engine::build_secrets::step_needs(res, s, true)).collect();
+                        if let Ok(stored) = &secrets {
+                            for n in &needs {
+                                let ok = stored.get(id).is_some_and(|m| m.contains_key(n));
+                                report(ok, &format!("build secret {id} {n}"), if ok { String::new() } else { format!("missing — cimon build-secret {id} {n}") });
+                            }
+                        }
                         for (kind, req) in &res.toolchains {
                             if let Some(def) = cat.as_ref().and_then(|c| c.kinds.get(kind)).filter(|d| d.is_base()) {
                                 match cimon_toolchain::base::check(&cfg.base, kind, def, req) {

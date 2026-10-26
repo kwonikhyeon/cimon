@@ -422,7 +422,7 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
                 cx.err_recipe(k, format!("env {k}: ${{{name}}} is per step — set it in the step's env"));
                 continue;
             }
-            if let Err(e) = vars::validate_ref(&name, &known(r, &no_artifacts_env, false)) {
+            if let Err(e) = vars::validate_ref(&name, &Known { allow_secret: true, ..known(r, &no_artifacts_env, false) }) {
                 cx.err_recipe(k, format!("env {k}: {e}"));
             }
         }
@@ -659,8 +659,11 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
         // variables in step strings
         let fixture_artifacts: BTreeSet<String> =
             d.fixture.as_ref().and_then(|f| fixtures.get(f)).map(|f| f.requires_artifacts.iter().cloned().collect()).unwrap_or_default();
-        for text in step_strings(d) {
-            check_refs(&mut cx, s, &text, &fixture_artifacts, &producers);
+        for text in step_command_strings(d) {
+            check_refs(&mut cx, s, &text, &fixture_artifacts, false);
+        }
+        for text in d.env.values() {
+            check_refs(&mut cx, s, text, &fixture_artifacts, true);
         }
         for (k, v) in &d.env {
             if !valid_env_name(k) {
@@ -735,13 +738,13 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
                 texts.extend(ot.run.clone());
             }
         }
-        texts.extend(f.env.values().cloned());
         texts.extend(f.collect.clone());
         let up_text = f.up.iter().flat_map(|c| c.run.iter()).cloned().collect::<Vec<_>>().join(" ");
         if up_text.contains("${artifact.") && f.on_up_failure.is_none() {
             cx.warn_recipe(&needle, format!("fixture {name}: up runs an artifact built by this branch but on_up_failure is not set — a broken build would look like an infra problem"));
         }
-        for t in texts {
+        let texts = texts.into_iter().map(|t| (t, false)).chain(f.env.values().map(|v| (v.clone(), true)));
+        for (t, allow_secret) in texts {
             if vars::unterminated(&t) {
                 cx.err_recipe(&needle, format!("fixture {name}: unterminated ${{…}} in {t:?}"));
             }
@@ -756,7 +759,7 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
                     cx.err_recipe(&needle, format!("fixture {name}: ${{{v}}} — parameters cannot be used in fixtures"));
                     continue;
                 }
-                let known = known(r, &allowed, false);
+                let known = Known { allow_secret, ..known(r, &allowed, false) };
                 if let Err(e) = vars::validate_ref(&v, &known) {
                     cx.err_recipe(&needle, format!("fixture {name}: {e}"));
                 }
@@ -765,9 +768,9 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
         }
     }
     let no_artifacts = BTreeSet::new();
-    for k in r.keep.iter().chain(r.clean_env.values()) {
+    for (k, allow_secret) in r.keep.iter().map(|k| (k, false)).chain(r.clean_env.values().map(|v| (v, true))) {
         for v in vars::refs(k) {
-            let known = known(r, &no_artifacts, false);
+            let known = Known { allow_secret, ..known(r, &no_artifacts, false) };
             if let Err(e) = vars::validate_ref(&v, &known) {
                 cx.err_recipe("[workspace]", format!("[workspace]: {e}"));
             }
@@ -797,10 +800,11 @@ pub(crate) fn known<'a>(r: &'a Resolved, artifacts: &'a BTreeSet<String>, allow_
         siblings: r.project.sibling.iter().map(|s| s.project.as_str()).collect(),
         artifacts: artifacts.iter().map(|s| s.as_str()).collect(),
         allow_value,
+        allow_secret: false,
     }
 }
 
-fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_artifacts: &BTreeSet<String>, _producers: &BTreeMap<String, String>) {
+fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_artifacts: &BTreeSet<String>, allow_secret: bool) {
     if vars::unterminated(text) {
         cx.err_step(s, format!("unterminated ${{…}} in {text:?}"));
     }
@@ -811,7 +815,7 @@ fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_ar
                 continue;
             }
         }
-        let k = known(cx.r, fixture_artifacts, false);
+        let k = Known { allow_secret, ..known(cx.r, fixture_artifacts, false) };
         match vars::validate_ref(&v, &k) {
             Err(e) => cx.err_step(s, e),
             Ok(Some(p)) => {
@@ -861,9 +865,15 @@ pub fn path_exists(tree: &dyn Tree, p: &str) -> bool {
 
 /// Every string of a step that undergoes variable expansion.
 pub fn step_strings(d: &StepDef) -> Vec<String> {
+    let mut v = step_command_strings(d);
+    v.extend(d.env.values().cloned());
+    v
+}
+
+/// [`step_strings`] but the step's `env` values — the strings a secret may not reach.
+fn step_command_strings(d: &StepDef) -> Vec<String> {
     let mut v: Vec<String> = d.run.clone();
     v.extend(d.cwd.clone());
-    v.extend(d.env.values().cloned());
     v.extend(d.inputs.clone());
     if let Some(j) = &d.judge {
         v.extend(j.run.clone().unwrap_or_default());

@@ -57,6 +57,6 @@ cargo test --workspace         # 단위 + 통합(서버를 프로세스 안에�
 ## 검증 상태
 
 - ✅ M0~M9 의 완료 기준을 단위·통합 시험으로 확인 — 로컬 Windows 개발 PC, 단일 계정 모드.
-- ✅ 구현 뒤 객관 리뷰(작업 수명주기·레시피 저장소·Windows 러너·보안)와 셋업 절차 점검에서 나온 결함을 고치고 회귀 시험을 더했다 — 작업 트리 git 을 빌드 계정으로, 계정 사이 git 소유자 검사, `[bootstrap]` 버전 고정 포함. `cargo test --workspace` 143개.
+- ✅ 구현 뒤 객관 리뷰(작업 수명주기·레시피 저장소·Windows 러너·보안)와 셋업 절차 점검에서 나온 결함을 고치고 회귀 시험을 더했다 — 작업 트리 git 을 빌드 계정으로, 계정 사이 git 소유자 검사, `[bootstrap]` 버전 고정 포함. `cargo test --workspace` 149개.
 - ✅ 2026-10-26 실제 Windows 11 PC 한 대(Tailscale 을 사용자 계정으로 쓰는 개인 tailnet)에 docs/setup.md 대로 올렸다 — `cimon setup`, 빌드 계정 모드(로그온·프로필 하이브·`CreateProcessAsUserW`·스윕·작업 트리 git), Windows 서비스, tailnet 너머 Claude Code 호출, 설치기(archive·github-release·uv·rustup·script, `--from`), 실제 프로젝트 빌드·테스트(통과, 산출물 내려받기와 sha256 확인), 레시피 제안·시도 실행·반영. 올리며 나온 결함은 고치고 setup.md 「실제 머신에서 확인한 것」 에 적었다.
 - ⚠️ 아직 돌려 보지 않은 것: 판정·검사 스크립트, fixture, 장시간 작업의 취소·서비스 재시작 중 중단, 리뷰 화면, 외부 백업 사본.

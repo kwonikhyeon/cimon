@@ -184,6 +184,23 @@ fn param_without_default_and_path_rules() {
 }
 
 #[test]
+fn secrets_only_in_env_values() {
+    const R: &str = "projects/example-app/recipe.toml";
+    let mut t = examples();
+    replace(&mut t, R, "GRADLE_OPTS = \"-Dorg.gradle.daemon=false\"\n", "GRADLE_OPTS = \"-Dorg.gradle.daemon=false\"\nREGISTRY_TOKEN = \"${secret.registry}\"\n");
+    replace(&mut t, R, "cwd = \"backend\"\ntimeout_min = 30\ntags = [\"rust\"]", "cwd = \"backend\"\nenv = { CARGO_REGISTRIES_CO_TOKEN = \"Bearer ${secret.cargo-co}\" }\ntimeout_min = 30\ntags = [\"rust\"]");
+    let r = check_tree(&t);
+    assert!(r.ok(), "{:#?}", r.errors);
+    replace(&mut t, R, "\":shared:allTests\", \"--console=plain\"]", "\":shared:allTests\", \"--console=plain\", \"-Ptoken=${secret.registry}\"]");
+    replace(&mut t, R, "REGISTRY_TOKEN = \"${secret.registry}\"", "REGISTRY_TOKEN = \"${secret.Registry}\"");
+    let r = check_tree(&t);
+    let has = |s: &str| r.errors.iter().any(|d| d.message.contains(s));
+    assert!(has("${secret.registry}: a secret may only be an env value"), "{:#?}", r.errors);
+    assert!(has("${secret.Registry}: a secret name is"), "{:#?}", r.errors);
+    assert_eq!(r.errors.len(), 2, "{:#?}", r.errors);
+}
+
+#[test]
 fn layering_holes_are_errors() {
     let mut t = examples();
     let recipe = t.read_str("projects/example-app/recipe.toml").unwrap().to_string();

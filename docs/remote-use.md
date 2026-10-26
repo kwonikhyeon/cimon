@@ -142,7 +142,7 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 | `fail` · `code` | 컴파일 에러, 테스트 실패, 시간 초과 등 | 내 코드를 본다 |
 | `fail` · `request` | 없는 브랜치, 허용 브랜치에서 닿지 않는 커밋 | 요청을 고친다 |
 | `fail`·`inconclusive` · `recipe` | 레시피·판정 스크립트 문제 | 레시피 담당에게, 또는 레시피 제안 |
-| `inconclusive` · `environment` | 툴체인 미설치, 디스크 부족 | 관리자(`cimon provision`) |
+| `inconclusive` · `environment` | 툴체인 미설치, 빌드 비밀 없음, 디스크 부족 | 관리자(`cimon provision`, `cimon build-secret`) |
 | `inconclusive` · `infra` | fetch·다운로드 실패, 서비스 재시작 | 다시 요청, 반복되면 관리자 |
 
 경고(`warnings`)도 읽는다 — warm 슬롯을 다시 만들었다, 빌드 계정에 남은 프로세스를 정리했다 같은 것이 여기 온다.

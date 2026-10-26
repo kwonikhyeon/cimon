@@ -75,6 +75,15 @@ enum Command {
         #[arg(long)]
         remove: bool,
     },
+    /// A credential (stdin) one project's recipe hands its build steps as
+    /// `${secret.<name>}` in an env value, e.g. a package registry token (design §11.6).
+    /// Without a name, lists the secrets.
+    BuildSecret {
+        project: Option<String>,
+        name: Option<String>,
+        #[arg(long)]
+        remove: bool,
+    },
     /// Entry point used by the Windows service control manager.
     #[command(hide = true)]
     Service,
@@ -225,6 +234,10 @@ fn main() -> Result<()> {
         Command::BuildGitToken { url, remove } => {
             let cfg = load_config(&cli.config)?;
             ops::build_git_token(&cfg, url, remove)
+        }
+        Command::BuildSecret { project, name, remove } => {
+            let cfg = load_config(&cli.config)?;
+            ops::build_secret(&cfg, project, name, remove)
         }
         Command::Service => service::run(cli.config.clone()),
         Command::Provision { project, kind, version, recipe_ref, from, admin } => {

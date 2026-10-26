@@ -62,6 +62,22 @@ pub struct Known<'a> {
     pub siblings: Vec<&'a str>,
     pub artifacts: Vec<&'a str>,
     pub allow_value: bool,
+    /// `${secret.x}` — environment values only, so a secret never lands on a command
+    /// line, in a path or in a judge's arguments.
+    pub allow_secret: bool,
+}
+
+/// A name `cimon build-secret` stores and `${secret.<name>}` reads.
+pub fn valid_secret_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars.next().is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'))
+        && name.len() <= 64
+}
+
+/// The secret names `${secret.<name>}` references in `texts` ask for.
+pub fn secret_refs<'a>(texts: impl IntoIterator<Item = &'a String>) -> std::collections::BTreeSet<String> {
+    texts.into_iter().flat_map(|t| refs(t)).filter_map(|r| r.strip_prefix("secret.").map(str::to_string)).collect()
 }
 
 /// Checks one reference against what exists. `Ok` carries the param name for
@@ -81,6 +97,9 @@ pub fn validate_ref(name: &str, k: &Known<'_>) -> Result<Option<String>, String>
         "vars" => Err(format!("unknown variable ${{{name}}} — no [vars] {rest}")),
         "param" if k.params.contains(&rest) => Ok(Some(rest.to_string())),
         "param" => Err(format!("unknown parameter ${{{name}}}")),
+        "secret" if !k.allow_secret => Err(format!("${{{name}}}: a secret may only be an env value — on a command line or in a path it would show up in logs and process lists")),
+        "secret" if valid_secret_name(rest) => Ok(None),
+        "secret" => Err(format!("${{{name}}}: a secret name is [a-z0-9][a-z0-9_-]*")),
         "job" if matches!(rest, "id" | "commit" | "commit_short") => Ok(None),
         "step" if rest == "out" => Ok(None),
         "artifact" if k.artifacts.contains(&rest) => Ok(None),
@@ -126,5 +145,18 @@ mod tests {
         assert!(unterminated("${vars.x"));
         assert!(unterminated("${a} ${b"));
         assert!(!unterminated("${a} $b {c}"));
+    }
+
+    #[test]
+    fn secrets_only_where_allowed() {
+        let vars = BTreeMap::new();
+        let k = |allow_secret| Known { vars: &vars, params: vec![], toolchains: vec![], siblings: vec![], artifacts: vec![], allow_value: false, allow_secret };
+        assert!(validate_ref("secret.artifactory-conan", &k(true)).is_ok());
+        assert!(validate_ref("secret.artifactory-conan", &k(false)).is_err(), "not on a command line");
+        assert!(validate_ref("secret.Artifactory", &k(true)).is_err());
+        assert!(validate_ref("secret.", &k(true)).is_err());
+        assert!(validate_ref("secret.-x", &k(true)).is_err());
+        let texts = ["u ${secret.a}".to_string(), "${secret.b_1}${ws}".to_string(), "${vars.secret}".to_string()];
+        assert_eq!(secret_refs(&texts).into_iter().collect::<Vec<_>>(), vec!["a", "b_1"]);
     }
 }

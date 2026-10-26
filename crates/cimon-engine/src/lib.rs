@@ -4,10 +4,12 @@
 pub mod artifacts;
 pub mod backup;
 pub mod build_git;
+pub mod build_secrets;
 pub mod fixtures;
 pub mod janitor;
 pub mod jobs;
 pub mod proposals;
+mod protected;
 pub mod recipes;
 pub mod result;
 pub mod run;

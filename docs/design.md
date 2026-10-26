@@ -766,6 +766,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
   - GitHub `ssh://`·`git@github.com:` 주소는 https 로 바꾼다(SSH 키가 없다).
   - **등록된 프로젝트의 저장소는 cimon 의 mirror 에서 받는다** — 레시피 트리의 각 프로젝트 `repo`(https 와 두 ssh 표기)를 `url.<mirror>.insteadOf` 로. 자격 증명이 빌드에 들어가지 않고 네트워크를 타지 않는다. cargo 가 `rev` 로 고정한 커밋은 mirror 가 광고하지 않는 객체라 `uploadpack.allowAnySHA1InWant`, 서비스 소유 mirror 를 빌드 계정이 열도록 `safe.directory` 도 함께 둔다(빌드 계정은 mirror 에 쓸 수 없다). mirror 는 그 프로젝트를 마지막으로 받은 만큼 새롭다 — 접수가 작업의 프로젝트와 형제를 받으므로, 의존 저장소를 형제로 두면 늘 최신이다. 더 새 커밋을 원하면 git 이 mirror 경로와 함께 `not our ref` 로 실패한다.
   - 등록되지 않은 비공개 저장소만 관리자가 그 저장소 하나를 읽는 **별도 토큰**을 `cimon build-git-token <저장소 URL>`(표준 입력)로 둔다 — DPAPI 로 `config\build-git.dpapi`, 저장된 URL **에만** HTTP 헤더(`http.<url>.extraheader`)로. 모든 빌드 단계가 볼 수 있으므로 읽기 전용이어야 하고, `doctor --network` 가 접근을 확인한다.
+  - git 이 아닌 도구의 자격 증명(패키지 레지스트리 로그인 등 — Conan 은 `CONAN_LOGIN_USERNAME_<REMOTE>`·`CONAN_PASSWORD_<REMOTE>` 를 읽는다)은 **빌드 비밀**이다. 관리자가 프로젝트 하나에 `cimon build-secret <project> <name>`(표준 입력)로 두면 DPAPI 로 `config\build-secrets.dpapi`, 그 프로젝트의 레시피가 **환경 변수 값에서만** `${secret.<name>}` 으로 넘긴다 — 정적 검사가 명령줄·경로·판정 인자에서는 거절하므로 명령줄·프로세스 목록에 나오지 않는다. 그 변수를 받는 모든 단계(와 그 저장소 코드)가 읽을 수 있고, 도구가 받은 세션 토큰을 홈에 남기면(`conan remote login` → `CONAN_HOME`) 그 홈을 쓰는 뒤 단계도 쓸 수 있으므로 읽기 전용이어야 한다. 단계가 쓰는 비밀이 없으면 그 단계는 `inconclusive`/`environment` 로 끝나고 `cimon build-secret` 명령을 알려 준다. `plan` 은 고른 단계에 필요한 비밀과 있는지를, `doctor` 는 `main` 레시피가 쓰는 비밀이 모두 있는지를 보인다.
   - 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
 - `core.longpaths=true`.
 
@@ -1141,7 +1142,7 @@ login_code_minutes = 5
 ### 16.4 관측 · 정리
 
 - `GET /healthz`: 토큰 없이는 `{"ok": true}` 만. 사용자 토큰(`Authorization: Bearer`)을 붙이면 큐 길이, 실행 중 작업, 디스크 여유, 레시피 `main` 커밋, 마지막 백업과 외부 사본 시각, 경고.
-- `cimon doctor`: base 툴체인, 두 계정과 권한(일괄 작업 로그온 포함), 디스크, GitHub 토큰(만료 14일 전 경고), 레시피 저장소(`git fsck` + `main` 정적 검사), 백업, Tailscale.
+- `cimon doctor`: base 툴체인, 두 계정과 권한(일괄 작업 로그온 포함), 디스크, GitHub 토큰(만료 14일 전 경고), 레시피 저장소(`git fsck` + `main` 정적 검사), `main` 레시피가 쓰는 빌드 비밀(§11.6), 백업, Tailscale.
 - **정리 규칙 — 정본**:
 
 | 대상 | 지우는 때 |

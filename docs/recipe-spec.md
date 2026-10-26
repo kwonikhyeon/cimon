@@ -189,6 +189,20 @@ SOME_PATH = "${ws}/tools"
 
 모든 단계에 들어가는 환경 변수. 변수 확장(§13)을 한다. 서비스는 `CARGO_TARGET_DIR`·`RUSTFLAGS` 를 주지 않는다 — 레시피가 명시하면 주고, 검증 경고를 낸다.
 
+도구가 읽는 자격 증명은 **빌드 비밀**(`${secret.<name>}`, §13)로 넘긴다. 비밀은 환경 변수 값(`[env]`·`[workspace].clean_env`·fixture `env`·단계 `env`)에서만 쓸 수 있다. 그 변수를 받는 단계만 보게 하려면 `[env]` 보다 그 단계의 `env` 에 둔다.
+
+```toml
+[[step]]
+id = "conan-login"
+kind = "setup"
+# 익명 접근을 받는 서버에는 conan 이 스스로 로그인하지 않는다(로그인해야 보이는 패키지는 404) — 먼저 로그인한다
+run = ["conan", "remote", "login", "digitrack"]
+env = { CONAN_LOGIN_USERNAME_DIGITRACK = "cimon-build", CONAN_PASSWORD_DIGITRACK = "${secret.artifactory-conan}" }
+when = "always"
+```
+
+도구가 받은 세션 토큰을 홈에 남기면(위 `conan remote login` 은 `CONAN_HOME` 에) 그 홈을 쓰는 뒤 단계도 그것을 쓸 수 있다 — 비밀은 읽기 전용이어야 한다.
+
 ### 7.2 `[isolate]`
 
 ```toml
@@ -495,6 +509,7 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 | `${toolchain.<kind>.version}` | 정확한 버전 |
 | `${sibling.<project>.root}` · `${sibling.<project>.commit}` | 형제 트리 |
 | `${value}` | `params.*.args` 안에서만 — 그 파라미터 값 |
+| `${secret.<name>}` | 관리자가 `cimon build-secret <project> <name>` 으로 이 프로젝트에 둔 값(design §11.6). **환경 변수 값에서만**. 이름은 `[a-z0-9][a-z0-9_-]*`. 없으면 그 단계가 `inconclusive`/`environment` |
 
 ---
 
@@ -536,7 +551,7 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 |---|---|
 | schema·모르는 키·타입 | `timeot_min` |
 | 참조 | 모르는 프리셋, 카탈로그에 없는 툴체인 종류, 모르는 `after`·`fixture`·`uses`·`applies_to`·`requires_artifacts`, 등록되지 않은 형제 프로젝트 |
-| 변수 | 모르는 `${…}`, 닫히지 않은 `${`, 값 없는(`default` 없는) 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}`, `[env]` 에서 단계마다 다른 값(`${param.*}`·`${artifact.*}`·`${step.out}`) |
+| 변수 | 모르는 `${…}`, 닫히지 않은 `${`, 값 없는(`default` 없는) 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}`, `[env]` 에서 단계마다 다른 값(`${param.*}`·`${artifact.*}`·`${step.out}`), 환경 변수 값 밖의 `${secret.*}`, 형식에 맞지 않는 비밀 이름 |
 | 파라미터 | `applies_to` 없음, 소비처(`env`·`args`·`${param.x}`) 없음 |
 | 순환 | `after` 순환 |
 | 중복 | include 끼리 같은 step id, 산출물 이름 중복 |

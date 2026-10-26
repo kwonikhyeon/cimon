@@ -243,3 +243,45 @@ async fn a_push_is_built_not_an_old_result() {
     assert_eq!(v2["verdict"], "pass");
     c.cancel().await.unwrap();
 }
+
+/// A build secret reaches the step through the env value the recipe wrote — and a
+/// missing one is the admin's to fix, not a code failure (design §11.6).
+#[tokio::test]
+async fn build_secret_reaches_the_step_env() {
+    const P: &str = "m2secret";
+    repos_dir();
+    make_repo(P, &[("show.cmd", "@echo off\r\nif \"%REG_TOKEN%\"==\"Bearer s3cr3t-value\" (echo token ok) else (echo token wrong & exit /b 1)\r\n")]);
+    let mut t = MemTree::new();
+    t.insert("toolchains.toml", "schema = 1\n");
+    t.insert(
+        format!("projects/{P}/project.toml"),
+        format!("schema = 1\nid = \"{P}\"\nrepo = \"https://example.invalid/{P}.git\"\nallowed_refs = [\"main\"]\ndefault_ref = \"main\"\nmax_job_minutes = 10\n"),
+    );
+    t.insert(
+        format!("projects/{P}/recipe.toml"),
+        "schema = 1\n[[step]]\nid = \"build\"\nkind = \"build\"\nrun = [\"./show.cmd\"]\nenv = { REG_TOKEN = \"Bearer ${secret.registry}\" }\nuncounted = true\n",
+    );
+    let h = Harness::start("").await;
+    h.app.recipes.import_init(&t, "admin-a", "init").unwrap();
+    let c = h.task_client(&h.member_token).await;
+
+    let (plan, _) = call_any(&c, "plan", json!({"project": P, "tool": "build"})).await;
+    assert!(plan["secrets"][0]["state"].as_str().unwrap().contains("cimon build-secret m2secret registry"), "{plan:#}");
+    let task = start_task(&c, "build", json!({"project": P})).await;
+    let (_, v, _) = wait_task(&c, &task, 120).await;
+    assert_eq!(v["verdict"], "inconclusive", "{v:#}");
+    assert_eq!(v["failure_class"], "environment", "{v:#}");
+    assert!(v["summary"].as_str().unwrap().contains("cimon build-secret m2secret registry"), "{v:#}");
+
+    let mut secrets = cimon_engine::build_secrets::Secrets::new();
+    secrets.entry(P.to_string()).or_default().insert("registry".into(), "s3cr3t-value".into());
+    cimon_engine::build_secrets::save(&h.app.layout, &secrets).unwrap();
+    let (plan, _) = call_any(&c, "plan", json!({"project": P, "tool": "build"})).await;
+    assert_eq!(plan["secrets"][0]["state"], "있음", "{plan:#}");
+    let task = start_task(&c, "build", json!({"project": P})).await;
+    let (_, v, _) = wait_task(&c, &task, 120).await;
+    assert_eq!(v["verdict"], "pass", "{v:#}");
+    let (log, _) = call_any(&c, "job_log", json!({"job": v["job_id"], "step": "build"})).await;
+    assert!(log["log"].as_str().unwrap().contains("token ok"), "{log:#}");
+    c.cancel().await.unwrap();
+}

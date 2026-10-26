@@ -137,6 +137,14 @@ Get-Clipboard | & $c build-git-token https://github.com/<org>/<repo>.git   # URL
 & $c build-git-token                                                       # 등록된 URL 목록
 ```
 
+git 이 아닌 도구가 **자기 자격 증명**을 요구하는 프로젝트(사내 Conan·npm 레지스트리 등 — 레시피가 `${secret.<name>}` 으로 쓴다)는 그 프로젝트에 **빌드 비밀**을 둔다. `plan` 의 `secrets`, `doctor` 의 `build secret` 이 무엇이 필요한지 보인다. 그 변수를 받는 단계가 모두 읽을 수 있으니 **읽기 전용** 토큰(예: 레지스트리를 읽기만 하는 전용 사용자의 토큰)을 쓴다.
+
+```powershell
+Get-Clipboard | & $c build-secret <project> <name>      # 예: build-secret dotori_rcs artifactory-conan
+& $c build-secret                                       # 저장된 비밀 목록(값은 보이지 않는다)
+& $c build-secret <project> <name> --remove
+```
+
 ## 7. 레시피 들여오기
 
 사내 레시피 폴더(처음 내용)를 빌드 머신으로 옮긴 뒤:
