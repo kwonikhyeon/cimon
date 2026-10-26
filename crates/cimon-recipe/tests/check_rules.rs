@@ -29,6 +29,25 @@ fn examples_pass() {
 }
 
 #[test]
+fn ignore_version_files_rules() {
+    const R: &str = "projects/example-app/recipe.toml";
+    const BASE: &str = "rust        = { version_file = \"backend/rust-toolchain.toml\" }";
+    let with = |line: &str| {
+        let mut t = examples();
+        replace(&mut t, R, BASE, line);
+        check_tree(&t)
+    };
+    let r = with("rust = { version_file = \"backend/rust-toolchain.toml\", ignore_version_files = [\"tools/pack/rust-toolchain.toml\"] }");
+    assert!(r.ok(), "{:#?}", r.errors);
+    let r = with("rust = { version_file = \"backend/rust-toolchain.toml\", ignore_version_files = [\"backend/rust-toolchain.toml\"] }");
+    assert!(r.errors.iter().any(|d| d.message.contains("cannot name version_file")), "{:#?}", r.errors);
+    let r = with("rust = { version_file = \"backend/rust-toolchain.toml\", ignore_version_files = [\"../other/rust-toolchain.toml\"] }");
+    assert!(r.errors.iter().any(|d| d.message.contains("must be a relative path")), "{:#?}", r.errors);
+    let r = with("rust = { version = \"1.94.0\", ignore_version_files = [\"tools/pack/rust-toolchain.toml\"] }");
+    assert!(r.errors.iter().any(|d| d.message.contains("only goes with version_file")), "{:#?}", r.errors);
+}
+
+#[test]
 fn version_any_expect_must_be_literal() {
     let mut t = examples();
     replace(&mut t, "toolchains.toml", "expect = \"GNU bash, version\"", "expect = \"GNU bash, version {version_probe}\"");

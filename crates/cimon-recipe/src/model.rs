@@ -116,6 +116,11 @@ pub struct ToolchainReq {
     pub version: Option<String>,
     #[serde(default)]
     pub version_file: Option<String>,
+    /// Other `rust-toolchain.toml` files in the repository that may pin a different
+    /// version: the job builds with `version_file`'s and says so in its warnings.
+    /// Empty is left out of the serialized form, so existing recipes hash the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_version_files: Vec<String>,
     #[serde(default)]
     pub min: Option<String>,
     #[serde(default)]

@@ -341,6 +341,9 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
                 cx.err_recipe(kind, format!("toolchain {kind}: base kinds take min, not version"));
             }
         } else {
+            if req.version_file.is_none() && !req.ignore_version_files.is_empty() {
+                cx.err_recipe(kind, format!("toolchain {kind}: ignore_version_files only goes with version_file"));
+            }
             match (&req.version, &req.version_file) {
                 (Some(v), None) => {
                     if !exact.is_match(v) {
@@ -352,6 +355,13 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
                         cx.err_recipe(kind, format!("toolchain {kind}: version_file is only supported for rust"));
                     } else if !is_safe_rel(f) || !(f.ends_with("rust-toolchain.toml") || f.ends_with("rust-toolchain")) {
                         cx.err_recipe(kind, format!("toolchain {kind}: version_file must be a relative path to rust-toolchain.toml"));
+                    }
+                    for g in &req.ignore_version_files {
+                        if !is_safe_rel(g) || !(g.ends_with("rust-toolchain.toml") || g.ends_with("rust-toolchain")) {
+                            cx.err_recipe(kind, format!("toolchain {kind}: ignore_version_files entry {g:?} must be a relative path to a rust-toolchain file"));
+                        } else if g == f {
+                            cx.err_recipe(kind, format!("toolchain {kind}: ignore_version_files cannot name version_file itself"));
+                        }
                     }
                 }
                 (Some(_), Some(_)) => cx.err_recipe(kind, format!("toolchain {kind}: give version or version_file, not both")),

@@ -35,6 +35,9 @@ pub struct JobPlan {
     pub versions: BTreeMap<String, String>,
     pub siblings: Vec<SiblingPin>,
     pub repo: String,
+    /// Intake findings the job result repeats as warnings (an ignored version file).
+    #[serde(default)]
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -377,14 +380,16 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
         Err(e) => return fail_intake(app, id, Verdict::Inconclusive, FailureClass::Infra, "git_error", &e.to_string()),
     };
     let mut versions = BTreeMap::new();
+    let mut notes = vec![];
     for kind in &plan.toolchains {
         let Some(req) = resolved.toolchains.get(kind) else { continue };
         if let Some(v) = &req.version {
             versions.insert(kind.clone(), v.clone());
         } else if let Some(f) = &req.version_file {
-            match read_version_file(&mirror, &commit, f, &tracked) {
-                Ok(v) => {
+            match read_version_file(&mirror, &commit, f, &tracked, &req.ignore_version_files) {
+                Ok((v, n)) => {
                     versions.insert(kind.clone(), v);
+                    notes.extend(n);
                 }
                 Err((code, msg)) => return fail_intake(app, id, Verdict::Fail, FailureClass::Recipe, code, &msg),
             }
@@ -394,7 +399,7 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
         return fail_intake(app, id, Verdict::Fail, FailureClass::Recipe, "glob_matches_tracked", &msg);
     }
 
-    let job_plan = JobPlan { plan: plan.clone(), versions, siblings: siblings.clone(), repo: project.repo.clone() };
+    let job_plan = JobPlan { plan: plan.clone(), versions, siblings: siblings.clone(), repo: project.repo.clone(), notes };
     let merge_key = merge_key(&job, &commit, &siblings, &plan, request.args.clean, &request.args);
     let _ = app.store.set_intake(id, &commit, &serde_json::to_string(&siblings).unwrap(), &serde_json::to_string(&job_plan).unwrap(), &merge_key);
     let _ = app.store.set_excluded(id, &plan.excluded);
@@ -471,8 +476,10 @@ fn merge_key(job: &cimon_store::JobRow, commit: &str, siblings: &[SiblingPin], p
 }
 
 /// `version_file` (recipe-spec §5): read at the pinned commit; every other
-/// `rust-toolchain.toml` in the repository must agree.
-fn read_version_file(mirror: &Mirror, commit: &str, path: &str, tracked: &[String]) -> Result<String, (&'static str, String)> {
+/// `rust-toolchain.toml` in the repository must agree, except those the recipe lists in
+/// `ignore_version_files` — returned as notes the job result repeats, so building them
+/// with this version is never silent.
+fn read_version_file(mirror: &Mirror, commit: &str, path: &str, tracked: &[String], ignore: &[String]) -> Result<(String, Vec<String>), (&'static str, String)> {
     let Some(bytes) = mirror.show(commit, path) else {
         return Err(("version_file_missing", format!("{path} does not exist at {}", &commit[..10])));
     };
@@ -481,19 +488,32 @@ fn read_version_file(mirror: &Mirror, commit: &str, path: &str, tracked: &[Strin
     if !exact.is_match(&v) {
         return Err(("version_file_mismatch", format!("{path}: channel {v:?} is not an exact version")));
     }
+    let mut notes = vec![];
     for other in tracked {
         let name = other.rsplit('/').next().unwrap_or(other);
         if other != path && (name == "rust-toolchain.toml" || name == "rust-toolchain") {
             if let Some(b) = mirror.show(commit, other) {
                 if let Ok(ov) = parse_toolchain_channel(&b) {
                     if ov != v {
-                        return Err(("version_file_mismatch", format!("rust-toolchain files disagree: {path} = {v}, {other} = {ov}")));
+                        if ignore.iter().any(|i| i == other) {
+                            notes.push(format!("{other} 은 {ov} 를 고정하지만 레시피의 ignore_version_files 에 있어 {v}({path})로 짓는다"));
+                            continue;
+                        }
+                        return Err((
+                            "version_file_mismatch",
+                            format!("rust-toolchain files disagree: {path} = {v}, {other} = {ov} — if that is intended, list {other} in the recipe's ignore_version_files"),
+                        ));
                     }
                 }
             }
         }
     }
-    Ok(v)
+    for i in ignore {
+        if !tracked.iter().any(|t| t == i) {
+            notes.push(format!("ignore_version_files 의 {i} 가 이 커밋에 없다 — 레시피에서 지워도 된다"));
+        }
+    }
+    Ok((v, notes))
 }
 
 /// The channel of a `rust-toolchain.toml` / `rust-toolchain` file.
@@ -662,6 +682,36 @@ pub fn now_str() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_version_files_must_agree_unless_listed() {
+        let d = tempfile::tempdir().unwrap();
+        let w = d.path().join("w");
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git").arg("-C").arg(&w).args(["-c", "user.name=t", "-c", "user.email=t@t"]).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        for (p, v) in [("eb/rust-toolchain.toml", "1.94.0"), ("tools/pack/rust-toolchain.toml", "1.91.1")] {
+            let f = w.join(p);
+            std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+            std::fs::write(f, format!("[toolchain]\nchannel = \"{v}\"\n")).unwrap();
+        }
+        std::process::Command::new("git").args(["init", "-q", "-b", "main"]).arg(&w).status().unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "two pins"]);
+        let commit = git(&["rev-parse", "HEAD"]);
+        let mirror = Mirror::fetch(&d.path().join("m.git"), &w.to_string_lossy().replace('\\', "/")).unwrap();
+        let tracked = mirror.tracked(&commit).unwrap();
+        let (code, msg) = read_version_file(&mirror, &commit, "eb/rust-toolchain.toml", &tracked, &[]).unwrap_err();
+        assert_eq!(code, "version_file_mismatch");
+        assert!(msg.contains("ignore_version_files"), "the refusal says how to allow it: {msg}");
+        let ignore = ["tools/pack/rust-toolchain.toml".to_string(), "gone/rust-toolchain.toml".to_string()];
+        let (v, notes) = read_version_file(&mirror, &commit, "eb/rust-toolchain.toml", &tracked, &ignore).unwrap();
+        assert_eq!(v, "1.94.0");
+        assert!(notes.iter().any(|n| n.contains("tools/pack/rust-toolchain.toml") && n.contains("1.91.1")), "{notes:?}");
+        assert!(notes.iter().any(|n| n.contains("gone/rust-toolchain.toml")), "a stale entry is reported: {notes:?}");
+    }
 
     #[test]
     fn toolchain_channel() {

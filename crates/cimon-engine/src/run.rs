@@ -153,7 +153,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         }
     };
     let commit = job.commit_sha.clone().unwrap_or_default();
-    let mut warnings: Vec<Warning> = vec![];
+    let mut warnings: Vec<Warning> = plan.notes.iter().map(|n| Warning::new("toolchain", n.clone())).collect();
     let build = app.build_account();
     if build.is_some() {
         sweep(app, &mut warnings, "시작 전");

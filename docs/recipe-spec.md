@@ -149,7 +149,8 @@ msvc    = { min = "17.11", components = ["Microsoft.VisualStudio.Component.VC.To
 | 필드 | 뜻 |
 |---|---|
 | `version` | 정확한 버전. managed 종류에 필수(`version_file` 이 없을 때) |
-| `version_file` | 저장소 안의 파일에서 버전을 읽는다(접수 때 `git show` 로 — 접수 검사, §15.2). 지금은 `rust-toolchain.toml` 의 `toolchain.channel` 만 지원하고, 그 값도 정확한 버전이어야 한다. 파일이 없거나, **저장소 안의 다른 `rust-toolchain.toml` 이 다른 버전을 적고 있으면** 작업은 `fail`/`recipe` 다(한 작업이 둘 중 하나로 조용히 지어지지 않게) |
+| `version_file` | 저장소 안의 파일에서 버전을 읽는다(접수 때 `git show` 로 — 접수 검사, §15.2). 지금은 `rust-toolchain.toml` 의 `toolchain.channel` 만 지원하고, 그 값도 정확한 버전이어야 한다. 파일이 없거나, **저장소 안의 다른 `rust-toolchain.toml` 이 다른 버전을 적고 있으면** 작업은 `fail`/`recipe` 다(한 작업이 둘 중 하나로 조용히 지어지지 않게 — 단계는 `RUSTUP_TOOLCHAIN` 으로 이 버전 하나를 쓴다) |
+| `ignore_version_files` | `version_file` 과 함께만. 다른 버전을 일부러 고정한 `rust-toolchain.toml` 경로 목록(예: 다른 저장소의 툴체인을 따라가는 하위 도구) — 그 파일은 비교하지 않고, 작업은 `version_file` 의 버전으로 지으며 결과의 경고에 무시한 파일과 버전을 적는다. 목록의 파일이 그 커밋에 없으면 경고 |
 | `min` | base 종류의 최소 버전 |
 | `packages` | `python` 전용 — 정확한 버전의 패키지 목록(`name==x.y.z`, extras 허용 — 옵션·URL·경로는 오류). `(python 버전, 패키지 목록)` 마다 uv 가상 환경을 하나 만든다 |
 | `components` 등 | 종류별 추가 필드 — 카탈로그 정의를 따른다(§16) |
@@ -555,7 +556,7 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 
 | 검사 | 실패하면 |
 |---|---|
-| `version_file` 이 그 커밋에 있고, 정확한 버전이고, 저장소 안의 다른 `rust-toolchain.toml` 과 같은가 | `fail`/`recipe`(`version_file_missing`·`version_file_mismatch`) |
+| `version_file` 이 그 커밋에 있고, 정확한 버전이고, 저장소 안의 다른 `rust-toolchain.toml`(`ignore_version_files` 제외)과 같은가 | `fail`/`recipe`(`version_file_missing`·`version_file_mismatch`) |
 | 요청된 산출물 glob·`junit` `reports` glob 이 git 추적 파일에 맞지 않는가 | `fail`/`recipe`(`glob_matches_tracked`) |
 | base 툴체인 — `vswhere`·`path_from`(`cimon.toml [base]`)·`sdkmanager` | `inconclusive`/`environment`(`base_missing`, 빠진 목록과 `hint`) |
 | managed 툴체인이 설치돼 있거나 자동 설치가 허용되는가, 시도 브랜치의 카탈로그 항목이 설치돼 있는가(§16.5) | `inconclusive`/`environment`(`toolchain_not_provisioned`) |
