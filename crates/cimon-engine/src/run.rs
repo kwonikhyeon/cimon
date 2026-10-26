@@ -1044,6 +1044,10 @@ impl JobCtx<'_> {
                 }
             }
         }
+        // git credentials for private dependencies (design §11.6) — after the recipe's
+        // layers, which it adds to rather than replaces
+        let tokens = crate::build_git::load(&app.layout)?;
+        crate::build_git::apply(&tokens, &mut env);
         Ok(env)
     }
 }

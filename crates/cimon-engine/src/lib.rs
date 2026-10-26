@@ -3,6 +3,7 @@
 
 pub mod artifacts;
 pub mod backup;
+pub mod build_git;
 pub mod fixtures;
 pub mod janitor;
 pub mod jobs;

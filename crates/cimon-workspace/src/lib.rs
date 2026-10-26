@@ -231,8 +231,17 @@ impl Mirror {
 /// Passed through `GIT_CONFIG_*` variables so it never appears in a process command
 /// line or a config file. Existing `GIT_CONFIG_COUNT` entries are kept.
 pub fn auth_env(token: &str) -> Vec<(String, String)> {
-    use std::fmt::Write;
     let start: usize = std::env::var("GIT_CONFIG_COUNT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    vec![
+        ("GIT_CONFIG_COUNT".into(), (start + 1).to_string()),
+        (format!("GIT_CONFIG_KEY_{start}"), "http.https://github.com/.extraheader".into()),
+        (format!("GIT_CONFIG_VALUE_{start}"), format!("AUTHORIZATION: basic {}", basic_auth(token))),
+    ]
+}
+
+/// The HTTP basic credentials GitHub takes for a token, base64-encoded.
+pub fn basic_auth(token: &str) -> String {
+    use std::fmt::Write;
     let mut b64 = String::new();
     let raw = format!("x-access-token:{token}");
     // minimal base64 (standard alphabet, padded)
@@ -247,11 +256,7 @@ pub fn auth_env(token: &str) -> Vec<(String, String)> {
             }
         }
     }
-    vec![
-        ("GIT_CONFIG_COUNT".into(), (start + 1).to_string()),
-        (format!("GIT_CONFIG_KEY_{start}"), "http.https://github.com/.extraheader".into()),
-        (format!("GIT_CONFIG_VALUE_{start}"), format!("AUTHORIZATION: basic {b64}")),
-    ]
+    b64
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

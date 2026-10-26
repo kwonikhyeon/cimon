@@ -241,6 +241,53 @@ fn bootstrap(dir: &Path, rustup: Option<&str>, uv: Option<&str>) -> Result<()> {
 
 /// `cimon github-token`: stores the GitHub read token DPAPI-encrypted in `config\`.
 pub fn github_token(cfg: &Config) -> Result<()> {
+    let token = read_token_line()?;
+    let token = token.as_str();
+    let layout = Layout::new(&cfg.paths.root);
+    std::fs::create_dir_all(layout.config_dir())?;
+    let p = layout.config_dir().join("github-token.dpapi");
+    #[cfg(windows)]
+    std::fs::write(&p, cimon_runner::win::protect(token.as_bytes())?)?;
+    #[cfg(not(windows))]
+    std::fs::write(&p, token)?;
+    println!("stored in {} — readable only through this machine's DPAPI and the config ACL", p.display());
+    Ok(())
+}
+
+/// `cimon build-git-token` (design §11.6): a token build steps send to one repository.
+/// Without a URL, lists the URLs that have one.
+pub fn build_git_token(cfg: &Config, url: Option<String>, remove: bool) -> Result<()> {
+    let layout = Layout::new(&cfg.paths.root);
+    let mut tokens = cimon_engine::build_git::load(&layout).map_err(|e| anyhow::anyhow!(e))?;
+    let Some(url) = url else {
+        if tokens.is_empty() {
+            eprintln!("no build git tokens");
+        }
+        for u in tokens.keys() {
+            println!("{u}");
+        }
+        return Ok(());
+    };
+    if !cimon_engine::build_git::valid_url(&url) {
+        bail!("{url:?} is not a repository URL — https://<host>/<owner>/<repo>[.git], exactly as the build fetches it after ssh → https");
+    }
+    if remove {
+        if tokens.remove(&url).is_none() {
+            bail!("there is no token for {url}");
+        }
+        cimon_engine::build_git::save(&layout, &tokens).map_err(|e| anyhow::anyhow!(e))?;
+        eprintln!("removed the token for {url}");
+        return Ok(());
+    }
+    let token = read_token_line()?;
+    tokens.insert(url.clone(), token);
+    cimon_engine::build_git::save(&layout, &tokens).map_err(|e| anyhow::anyhow!(e))?;
+    eprintln!("build steps now send this token to {url} only — every build step can read it, so make it read-only for that one repository");
+    Ok(())
+}
+
+/// One token line from stdin, checked to look like a token.
+fn read_token_line() -> Result<String> {
     let mut token = String::new();
     std::io::stdin().read_line(&mut token)?;
     // PowerShell puts a UTF-8 BOM in front of what it pipes to a program; a token
@@ -252,15 +299,7 @@ pub fn github_token(cfg: &Config) -> Result<()> {
     if !token.chars().all(|c| c.is_ascii_graphic()) {
         bail!("that is not a GitHub token (it has spaces or non-ASCII characters) — give the token alone on one line");
     }
-    let layout = Layout::new(&cfg.paths.root);
-    std::fs::create_dir_all(layout.config_dir())?;
-    let p = layout.config_dir().join("github-token.dpapi");
-    #[cfg(windows)]
-    std::fs::write(&p, cimon_runner::win::protect(token.as_bytes())?)?;
-    #[cfg(not(windows))]
-    std::fs::write(&p, token)?;
-    println!("stored in {} — readable only through this machine's DPAPI and the config ACL", p.display());
-    Ok(())
+    Ok(token.to_string())
 }
 
 /// `cimon drain`: new jobs are refused; returns once nothing runs (design §16.6).
@@ -347,6 +386,28 @@ pub fn doctor(cfg: &Config, network: bool) -> Result<usize> {
                     }
                 }
                 Err(e) => report(false, "recipes main", e.to_string()),
+            }
+        }
+    }
+    match cimon_engine::build_git::load(&layout) {
+        Err(e) => report(false, "build git tokens", e),
+        Ok(tokens) => {
+            for (url, token) in &tokens {
+                if !network {
+                    report(true, &format!("build git token for {url}"), "check access with --network".into());
+                    continue;
+                }
+                // as a build step sends it: the one header, no credential helper
+                let mut env = std::collections::BTreeMap::new();
+                cimon_engine::build_git::apply(&std::iter::once((url.clone(), token.clone())).collect(), &mut env);
+                let ok = std::process::Command::new("git")
+                    .args(["-c", "credential.helper=", "ls-remote", "--heads", url])
+                    .envs(&env)
+                    .env("GIT_TERMINAL_PROMPT", "0")
+                    .output()
+                    .map(|o| o.status.success())
+                    .unwrap_or(false);
+                report(ok, &format!("build git access to {url}"), String::new());
             }
         }
     }

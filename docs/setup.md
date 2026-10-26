@@ -22,6 +22,12 @@ $c = "C:\Program Files\cimon\cimon.exe"
 
 **base 툴체인** — 레시피 저장소 카탈로그(`toolchains.toml`)의 `tier = "base"` 항목이다. 관리자가 미리 설치하고 cimon 은 검사만 한다(design §10.2). 흔히 Visual Studio Build Tools(C++ 워크로드 + Windows SDK), Git for Windows 등이다. 빠진 것은 9단계의 `cimon doctor` 가 프로젝트별로 알려 준다.
 
+base 도구가 **관리자 계정의 사용자 폴더**에 깔려 있으면(Android Studio 의 SDK 는 `%LOCALAPPDATA%\Android\Sdk`, 사용자용 Inno Setup 은 `%LOCALAPPDATA%\Programs\Inno Setup 6`) 빌드 계정이 읽지 못한다. 4단계 setup 뒤에 그 폴더에만 읽기 권한을 준다 — `doctor` 는 관리자로 돌아서 이 문제를 잡지 못한다.
+
+```powershell
+icacls "<그 폴더>" /grant "cimon-build:(OI)(CI)RX"
+```
+
 cimon 자신이 쓰는 것은 **Git for Windows 2.40 이상**(시스템 PATH)이다.
 
 ```powershell
@@ -36,7 +42,11 @@ git config --system core.longpaths true
    - MagicDNS·HTTPS 인증서를 켠다.
    - ACL 을 design §15.3 초안대로: 기본 「모두 → 모두」 규칙을 지우고, `tag:cimon` 에서 나가는 grant 는 두지 않는다.
 3. `tailscale serve --bg --https=443 http://127.0.0.1:8770` — 재부팅 뒤에도 유지된다.
-4. **Funnel 은 켜지 않는다.** 서비스는 시작할 때 `tailscale serve status --json` 으로 Funnel 이 꺼졌는지 확인하고, 켜져 있거나 확인하지 못하면 시작을 거부한다. 그래서 이 단계를 서비스 시작보다 먼저 끝낸다.
+4. **Funnel 은 켜지 않는다.** 서비스는 시작할 때 `tailscale serve status --json` 으로 Funnel 이 꺼졌는지 확인하고, 켜져 있으면 시작을 거부한다. 그래서 이 단계를 서비스 시작보다 먼저 끝낸다.
+5. **Windows 에서 Tailscale 이 사용자 계정으로 로그인돼 있으면** Tailscale 은 그 사용자에게만 답한다 — 서비스 계정의 조회는 `401 Unauthorized: Tailscale already in use by <사용자>` 로 거절되고, 서비스는 Funnel 을 확인할 수 없어 시작하지 않는다. 그런 머신에서는 `cimon.toml` 에 `[tailscale] allow_unverified_funnel = true` 를 두고 대신 이렇게 보장한다.
+   - tailnet 정책(Access controls)에 이 기기용 `funnel` 노드 속성(`"nodeAttrs"` 의 `"attr": ["funnel"]`)을 두지 않는다 — 그러면 Funnel 자체를 켤 수 없다. 관리 콘솔 JSON 편집기 오른쪽에 「Add Funnel to policy」 가 보이면 정책에 없는 것이다(누르지 않는다).
+   - `cimon doctor` 를 Tailscale 이 로그인된 그 사용자(관리자 PowerShell)로 돌리면 Funnel 을 실제로 확인한다.
+   - 서비스는 확인하지 못했다는 경고를 로그와 `/healthz` 에 계속 싣는다. 켜진 것이 보이면 이 설정과 상관없이 거부한다.
 
 ## 2. cimon.exe 배치
 
@@ -47,7 +57,13 @@ git config --system core.longpaths true
 
 ## 3. 설정 파일
 
-`D:\cimon\config\cimon.toml` 을 먼저 쓴다(setup 이 읽는다). 위치를 바꾸려면 모든 명령에 `--config <경로>` 나 환경 변수 `CIMON_CONFIG`. 여기 없는 키의 기본값과 설명은 design §14.
+`D:\cimon\config\cimon.toml` 을 먼저 쓴다(setup 이 읽는다). 여기 없는 키의 기본값과 설명은 design §14.
+
+다른 위치(예: `D:` 가 없어 `C:\cimon`)에 두면 setup 을 `--config <경로>` 로 돌린다 — 서비스에는 그 경로가 박힌다. CLI 가 매번 찾도록 기계 전체 환경 변수도 둔다(새로 연 PowerShell 부터 적용).
+
+```powershell
+[Environment]::SetEnvironmentVariable('CIMON_CONFIG', 'C:\cimon\config\cimon.toml', 'Machine')
+```
 
 ```toml
 [server]
@@ -89,9 +105,10 @@ offsite = 'E:\cimon-backup'                  # 빌드 머신 밖 사본. 안 두
 2. Windows 서비스 `cimon` 등록(`NT SERVICE\cimon`, 자동 시작, 실패 시 재시작)
 3. 산출물 링크 서명 키 `config\link.key`
 4. 빌드 계정 `cimon-build` — 무작위 비밀번호, 만료 없음, `config\build-account.dpapi` 에 DPAPI(머신 범위)로 저장
-5. 권한 — 빌드 계정: 「일괄 작업으로 로그온」. 서비스 계정: 「서비스로 로그온」·프로세스 토큰 바꾸기·메모리 할당량 조정·백업·복원(`LoadUserProfile` 이 요구한다, design §9.2)
-6. ACL(design §5) — 서비스는 전부, 빌드 계정은 `ws`·`caches`·`homes`·`tmp` 쓰기, `mirrors`·`toolchains`·`recipes`·`artifacts` 읽기, 나머지는 접근 불가
-7. `[bootstrap]` 버전의 rustup·uv 를 `toolchains\_bootstrap\` 에(체크섬 확인)
+5. 권한 — 빌드 계정: 「일괄 작업으로 로그온」. 서비스 계정: 「서비스로 로그온」·프로세스 토큰 바꾸기·메모리 할당량 조정·백업·복원(빌드 계정 프로필 하이브를 올리는 데 쓴다, design §9.2)
+6. 빌드 계정 프로필 — 사용자 프로필 서비스는 관리자의 호출에만 프로필을 만들어 준다. setup(관리자)이 한 번 만들어 두고, 서비스는 그 하이브를 올려 쓴다
+7. ACL(design §5) — 서비스는 전부, 빌드 계정은 `ws`·`caches`·`homes`·`tmp` 쓰기, `mirrors`·`toolchains`·`recipes`·`artifacts` 읽기, 루트 폴더 자체는 목록만(위로 올라가며 폴더를 읽는 빌드 도구 때문), 나머지는 접근 불가
+8. `[bootstrap]` 버전의 rustup·uv 를 `toolchains\_bootstrap\` 에(체크섬 확인)
 
 ## 5. 빌드 계정 아웃바운드 제한 (수동)
 
@@ -104,8 +121,16 @@ setup 이 자동화하지 않는다. Windows 방화벽(또는 WFP)으로 `cimon-
 & $c token create <이름> --admin      # 사용자 토큰은 이때 한 번만 보인다
 ```
 
-- GitHub 토큰은 등록할 저장소만 읽는 **fine-grained 토큰**(Contents·Metadata 읽기)이다. 서비스가 fetch 할 때만 쓰고, 빌드 계정에는 넘기지 않는다.
-- `echo <토큰> | cimon github-token` 처럼 넘기지 않는다 — PowerShell 명령 기록에 남는다.
+- GitHub 토큰은 등록할 저장소만 읽는 **fine-grained 토큰**(Contents·Metadata 읽기)이 낫다. classic 토큰·`gh` 로그인 토큰도 되지만 `repo` 범위라 접근할 수 있는 모든 비공개 저장소에 쓰기까지 된다. 서비스가 fetch 할 때만 쓰고, 빌드 계정에는 넘기지 않는다.
+- `echo <토큰> | cimon github-token` 처럼 넘기지 않는다 — PowerShell 명령 기록에 남는다. 클립보드나 `gh` 에서 바로 파이프하면 남지 않는다: `Get-Clipboard | & $c github-token` 또는 `gh auth token | & $c github-token`(PowerShell 이 앞에 붙이는 BOM 은 cimon 이 뗀다).
+- `doctor --network` 의 `GitHub access` 가 모두 OK 여야 한다.
+
+빌드 중에 **비공개 저장소를 git 으로 받는** 프로젝트(cargo `git` 의존성 등 — 레시피 저장소의 프로젝트 노트에 적혀 있다)는 빌드 계정에도 그 저장소 하나만 읽는 토큰이 필요하다. 모든 빌드 단계가 볼 수 있으니 fine-grained 로 그 저장소의 Contents 읽기만 준다.
+
+```powershell
+Get-Clipboard | & $c build-git-token https://github.com/<org>/<repo>.git   # URL 은 빌드가 받는 주소 그대로(ssh 주소는 https 로 바뀐 뒤의 모양)
+& $c build-git-token                                                       # 등록된 URL 목록
+```
 
 ## 7. 레시피 들여오기
 
@@ -167,11 +192,10 @@ sc.exe stop cimon
 sc.exe start cimon                       # 시작할 때 drain 표시를 지운다
 ```
 
-## 실제 머신에서 아직 확인하지 않은 것
+## 실제 머신에서 확인한 것
 
-개발 PC 의 단일 계정 모드 시험만 거쳤다(README 「검증 상태」). 처음 올릴 때 특히 볼 것:
+2026-10-26, Tailscale 을 사용자 계정으로 쓰는 Windows 11 PC 한 대(`C:\cimon`, 개인 tailnet)에 이 절차대로 올렸다.
 
-- 빌드 계정 모드 — 서비스 계정의 `LoadUserProfile`(백업·복원 권한), `CreateProcessAsUserW`, 빈 `lpDesktop`, 작업 끝 스윕, 작업 트리 git 을 빌드 계정으로 돌리기
-- `cimon setup` 의 실제 실행 — 계정 생성, LSA 권한, ACL, 서비스 등록
-- 서비스 계정이 `tailscale serve status --json` 을 실행할 수 있는지 — 못 하면 서비스가 시작을 거부한다
-- rustup·uv·script 설치기의 실제 다운로드
+- 확인함: setup 전 단계(계정·권한·서비스 등록·ACL·bootstrap), 빌드 계정 로그온, 서비스 기동, tailnet 에서 `/healthz`·토큰 거절(401), Claude Code 로 `list_projects`, archive·github-release·uv·rustup 설치기, script 설치기를 빌드 계정으로 실행, 작업 하나를 빌드 계정으로 끝까지(시작 스윕 → 작업 트리 git → setup·build 단계 → 결과·경고).
+- 올리며 고친 것: 서비스 시작 실패가 로그에 남지 않던 것, 서비스 계정의 Tailscale 조회 거절(위 1단계 5), `LoadUserProfile` 거절(프로필 하이브를 직접 올림), 루트 폴더 목록 권한, PowerShell 파이프가 붙인 토큰 앞 BOM, provision 이 script 설치기의 mirror 를 받지 않던 것.
+- 아직: 판정·검사 스크립트, fixture, `[account_env]` 를 쓰는 프로젝트의 실행, 장시간 작업의 취소·서비스 재시작 중 중단.

@@ -57,6 +57,13 @@ enum Command {
     },
     /// Store the GitHub read token (read from stdin) DPAPI-encrypted.
     GithubToken,
+    /// A token build steps send to one repository (stdin), e.g. for a private cargo git
+    /// dependency (design §11.6). Without a URL, lists the URLs that have one.
+    BuildGitToken {
+        url: Option<String>,
+        #[arg(long)]
+        remove: bool,
+    },
     /// Entry point used by the Windows service control manager.
     #[command(hide = true)]
     Service,
@@ -186,6 +193,10 @@ fn main() -> Result<()> {
         Command::GithubToken => {
             let cfg = load_config(&cli.config)?;
             ops::github_token(&cfg)
+        }
+        Command::BuildGitToken { url, remove } => {
+            let cfg = load_config(&cli.config)?;
+            ops::build_git_token(&cfg, url, remove)
         }
         Command::Service => service::run(cli.config.clone()),
         Command::Provision { project, kind, version, recipe_ref, admin } => {

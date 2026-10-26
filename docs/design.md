@@ -199,6 +199,8 @@ D:\cimon\                              서비스  빌드
   backup\                              rw      -      작업 저장소·레시피 저장소 백업(외부 사본은 §16.5)
 ```
 
+루트(`D:\cimon` 자체)는 빌드 계정이 **목록만** 볼 수 있다(그 폴더만, 상속 없음) — 작업 트리에서 위로 올라가며 폴더를 읽는 빌드 도구(esbuild 등)가 루트에서 「Access is denied」 로 멈추지 않게. 보이는 것은 최상위 폴더 이름뿐이다.
+
 `*` `logs\j<id>\<step>\` 안에서 빌드 계정이 쓸 수 있는 것은 `out\` 하위뿐이다 — `logs\` 는 서비스 전용이고, 러너가 단계마다 그 단계의 `out\` 에만 쓰기 권한을 준다. `toolchains\_staging\` 도 서비스 전용(빌드 계정은 읽기)이고, `script` 설치기의 staging 폴더만 그 설치 동안 쓰기 권한을 받는다 — 확인한 내려받기를 푸는 사이에 빌드 단계가 바꿔치지 못하게. script 가 만든 파일은 빌드 계정 소유라(소유자는 ACL 을 다시 쓸 수 있다) 옮기지 않고, 서비스가 링크·정션을 거부하며 최종 폴더로 **복사**한 뒤 그 복사본을 probe 한다.
 
 `ws\` 아래 클론(`.git` 포함)은 빌드 계정이 만들고 다룬다 — 서비스는 그 안에서 git 을 돌리지 않는다(§11.1).
@@ -607,7 +609,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 
 ### 9.2 프로세스와 계정
 
-- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `LoadUserProfile` + `CreateProcessAsUserW`, 일시정지로 만든 뒤 Job Object 에 넣고 재개, 상속 핸들은 표준 입출력 셋만). 띄우는 것은 `cimon.exe __exec <spec>` 도우미이고, 도우미가 Rust 표준 라이브러리로 실제 명령을 띄운다(`.bat`·`.cmd` 인자 이스케이프를 표준 라이브러리에 맡기기 위해). 빌드 계정 비밀번호는 `cimon setup` 이 무작위로 정해 **DPAPI(머신 범위)로 암호화해 `config\build-account.dpapi`** 에 둔다 — `config\` 는 서비스 계정과 관리자만 읽는다. 서비스 계정에는 `setup` 이 「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」과, `LoadUserProfile` 이 호출자에게 요구하는 **「파일 및 디렉터리 백업」·「복원」** 을 준다(서비스가 시작할 때 켠다 — 서비스는 빌드 계정 비밀번호를 쥔 신뢰 쪽이라 이 권한을 더해도 경계가 바뀌지 않는다). 자식은 서비스의 창 스테이션을 물려받지 않는다(`lpDesktop` = 빈 문자열). 파이프 핸들은 `CreateProcessAsUserW` 직전에만 상속 가능하게 해 다른 스레드가 띄우는 프로세스로 새지 않게 하고, 출력 읽기는 프로세스가 끝난 뒤 10초를 넘기면 끊는다. 도우미가 명령을 못 띄우면 그 사유를 따로 알려 종료 코드가 아니라 「시작 실패」(`inconclusive`/`infra`)가 된다. 실제 빌드 머신에서 이 경로로 돌려 본 적은 아직 없다(**확인 필요**).
+- 러너는 단계마다 **빌드 계정 `cimon-build` 의 토큰으로** 자식 프로세스를 띄운다(`LogonUser`(batch) + `LoadUserProfile` + `CreateProcessAsUserW`, 일시정지로 만든 뒤 Job Object 에 넣고 재개, 상속 핸들은 표준 입출력 셋만). 띄우는 것은 `cimon.exe __exec <spec>` 도우미이고, 도우미가 Rust 표준 라이브러리로 실제 명령을 띄운다(`.bat`·`.cmd` 인자 이스케이프를 표준 라이브러리에 맡기기 위해). 빌드 계정 비밀번호는 `cimon setup` 이 무작위로 정해 **DPAPI(머신 범위)로 암호화해 `config\build-account.dpapi`** 에 둔다 — `config\` 는 서비스 계정과 관리자만 읽는다. 서비스 계정에는 `setup` 이 「프로세스 수준 토큰 바꾸기」·「프로세스의 메모리 할당량 조정」과 **「파일 및 디렉터리 백업」·「복원」** 을 준다(서비스가 시작할 때 켠다 — 서비스는 빌드 계정 비밀번호를 쥔 신뢰 쪽이라 이 권한을 더해도 경계가 바뀌지 않는다). **프로필**: 사용자 프로필 서비스는 이 두 권한이 있어도 관리자가 아닌 호출자의 `LoadUserProfile` 을 거부한다(`ERROR_ACCESS_DENIED`, 실제 머신에서 확인). 그래서 프로필은 `setup`(관리자)이 한 번 만들고, 서비스는 `LoadUserProfile` 이 거부되면 프로필의 `NTUSER.DAT` 를 `RegLoadKey` 로 `HKEY_USERS\<SID>` 에 직접 올린다 — 이것은 두 권한만 요구하고, 그 계정의 프로세스는 HKCU 를 거기서 찾는다(`[account_env]` 가 이 하이브에 쓴다). 자식은 서비스의 창 스테이션을 물려받지 않는다(`lpDesktop` = 빈 문자열). 파이프 핸들은 `CreateProcessAsUserW` 직전에만 상속 가능하게 해 다른 스레드가 띄우는 프로세스로 새지 않게 하고, 출력 읽기는 프로세스가 끝난 뒤 10초를 넘기면 끊는다. 도우미가 명령을 못 띄우면 그 사유를 따로 알려 종료 코드가 아니라 「시작 실패」(`inconclusive`/`infra`)가 된다. 2026-10-26 실제 Windows PC 에서 이 경로로 설치 스크립트와 작업 하나를 끝까지 돌렸다(setup.md 「실제 머신에서 확인한 것」).
 - 서비스 계정은 가상 계정 **`NT SERVICE\cimon`** 이다(관리할 비밀번호가 없다). 이 문서의 「서비스 계정 `cimon`」 은 이것을 가리킨다.
 - Job Object(`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, breakaway 불허). 취소·시간 초과는 Job Object 통째로 종료. 단계가 끝난 뒤 남은 프로세스는 종료하고 경고로 남긴다.
 - **Job Object 로 못 잡는 것**: 작업 스케줄러·서비스로 띄운 프로세스. 프로젝트 도구가 스택을 「호출자보다 오래 살게」 띄우는 경우가 그렇다. 그래서:
@@ -760,7 +762,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 ### 11.6 자격 증명
 
 - 서비스 계정: 등록된 저장소를 읽는 GitHub fine-grained 토큰. `cimon github-token`(표준 입력)이 DPAPI 로 암호화해 `config\github-token.dpapi` 에 두고, fetch 할 때 **`GIT_CONFIG_*` 환경 변수의 `http.https://github.com/.extraheader`** 로만 넘긴다 — 명령줄·설정 파일에 남지 않는다. **SSH 키는 두지 않는다** — git 설정 `url."https://github.com/".insteadOf "ssh://git@github.com/"`.
-- 빌드 계정: 기본은 **GitHub 자격 증명이 없다.** 빌드 중에 비공개 저장소를 git 으로 받는 프로젝트가 있으면 그 저장소만 읽는 **별도 토큰**을 빌드 계정에 둔다(어느 저장소인지는 레시피 저장소 노트).
+- 빌드 계정: 기본은 **GitHub 자격 증명이 없다.** 빌드 중에 비공개 저장소를 git 으로 받는 프로젝트(cargo 의 `git` 의존성 등)가 있으면 관리자가 그 저장소만 읽는 **별도 토큰**을 `cimon build-git-token <저장소 URL>`(표준 입력)로 둔다 — DPAPI 로 `config\build-git.dpapi` 에. cimon 은 단계마다 `GIT_CONFIG_*` 로 ① GitHub `ssh://`·`git@github.com:` 주소를 https 로 바꾸고 ② 저장된 URL **에만** 그 토큰을 HTTP 헤더(`http.<url>.extraheader`)로 붙인다 — 환경 변수라 레시피가 HOME 을 격리해도 적용되고, git CLI 를 부르는 도구에만 듣는다(cargo 는 `git-fetch-with-cli = true`). 모든 빌드 단계가 이 토큰을 볼 수 있으므로 저장소 하나 읽기 전용이어야 한다. `doctor --network` 가 토큰마다 접근을 확인한다. 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
 - `core.longpaths=true`.
 
 ---
@@ -936,6 +938,7 @@ allowed_hosts = ["cimon.<tailnet>.ts.net"]         # rmcp 기본값은 loopback 
 [tailscale]
 serve_target = "http://127.0.0.1:8770"
 require_funnel_off = true
+allow_unverified_funnel = false                    # 서비스 계정이 Tailscale 을 조회할 수 없는 머신에서만 true(§15.3)
 audit_identity_headers = true
 
 [paths]
@@ -1040,7 +1043,7 @@ login_code_minutes = 5
                                      --> http://127.0.0.1:8770  cimon
 ```
 
-- **빌드 머신**: **unattended 모드**(`tailscale up --unattended=true`, 관리자 계정으로), 태그 `tag:cimon`, 키 만료 꺼짐 확인(기본 180일마다 재인증), `tailscale serve --bg --https=443 http://127.0.0.1:8770`(재부팅 뒤에도 유지, `127.0.0.1` 대상만 프록시), tailnet 에 HTTPS 인증서 켜기. **Funnel 은 켜지 않는다** — 서비스가 시작할 때와 `doctor` 에서 `tailscale serve status --json` 을 읽어 켜져 있으면 **시작을 거부한다**.
+- **빌드 머신**: **unattended 모드**(`tailscale up --unattended=true`, 관리자 계정으로), 태그 `tag:cimon`, 키 만료 꺼짐 확인(기본 180일마다 재인증), `tailscale serve --bg --https=443 http://127.0.0.1:8770`(재부팅 뒤에도 유지, `127.0.0.1` 대상만 프록시), tailnet 에 HTTPS 인증서 켜기. **Funnel 은 켜지 않는다** — 서비스가 시작할 때와 `doctor` 에서 `tailscale serve status --json` 을 읽어 켜져 있으면 **시작을 거부한다**. Windows 에서 Tailscale 이 사용자 계정으로 로그인돼 있으면 Tailscale 은 그 사용자에게만 답해 서비스 계정은 상태를 읽지 못한다(`401 … already in use by <사용자>`). 그런 머신은 `[tailscale].allow_unverified_funnel = true` 로 시작하되 그 사실을 로그와 `/healthz` 에 계속 싣고, Funnel 확인은 그 사용자로 돌리는 `doctor` 와 **tailnet 정책**이 맡는다 — 정책에 `funnel` 노드 속성이 없으면 Funnel 을 켤 수 없다.
 - **ACL**(초안):
 
   ```jsonc
