@@ -8,11 +8,25 @@ use tokio_util::sync::CancellationToken;
 
 /// Runs until `shutdown` is cancelled (Windows service stop) or Ctrl-C.
 pub async fn run(cfg: Config, shutdown: Option<CancellationToken>) -> Result<()> {
+    let mut notices = vec![];
     if cfg.tailscale.require_funnel_off {
-        crate::tailscale::ensure_funnel_off()?;
+        match crate::tailscale::check_funnel()? {
+            crate::tailscale::Funnel::Off => {}
+            crate::tailscale::Funnel::Unobservable(why) if cfg.tailscale.allow_unverified_funnel => {
+                let w = format!(
+                    "Tailscale Funnel 이 꺼졌는지 서비스 계정으로 확인하지 못했다({why}) — [tailscale].allow_unverified_funnel 에 따라 시작했다. Tailscale 을 쓰는 사용자로 `cimon doctor` 를 돌려 확인하라"
+                );
+                tracing::warn!("{w}");
+                notices.push(w);
+            }
+            crate::tailscale::Funnel::Unobservable(why) => anyhow::bail!(
+                "cannot confirm Tailscale Funnel is off: {why}. If Tailscale answers only the user who owns it (Windows), set [tailscale].allow_unverified_funnel = true and check Funnel with `cimon doctor` as that user"
+            ),
+        }
     }
     let shutdown = shutdown.unwrap_or_default();
     let app = App::open(cfg).context("opening the job store")?;
+    app.engine.notices.lock().unwrap().extend(notices);
     // an upgrade drains, stops, replaces and starts: a started service takes jobs again
     let _ = std::fs::remove_file(app.layout.draining_flag());
     let (addr, server) = start(app, shutdown.clone()).await?;

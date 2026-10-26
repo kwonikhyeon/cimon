@@ -84,13 +84,20 @@ pub struct TailscaleConfig {
     /// Tailscale set this to false.
     #[serde(default = "d_true")]
     pub require_funnel_off: bool,
+    /// When the service account cannot query Tailscale — on Windows, Tailscale answers
+    /// only the user who owns it — false (the default) refuses to start; true starts
+    /// with a warning in the service log and `/healthz`. Funnel is then checked by
+    /// `cimon doctor` run by that user, and is best made impossible by tailnet policy
+    /// (no `funnel` node attribute). A Funnel that is seen to be on always refuses.
+    #[serde(default)]
+    pub allow_unverified_funnel: bool,
     #[serde(default = "d_true")]
     pub audit_identity_headers: bool,
 }
 
 impl Default for TailscaleConfig {
     fn default() -> Self {
-        TailscaleConfig { serve_target: d_serve_target(), require_funnel_off: true, audit_identity_headers: true }
+        TailscaleConfig { serve_target: d_serve_target(), require_funnel_off: true, allow_unverified_funnel: false, audit_identity_headers: true }
     }
 }
 

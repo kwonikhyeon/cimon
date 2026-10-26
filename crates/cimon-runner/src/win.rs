@@ -133,6 +133,8 @@ pub fn resume_process(pid: u32) -> std::io::Result<()> {
 pub struct Logon {
     pub token: Handle,
     profile: HANDLE,
+    /// `HKEY_USERS\<SID>` when this process loaded the hive itself (see `new`).
+    hive: Option<Vec<u16>>,
     pub profile_dir: String,
 }
 
@@ -140,10 +142,16 @@ unsafe impl Send for Logon {}
 unsafe impl Sync for Logon {}
 
 impl Logon {
-    /// `LogonUser(batch)` + `LoadUserProfile` — the profile must be loaded for the
-    /// account's HKCU (account_env) and for tools that read the user's settings.
-    /// `LoadUserProfile` needs the backup and restore privileges in the caller's token;
-    /// `cimon setup` grants them to the service account and they are enabled here.
+    /// `LogonUser(batch)` + the account's profile — loaded for its HKCU (account_env)
+    /// and for tools that read the user's settings.
+    ///
+    /// `LoadUserProfile` works for an administrator (`cimon setup`, `cimon doctor`). The
+    /// User Profile Service refuses it to the service account even with the backup and
+    /// restore privileges (ERROR_ACCESS_DENIED, seen on a real machine), so then the
+    /// service loads the profile's hive itself — `RegLoadKey` into `HKEY_USERS\<SID>`
+    /// needs exactly those two privileges, and a process of that user then finds its
+    /// HKCU there. The profile must exist already: `cimon setup` creates it as an
+    /// administrator.
     pub fn new(user: &str, password: &str) -> std::io::Result<Logon> {
         let missing: Vec<&str> = ["SeBackupPrivilege", "SeRestorePrivilege"].into_iter().filter(|p| enable_privilege(p).is_err()).collect();
         unsafe {
@@ -160,18 +168,28 @@ impl Logon {
             pi.dwSize = std::mem::size_of::<PROFILEINFOW>() as u32;
             pi.dwFlags = 1; // PI_NOUI — never show a dialog from a service
             pi.lpUserName = name.as_mut_ptr();
-            if LoadUserProfileW(token.0, &mut pi) == 0 {
-                let hint = if missing.is_empty() { String::new() } else { format!(" — the service account lacks {} (run `cimon setup` again)", missing.join(" and ")) };
-                return Err(last_error(&format!("LoadUserProfileW{hint}")));
+            let mut logon = Logon { token, profile: null_mut(), hive: None, profile_dir: String::new() };
+            if LoadUserProfileW(logon.token.0, &mut pi) != 0 {
+                logon.profile = pi.hProfile;
+            } else {
+                let code = GetLastError();
+                if !missing.is_empty() {
+                    return Err(last_error(&format!("LoadUserProfileW — the service account lacks {} (run `cimon setup` again)", missing.join(" and "))));
+                }
+                if code != windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED {
+                    return Err(last_error("LoadUserProfileW"));
+                }
             }
-            let mut logon = Logon { token, profile: pi.hProfile, profile_dir: String::new() };
             let mut buf = vec![0u16; 1024];
             let mut len = buf.len() as u32;
             if GetUserProfileDirectoryW(logon.token.0, buf.as_mut_ptr(), &mut len) == 0 {
                 // without it USERPROFILE/APPDATA would be empty and tools would write anywhere
-                return Err(last_error("GetUserProfileDirectoryW"));
+                return Err(last_error(&format!("GetUserProfileDirectoryW — {user} has no profile yet; run `cimon setup` (as an administrator it creates the profile)")));
             }
             logon.profile_dir = String::from_utf16_lossy(&buf[..(len as usize).saturating_sub(1)]);
+            if logon.profile.is_null() {
+                logon.hive = load_hive(&logon.token, &logon.profile_dir)?;
+            }
             Ok(logon)
         }
     }
@@ -206,6 +224,55 @@ impl Drop for Logon {
         if !self.profile.is_null() {
             unsafe { UnloadUserProfile(self.token.0, self.profile) };
         }
+        if let Some(key) = &self.hive {
+            use windows_sys::Win32::System::Registry::{RegUnLoadKeyW, HKEY_USERS};
+            // fails while a process of the account still holds a key — the sweep ends them
+            unsafe { RegUnLoadKeyW(HKEY_USERS, key.as_ptr()) };
+        }
+    }
+}
+
+/// Loads `<profile_dir>\NTUSER.DAT` as `HKEY_USERS\<SID of token>`. Returns the key this
+/// call loaded, or None when the hive is loaded already (someone else unloads it).
+fn load_hive(token: &Handle, profile_dir: &str) -> std::io::Result<Option<Vec<u16>>> {
+    use windows_sys::Win32::System::Registry::{RegLoadKeyW, HKEY_USERS};
+    let sid = token_sid(token)?;
+    let key = wide(&sid);
+    let file = wide(&format!("{profile_dir}\\NTUSER.DAT"));
+    match unsafe { RegLoadKeyW(HKEY_USERS, key.as_ptr(), file.as_ptr()) } {
+        0 => Ok(Some(key)),
+        // ERROR_SHARING_VIOLATION: the hive file is open — loaded already (a logged-on
+        // session of the account, or a profile another caller loaded)
+        32 => Ok(None),
+        e => Err(std::io::Error::other(
+            format!("RegLoadKeyW HKEY_USERS\\{sid} from {profile_dir}\\NTUSER.DAT failed (Win32 error {e}) — the service account needs the backup and restore privileges (`cimon setup`)"),
+        )),
+    }
+}
+
+/// The user SID of `token` as a string (`S-1-5-21-…`).
+fn token_sid(token: &Handle) -> std::io::Result<String> {
+    use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+    use windows_sys::Win32::Security::{GetTokenInformation, TokenUser, TOKEN_USER};
+    unsafe {
+        let mut len = 0u32;
+        GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut len);
+        let mut buf = vec![0u8; len as usize];
+        if GetTokenInformation(token.0, TokenUser, buf.as_mut_ptr() as *mut _, len, &mut len) == 0 {
+            return Err(last_error("GetTokenInformation(TokenUser)"));
+        }
+        let tu = &*(buf.as_ptr() as *const TOKEN_USER);
+        let mut s: windows_sys::core::PWSTR = null_mut();
+        if ConvertSidToStringSidW(tu.User.Sid, &mut s) == 0 {
+            return Err(last_error("ConvertSidToStringSidW"));
+        }
+        let mut n = 0;
+        while *s.add(n) != 0 {
+            n += 1;
+        }
+        let out = String::from_utf16_lossy(std::slice::from_raw_parts(s, n));
+        LocalFree(s as _);
+        Ok(out)
     }
 }
 

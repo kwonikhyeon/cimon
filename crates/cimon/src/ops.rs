@@ -113,6 +113,17 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         }));
         let b = build.clone();
         steps.push(step(format!("rights: {build} — log on as a batch job"), move || crate::lsa::add_rights(&b, &["SeBatchLogonRight"])));
+        // the User Profile Service creates a profile only for an administrator's call;
+        // the service later loads the existing profile's hive itself
+        #[cfg(windows)]
+        {
+            let b = build.clone();
+            let pwfile = layout.config_dir().join("build-account.dpapi");
+            let helper = std::env::current_exe()?;
+            steps.push(step(format!("profile of {build} (created by this administrator run)"), move || {
+                cimon_runner::BuildAccount::logon(&b, &pwfile, &helper).map(drop).map_err(|e| anyhow::anyhow!(e))
+            }));
+        }
     }
     // backup/restore: LoadUserProfile requires them in the caller (the build account's
     // HKCU). They let the service read and write any file — it is the trusted part of

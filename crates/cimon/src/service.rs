@@ -74,6 +74,11 @@ mod imp {
             let _guard = crate::init_service_logging(&cimon_core::Layout::new(&cfg.paths.root).service_logs());
             let rt = tokio::runtime::Runtime::new()?;
             let r = rt.block_on(cimon::serve::run(cfg, Some(token)));
+            // while the log writer is open — `_guard` closes it when this closure
+            // returns, and service_main's line would then go nowhere
+            if let Err(e) = &r {
+                tracing::error!("service failed: {e:#}");
+            }
             // blocking workers (a job being torn down, an intake fetch) get a bounded wait
             rt.shutdown_timeout(Duration::from_secs(25));
             r

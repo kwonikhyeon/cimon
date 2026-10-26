@@ -41,6 +41,8 @@ pub struct Engine {
     pub mirror_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
     /// In-process half of [`App::build_guard`].
     pub build_lock: Mutex<()>,
+    /// Conditions found at start that every `/healthz` repeats (e.g. Funnel unverified).
+    pub notices: Mutex<Vec<String>>,
 }
 
 impl Engine {
@@ -80,6 +82,7 @@ impl App {
             janitor: Notify::new(),
             mirror_locks: Mutex::new(HashMap::new()),
             build_lock: Mutex::new(()),
+            notices: Mutex::new(vec![]),
         };
         Ok(Arc::new(App { config, layout, store, recipes, engine }))
     }
@@ -165,6 +168,8 @@ pub fn health(app: &App) -> serde_json::Value {
     use cimon_core::JobState::*;
     let queued = app.store.jobs_in_states(&[Intake, Provisioning, Ready]).map(|v| v.len()).unwrap_or(0);
     let running = app.store.jobs_in_states(&[Running, Collecting, Cancelling]).map(|v| v.len()).unwrap_or(0);
+    let mut warnings = backup::warnings(app);
+    warnings.extend(app.engine.notices.lock().unwrap().iter().cloned());
     serde_json::json!({
         "ok": true,
         "queued": queued,
@@ -175,7 +180,7 @@ pub fn health(app: &App) -> serde_json::Value {
         "last_recipe_backup": app.store.last_backup("recipes").ok().flatten(),
         "last_recipe_offsite": app.store.last_offsite("recipes").ok().flatten(),
         "last_db_offsite": app.store.last_offsite("db").ok().flatten(),
-        "warnings": backup::warnings(app),
+        "warnings": warnings,
         "version": env!("CARGO_PKG_VERSION"),
     })
 }
