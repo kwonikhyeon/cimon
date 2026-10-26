@@ -64,11 +64,7 @@ git config --system core.longpaths true
 
 `D:\cimon\config\cimon.toml` 을 먼저 쓴다(setup 이 읽는다). 여기 없는 키의 기본값과 설명은 design §14.
 
-다른 위치(예: `D:` 가 없어 `C:\cimon`)에 두면 setup 을 `--config <경로>` 로 돌린다 — 서비스에는 그 경로가 박힌다. CLI 가 매번 찾도록 기계 전체 환경 변수도 둔다(새로 연 PowerShell 부터 적용).
-
-```powershell
-[Environment]::SetEnvironmentVariable('CIMON_CONFIG', 'C:\cimon\config\cimon.toml', 'Machine')
-```
+다른 위치(예: `D:` 가 없어 `C:\cimon`)에 두면 setup 을 `--config <경로>` 로 **한 번** 돌린다 — 서비스 명령줄에 그 경로가 박히고, 그 뒤로 CLI 는 `--config` 없이도 설치된 서비스의 명령줄에서 경로를 읽는다(찾는 순서: `--config` → `$CIMON_CONFIG` → 서비스의 `--config` → `D:\cimon\config\cimon.toml`).
 
 ```toml
 [server]
@@ -122,26 +118,27 @@ setup 이 자동화하지 않는다. Windows 방화벽(또는 WFP)으로 `cimon-
 ## 6. GitHub 토큰 · 첫 관리자
 
 ```powershell
-& $c github-token                    # 토큰을 붙여 넣고 Enter — config\github-token.dpapi 에 DPAPI 로
+& $c github-token                    # 입력이 보이지 않는 프롬프트에 토큰을 붙여 넣고 Enter — config\github-token.dpapi 에 DPAPI 로
 & $c token create <이름> --admin      # 사용자 토큰은 이때 한 번만 보인다
 ```
 
 - GitHub 토큰은 등록할 저장소만 읽는 **fine-grained 토큰**(Contents·Metadata 읽기)이 낫다. classic 토큰·`gh` 로그인 토큰도 되지만 `repo` 범위라 접근할 수 있는 모든 비공개 저장소에 쓰기까지 된다. 서비스가 fetch 할 때만 쓰고, 빌드 계정에는 넘기지 않는다.
-- `echo <토큰> | cimon github-token` 처럼 넘기지 않는다 — PowerShell 명령 기록에 남는다. 클립보드나 `gh` 에서 바로 파이프하면 남지 않는다: `Get-Clipboard | & $c github-token` 또는 `gh auth token | & $c github-token`(PowerShell 이 앞에 붙이는 BOM 은 cimon 이 뗀다).
+- 토큰을 받는 명령(`github-token`·`build-git-token`·`build-secret`)은 콘솔에서 그냥 실행하면 **입력이 보이지 않는 프롬프트**로 묻는다 — 화면·명령 기록에 남지 않는다. 파이프로도 받는다: `gh auth token | & $c github-token`(PowerShell 이 앞에 붙이는 BOM 은 cimon 이 뗀다). `echo <토큰> | …` 처럼 명령줄에 토큰을 쓰지 않는다 — PowerShell 명령 기록에 남는다.
 - `doctor --network` 의 `GitHub access` 가 모두 OK 여야 한다.
 
 빌드 중에 **다른 저장소를 git 으로 받는** 프로젝트(cargo `git` 의존성 등 — 레시피 저장소의 프로젝트 노트에 적혀 있다)는 그 저장소가 **cimon 에 등록된 프로젝트면 아무것도 할 필요가 없다** — 빌드 단계는 cimon 의 mirror 에서 받는다(design §11.6). 등록되지 않은 비공개 저장소일 때만 빌드 계정에 그 저장소 하나를 읽는 토큰을 둔다. 모든 빌드 단계가 볼 수 있으니 fine-grained 로 그 저장소의 Contents 읽기만 준다.
 
 ```powershell
-Get-Clipboard | & $c build-git-token https://github.com/<org>/<repo>.git   # URL 은 빌드가 받는 주소 그대로(ssh 주소는 https 로 바뀐 뒤의 모양)
-& $c build-git-token                                                       # 등록된 URL 목록
+& $c build-git-token https://github.com/<org>/<repo>.git   # 토큰을 묻는다. URL 은 빌드가 받는 주소 그대로(ssh 주소는 https 로 바뀐 뒤의 모양)
+& $c build-git-token                                        # 등록된 URL 목록
 ```
 
 git 이 아닌 도구가 **자기 자격 증명**을 요구하는 프로젝트(사내 Conan·npm 레지스트리 등 — 레시피가 `${secret.<name>}` 으로 쓴다)는 그 프로젝트에 **빌드 비밀**을 둔다. `plan` 의 `secrets`, `doctor` 의 `build secret` 이 무엇이 필요한지 보인다. 그 변수를 받는 단계가 모두 읽을 수 있으니 **읽기 전용** 토큰(예: 레지스트리를 읽기만 하는 전용 사용자의 토큰)을 쓴다.
 
 ```powershell
-Get-Clipboard | & $c build-secret <project> <name>      # 예: build-secret dotori_rcs artifactory-conan
-& $c build-secret                                       # 저장된 비밀 목록(값은 보이지 않는다)
+& $c build-secret <project> <name>                  # 값을 묻는다. 예: build-secret dotori_rcs artifactory-conan-token
+"cimon-build" | & $c build-secret <project> <name>  # 비밀이 아닌 값(사용자 이름 등)은 파이프로
+& $c build-secret                                   # 저장된 비밀 목록(값은 보이지 않는다)
 & $c build-secret <project> <name> --remove
 ```
 

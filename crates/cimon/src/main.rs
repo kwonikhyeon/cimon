@@ -15,7 +15,8 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(name = "cimon", version, about = "Cimon says: build.")]
 struct Cli {
-    /// cimon.toml. Defaults to $CIMON_CONFIG, then D:\cimon\config\cimon.toml.
+    /// cimon.toml. Defaults to $CIMON_CONFIG, then the installed service's --config, then
+    /// D:\cimon\config\cimon.toml.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -157,7 +158,56 @@ pub fn config_path(cli: &Option<PathBuf>) -> PathBuf {
     if let Ok(p) = std::env::var("CIMON_CONFIG") {
         return PathBuf::from(p);
     }
+    // an admin on the build machine does not repeat what `cimon setup` put in the
+    // service's command line
+    if let Some(p) = service_config() {
+        return p;
+    }
     PathBuf::from(r"D:\cimon\config\cimon.toml")
+}
+
+/// The `--config` of the installed service, from its command line in the registry.
+#[cfg(windows)]
+fn service_config() -> Option<PathBuf> {
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let key = wide(&format!(r"SYSTEM\CurrentControlSet\Services\{}", ops::SERVICE_NAME));
+    let value = wide("ImagePath");
+    let mut buf = vec![0u16; 4096];
+    let mut bytes = (buf.len() * 2) as u32;
+    // SAFETY: the key and value names are NUL-terminated; buf holds `bytes` bytes
+    let rc = unsafe {
+        RegGetValueW(HKEY_LOCAL_MACHINE, key.as_ptr(), value.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, std::ptr::null_mut(), buf.as_mut_ptr().cast(), &mut bytes)
+    };
+    if rc != 0 {
+        return None;
+    }
+    let line = String::from_utf16_lossy(&buf[..bytes as usize / 2]);
+    config_arg(line.trim_end_matches('\0'))
+}
+
+#[cfg(not(windows))]
+fn service_config() -> Option<PathBuf> {
+    None
+}
+
+/// The value of `--config` in a service command line (setup quotes it).
+fn config_arg(line: &str) -> Option<PathBuf> {
+    let rest = line.split_once(" --config ")?.1.trim_start();
+    let p = match rest.strip_prefix('"') {
+        Some(q) => q.split('"').next()?,
+        None => rest.split_whitespace().next()?,
+    };
+    (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+#[cfg(test)]
+#[test]
+fn config_from_a_service_command_line() {
+    let p = |s: &str| config_arg(s).map(|p| p.to_string_lossy().into_owned());
+    assert_eq!(p(r#""C:\Program Files\cimon\cimon.exe" service --config "C:\cimon\config\cimon.toml""#).as_deref(), Some(r"C:\cimon\config\cimon.toml"));
+    assert_eq!(p(r#"C:\cimon\cimon.exe service --config D:\c\cimon.toml"#).as_deref(), Some(r"D:\c\cimon.toml"));
+    assert_eq!(p(r#""C:\cimon\cimon.exe" service"#), None);
 }
 
 pub fn load_config(cli: &Option<PathBuf>) -> Result<Config> {

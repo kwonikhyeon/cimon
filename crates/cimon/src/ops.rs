@@ -331,10 +331,16 @@ pub fn build_secret(cfg: &Config, project: Option<String>, name: Option<String>,
     Ok(())
 }
 
-/// One token line from stdin, checked to look like a token.
+/// One token line from stdin, checked to look like a token. At a console it asks with
+/// the input hidden — nothing to copy through the clipboard, nothing on screen.
 fn read_token_line() -> Result<String> {
+    use std::io::IsTerminal;
     let mut token = String::new();
-    std::io::stdin().read_line(&mut token)?;
+    if std::io::stdin().is_terminal() {
+        token = read_hidden("paste the token (input is hidden) and press Enter: ")?;
+    } else {
+        std::io::stdin().read_line(&mut token)?;
+    }
     // PowerShell puts a UTF-8 BOM in front of what it pipes to a program; a token
     // stored with it fails every fetch
     let token = token.trim().trim_start_matches('\u{feff}').trim();
@@ -345,6 +351,31 @@ fn read_token_line() -> Result<String> {
         bail!("that is not a token (it has spaces or non-ASCII characters) — give the token alone on one line");
     }
     Ok(token.to_string())
+}
+
+/// One line from the console with echo off.
+#[cfg(windows)]
+fn read_hidden(prompt: &str) -> Result<String> {
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE};
+    eprint!("{prompt}");
+    // SAFETY: the process's own standard input handle and a local mode
+    let h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode = 0;
+    if unsafe { GetConsoleMode(h, &mut mode) } == 0 || unsafe { SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) } == 0 {
+        eprintln!();
+        bail!("cannot hide the input in this terminal — pipe the token in instead (Get-Clipboard | cimon …)");
+    }
+    let mut line = String::new();
+    let read = std::io::stdin().read_line(&mut line);
+    unsafe { SetConsoleMode(h, mode) };
+    eprintln!();
+    read?;
+    Ok(line)
+}
+
+#[cfg(not(windows))]
+fn read_hidden(_prompt: &str) -> Result<String> {
+    bail!("pipe the token in on stdin")
 }
 
 /// `cimon drain`: new jobs are refused; returns once nothing runs (design §16.6).
