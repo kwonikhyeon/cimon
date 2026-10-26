@@ -62,6 +62,67 @@ impl Store {
         Ok(())
     }
 
+    // ── invites ─────────────────────────────────────────────────────────
+
+    /// A one-time code that creates user `name` when a team member's PC redeems it
+    /// (`/connect/redeem`, design §16.3) — the token is made then, so it never passes
+    /// through the admin's terminal or a chat. Only the code's hash is stored. Returns
+    /// (code, expires_at). A name that is already a user is refused; a pending invite
+    /// for the same name is replaced.
+    pub fn create_invite(&self, name: &str, role: cimon_core::Role, created_by: &str, minutes: u32) -> Result<(String, String)> {
+        crate::validate_user_name(name)?;
+        let code = cimon_core::invite_code();
+        let hash = cimon_core::sha256_hex(cimon_core::normalize_invite_code(&code).as_bytes());
+        let expires = cimon_core::after_secs(minutes as i64 * 60);
+        self.tx(|tx| {
+            let exists: Option<i64> = tx.query_row("SELECT 1 FROM users WHERE name = ?1", [name], |r| r.get(0)).optional()?;
+            if exists.is_some() {
+                return Err(crate::StoreError::Conflict(format!("user {name:?} already exists — invite a new name (one per device), or `cimon token rotate {name}`")));
+            }
+            tx.execute("DELETE FROM invites WHERE name = ?1 AND redeemed_at IS NULL", [name])?;
+            tx.execute(
+                "INSERT INTO invites (code_sha256, name, role, created_by, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![hash, name, role.as_str(), created_by, now(), expires],
+            )?;
+            Ok(())
+        })?;
+        Ok((code, expires))
+    }
+
+    /// Redeems an invite: marks it used and creates its user, in one transaction.
+    /// Returns (user, role, token), or None when the code is unknown, used or expired.
+    pub fn redeem_invite(&self, code: &str, login: Option<&str>) -> Result<Option<(String, cimon_core::Role, String)>> {
+        let hash = cimon_core::sha256_hex(cimon_core::normalize_invite_code(code).as_bytes());
+        self.tx(|tx| {
+            let row: Option<(String, String, String, Option<String>)> = tx
+                .query_row("SELECT name, role, expires_at, redeemed_at FROM invites WHERE code_sha256 = ?1", [&hash], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })
+                .optional()?;
+            let Some((name, role, expires, redeemed)) = row else { return Ok(None) };
+            if redeemed.is_some() || expires < now() {
+                return Ok(None);
+            }
+            let n = tx.execute(
+                "UPDATE invites SET redeemed_at = ?2, redeemed_login = ?3 WHERE code_sha256 = ?1 AND redeemed_at IS NULL",
+                params![hash, now(), login],
+            )?;
+            if n != 1 {
+                return Ok(None);
+            }
+            let token = cimon_core::random_secret_hex();
+            let created = tx.execute(
+                "INSERT INTO users (name, token_sha256, role, created_at) VALUES (?1, ?2, ?3, ?4) ON CONFLICT(name) DO NOTHING",
+                params![name, cimon_core::sha256_hex(token.as_bytes()), role, now()],
+            )?;
+            if created == 0 {
+                return Err(crate::StoreError::Conflict(format!("user {name:?} was created after the invite — ask for a new invite")));
+            }
+            let role = cimon_core::Role::parse(&role).unwrap_or(cimon_core::Role::Member);
+            Ok(Some((name, role, token)))
+        })
+    }
+
     // ── web ─────────────────────────────────────────────────────────────
 
     pub fn create_login_code(&self, user: &str, minutes: u32) -> Result<String> {
@@ -141,7 +202,8 @@ impl Store {
         let c = self.conn();
         let a = c.execute("DELETE FROM web_sessions WHERE expires_at < ?1", [before])?;
         let b = c.execute("DELETE FROM login_codes WHERE expires_at < ?1", [before])?;
-        Ok(a + b)
+        let i = c.execute("DELETE FROM invites WHERE expires_at < ?1", [before])?;
+        Ok(a + b + i)
     }
 
     pub fn purge_audit(&self, before: &str) -> Result<usize> {

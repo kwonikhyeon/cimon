@@ -1130,9 +1130,11 @@ login_code_minutes = 5
 
 1. Tailscale 설치 → 회사 계정 로그인 → tailnet 관리자가 `group:cimon-users` 에 넣는다.
 2. Claude Code v2.1.304 이상.
-3. 관리자가 `cimon token create <이름>` 으로 토큰을 발급해 전달(메신저 평문 금지).
-4. §15.4 대로 등록.
+3. 관리자가 `cimon invite <이름>` 으로 **초대 코드**(Crockford base32 8자 = 40비트, 기본 10분, 한 번)를 만든다. 서버에는 코드의 해시와 이름·역할만 남는다.
+4. 팀원이 서버가 내주는 스크립트를 실행한다 — `GET /connect.ps1` · `GET /connect.sh`(서버 주소가 박혀 있고 비밀은 없다). 스크립트가 `POST /connect/redeem` 에 코드를 내면 서버가 그때 사용자를 만들어 토큰을 돌려주고(한 트랜잭션에서 초대를 쓰고 사용자를 만든다), 스크립트가 토큰을 OS 보관소에 넣고 §15.4 의 헤더 도우미와 등록을 대신 한 뒤 `claude mcp get` 으로 연결을 확인한다. 이 경로들은 토큰 없이 열려 있다 — tailnet 이 문이고 코드가 자격 증명이다. 틀린 코드는 0.5초씩 늦게 답하고, 10분에 20번 넘게 틀리면 그동안 모든 교환을 거절한다. 교환·실패는 Tailscale 신원과 함께 감사 로그에.
 5. 확인: `/mcp` 에 cimon 연결, `list_projects` 가 프로젝트 목록.
+
+토큰을 직접 주는 길(`cimon token create`, §15.4 의 수동 등록)도 남는다.
 
 퇴사·분실: tailnet 에서 기기를 빼고 `cimon token disable <이름>`.
 

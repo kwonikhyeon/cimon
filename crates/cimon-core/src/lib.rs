@@ -39,6 +39,30 @@ pub fn random_id128() -> String {
     base32(&bytes)
 }
 
+/// An invite code a person types: 8 characters of Crockford base32 (40 random bits),
+/// shown as `XXXX-XXXX`. Short-lived and single-use (`Store::create_invite`).
+pub fn invite_code() -> String {
+    use rand::RngCore;
+    const A: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+    let mut bytes = [0u8; 8];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    let s: String = bytes.iter().map(|b| A[(*b & 31) as usize] as char).collect();
+    format!("{}-{}", &s[..4], &s[4..])
+}
+
+/// The form an invite code is hashed in: upper case, separators dropped, and the
+/// letters people mistake for digits read as those digits (Crockford).
+pub fn normalize_invite_code(code: &str) -> String {
+    code.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| match c.to_ascii_uppercase() {
+            'O' => '0',
+            'I' | 'L' => '1',
+            c => c,
+        })
+        .collect()
+}
+
 /// 256 random bits as hex — tokens, session ids, login codes, keys.
 pub fn random_secret_hex() -> String {
     use rand::RngCore;

@@ -17,7 +17,14 @@ cimon(「시몬」)은 Claude Code 가 MCP tasks 로 부르는 원격 빌드·�
 
 ## 쓰기(팀원)
 
-회사 tailnet 에 붙은 PC 라면 사무실 밖에서도 쓴다. 준비는 세 가지다 — Tailscale 로그인, 관리자에게 받은 cimon 토큰, Claude Code v2.1.304 이상. 토큰을 DPAPI 로 저장하고 `headersHelper` 로 등록하는 방법과 사용 예는 **[docs/remote-use.md](docs/remote-use.md)**.
+회사 tailnet 에 붙은 PC 라면 사무실 밖에서도 쓴다. 관리자에게 초대 코드(`cimon invite <이름>`)를 받고, Tailscale 에 로그인한 뒤 한 줄을 실행해 코드를 입력하면 연결이 끝난다(Claude Code v2.1.304 이상).
+
+```powershell
+irm https://<서버>/connect.ps1 | iex          # Windows
+curl -fsSL https://<서버>/connect.sh | sh     # macOS · Linux
+```
+
+토큰 저장·등록이 무엇을 하는지, 손으로 하는 법, 사용 예는 **[docs/remote-use.md](docs/remote-use.md)**.
 
 ## 처음 올리기(빌드 머신, 관리자)
 

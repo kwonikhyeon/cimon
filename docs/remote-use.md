@@ -19,10 +19,32 @@
 | 무엇 | 누구에게 |
 |---|---|
 | tailnet 계정, `group:cimon-users` 등록 | tailnet 관리자 |
-| cimon 토큰 — 한 번만 보인다 | cimon 관리자(`cimon token create <이름>`) |
+| **초대 코드**(`XXXX-XXXX`, 10분·한 번) | cimon 관리자(`cimon invite <이름>` — 기기마다 이름 하나) |
 | Claude Code **v2.1.304 이상**(MCP tasks) | 직접 — `claude --version` |
 
-토큰은 메신저에 평문으로 받지 않는다. 사내 비밀 공유 도구를 쓴다.
+## 빠른 연결 (권장)
+
+Tailscale 에 로그인한 뒤, 서버가 직접 내주는 스크립트를 한 줄로 실행하고 초대 코드를 입력한다.
+
+```powershell
+# Windows (PowerShell)
+irm https://cimon.<tailnet>.ts.net/connect.ps1 | iex
+```
+```sh
+# macOS · Linux
+curl -fsSL https://cimon.<tailnet>.ts.net/connect.sh | sh
+```
+
+스크립트가 하는 일:
+
+1. 초대 코드를 서버에 내고 이 기기용 토큰을 받는다 — 토큰은 화면에도 메신저에도 나오지 않는다.
+2. 토큰을 Windows 는 DPAPI 파일(`%USERPROFILE%\.cimon\token.dpapi`), macOS 는 키체인, Linux 는 `secret-tool`(없으면 권한 600 파일)에 둔다.
+3. 헤더 도우미(`header.ps1` / `header.sh`)를 쓰고 `claude mcp add-json --scope user cimon …` 로 등록한다(이전 등록은 바꾼다).
+4. `claude mcp get cimon` 으로 등록 내용과 연결(Connected)을 확인한다 — 어긋나면 「done」 대신 실패로 끝난다.
+
+`done - signed in as <이름>` 이 나오면 「3. 확인」 으로 간다. 코드는 대소문자·`-` 를 가리지 않고, `O`/`0`·`I`/`1` 을 헷갈려도 된다. 자동 설치 스크립트에서는 코드를 `CIMON_INVITE_CODE` 환경 변수로 넘기면 묻지 않는다.
+
+손으로 등록하려면 아래 1·2(또는 2') 를 따른다.
 
 ## 1. Tailscale
 

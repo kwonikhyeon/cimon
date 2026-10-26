@@ -178,7 +178,13 @@ sc.exe start cimon
 
 ## 11. 팀원 등록
 
-팀원마다 tailnet 의 `group:cimon-users` 에 넣고, `& $c token create <이름>` 으로 토큰을 발급해 전달한다(메신저 평문 금지). 팀원이 할 일은 [remote-use.md](remote-use.md).
+팀원마다 tailnet 의 `group:cimon-users` 에 넣고 **초대 코드**를 만든다 — 기기마다 이름 하나(잃어버린 기기만 끌 수 있게).
+
+```powershell
+& $c invite <이름>             # 10분·한 번 쓰는 코드와, 팀원이 실행할 한 줄을 출력한다(--admin, --minutes)
+```
+
+팀원은 그 한 줄(`irm …/connect.ps1 | iex` 또는 `curl -fsSL …/connect.sh | sh`)을 실행하고 코드를 입력하면 끝이다 — 토큰은 그 기기에서 만들어져 바로 OS 보관소에 들어가므로 사람 손을 거치지 않는다([remote-use.md](remote-use.md) 「빠른 연결」). 코드 대신 토큰을 직접 주려면 `& $c token create <이름>`(한 번만 보인다, 메신저 평문 금지).
 
 사용자 관리: `& $c token disable <이름>` · `& $c token rotate <이름>` · `& $c user role <이름> admin|member` · `& $c token list`.
 

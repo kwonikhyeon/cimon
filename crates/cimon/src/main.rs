@@ -31,6 +31,17 @@ enum Command {
         #[command(subcommand)]
         action: TokenCmd,
     },
+    /// A one-time code that connects a team member's PC (design §16.3): they run the
+    /// printed one-liner, type the code, and the script stores a new token and registers
+    /// cimon with Claude Code. One user per device.
+    Invite {
+        name: String,
+        #[arg(long)]
+        admin: bool,
+        /// Minutes the code stays valid.
+        #[arg(long, default_value_t = 10)]
+        minutes: u32,
+    },
     /// User roles.
     User {
         #[command(subcommand)]
@@ -179,6 +190,18 @@ fn main() -> Result<()> {
                     }
                 }
             }
+            Ok(())
+        }
+        Command::Invite { name, admin, minutes } => {
+            let cfg = load_config(&cli.config)?;
+            let store = cimon_store::Store::open(&cimon_core::Layout::new(&cfg.paths.root).db())?;
+            let (code, expires) = store.create_invite(&name, if admin { Role::Admin } else { Role::Member }, &whoami(), minutes)?;
+            let url = cfg.server.public_url.trim_end_matches('/');
+            println!("invite for {name} ({}) — one use, until {expires} ({minutes} min):\n", if admin { "admin" } else { "member" });
+            println!("    {code}\n");
+            println!("On their PC (Tailscale on, Claude Code 2.1.304+), run and type the code:");
+            println!("  Windows (PowerShell):  irm {url}/connect.ps1 | iex");
+            println!("  macOS / Linux:         curl -fsSL {url}/connect.sh | sh");
             Ok(())
         }
         Command::Setup { dry_run } => {

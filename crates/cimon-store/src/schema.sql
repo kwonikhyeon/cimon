@@ -204,6 +204,18 @@ CREATE TABLE IF NOT EXISTS web_sessions (
   revoked_at   TEXT
 );
 
+-- one-time codes that create a user on a team member's PC (cimon invite → /connect)
+CREATE TABLE IF NOT EXISTS invites (
+  code_sha256    TEXT PRIMARY KEY,
+  name           TEXT NOT NULL,
+  role           TEXT NOT NULL,
+  created_by     TEXT NOT NULL,
+  created_at     TEXT NOT NULL,
+  expires_at     TEXT NOT NULL,
+  redeemed_at    TEXT,
+  redeemed_login TEXT
+);
+
 CREATE TABLE IF NOT EXISTS login_codes (
   code_sha256 TEXT PRIMARY KEY,
   user        TEXT NOT NULL,

@@ -1,6 +1,7 @@
 //! MCP endpoint (`POST /mcp`, revision 2026-07-28 + Tasks extension) and its HTTP
 //! plumbing: bearer-token auth in front of rmcp, identity-header audit, `/healthz`.
 
+pub mod connect;
 pub mod recipe_tools;
 pub mod server;
 pub mod tools;
@@ -11,7 +12,7 @@ use axum::{
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use cimon_core::AuthUser;
@@ -43,6 +44,9 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
     Router::new()
         .route("/healthz", get(healthz))
         .route("/artifacts/{job}/{name}", get(download))
+        .route("/connect.ps1", get(connect::ps1))
+        .route("/connect.sh", get(connect::sh))
+        .route("/connect/redeem", post(connect::redeem))
         .with_state(app.clone())
         .merge(mcp_routes)
 }
