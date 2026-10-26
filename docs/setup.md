@@ -22,11 +22,16 @@ $c = "C:\Program Files\cimon\cimon.exe"
 
 **base 툴체인** — 레시피 저장소 카탈로그(`toolchains.toml`)의 `tier = "base"` 항목이다. 관리자가 미리 설치하고 cimon 은 검사만 한다(design §10.2). 흔히 Visual Studio Build Tools(C++ 워크로드 + Windows SDK), Git for Windows 등이다. 빠진 것은 9단계의 `cimon doctor` 가 프로젝트별로 알려 준다.
 
-base 도구가 **관리자 계정의 사용자 폴더**에 깔려 있으면(Android Studio 의 SDK 는 `%LOCALAPPDATA%\Android\Sdk`, 사용자용 Inno Setup 은 `%LOCALAPPDATA%\Programs\Inno Setup 6`) 빌드 계정이 읽지 못한다. 4단계 setup 뒤에 그 폴더에만 읽기 권한을 준다 — `doctor` 는 관리자로 돌아서 이 문제를 잡지 못한다.
+base 도구가 **관리자 계정의 사용자 폴더**에 깔려 있으면(Android Studio 의 SDK 는 `%LOCALAPPDATA%\Android\Sdk`, 사용자용 Inno Setup 은 `%LOCALAPPDATA%\Programs\Inno Setup 6`) 빌드 계정이 쓸 수 없다. 그 폴더에만 읽기 권한을 줘도 모자란다 — 도구가 실제 경로를 확인하며 상위 폴더(`C:\Users\<관리자>`·`AppData`…)를 하나씩 읽다가 거절된다(javac 의 `AccessDeniedException … toRealPath`, 실제 머신에서 확인). 시스템 위치에 따로 두고 `[base]` 를 그쪽으로 한다. `doctor` 는 관리자로 돌아서 이 문제를 잡지 못한다.
 
 ```powershell
-icacls "<그 폴더>" /grant "cimon-build:(OI)(CI)RX"
+# 예: Android SDK — 필요한 패키지만 든 사용자 SDK 를 통째로(라이선스 파일 포함) 복사
+New-Item -ItemType Directory -Force C:\Android\Sdk | Out-Null
+icacls C:\Android /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F" "*S-1-5-32-545:(OI)(CI)RX"   # 관리자·SYSTEM 만 쓰기 — 빌드가 SDK 를 바꾸지 못하게
+robocopy "$env:LOCALAPPDATA\Android\Sdk" C:\Android\Sdk /E /XD .temp
 ```
+
+`C:\` 바로 아래 새 폴더는 기본으로 인증된 사용자 누구나 수정할 수 있다 — 위처럼 권한을 잡지 않으면 빌드 단계가 base 도구를 바꿔 다른 작업에 영향을 줄 수 있다.
 
 cimon 자신이 쓰는 것은 **Git for Windows 2.40 이상**(시스템 PATH)이다.
 
