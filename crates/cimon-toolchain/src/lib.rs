@@ -291,6 +291,50 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
     })
 }
 
+/// Installs one managed kind from a local copy an admin vouches for (`cimon provision
+/// --from`) — for when the catalog's source is unavailable. The service's own copy is
+/// made (links and junctions refused, so it inherits the read-only grant), the
+/// catalog's probe runs on it as the build account, and the record says
+/// `local:<path>`: no catalog checksum was checked, the admin's word stands in for it.
+/// Kinds whose installer builds in place (rustup, uv) are refused.
+pub fn install_from_local(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str, req: &ToolchainReq, src: &Path) -> Result<ToolchainInstall, InstallError> {
+    if def.is_base() {
+        return Err(err(format!("{kind} is a base kind — an admin installs it")));
+    }
+    if matches!(def.installer.as_str(), "rustup" | "uv-python" | "uv-tool") {
+        return Err(err(format!("{kind} uses the {} installer, which installs in place — --from takes archive, github-release and script kinds", def.installer)));
+    }
+    if !src.is_dir() {
+        return Err(err(format!("{} is not a directory", src.display())));
+    }
+    let vkey = version_key(def, version, req);
+    let final_dir = ctx.layout.toolchain_dir(kind, &vkey, entry);
+    if final_dir.exists() {
+        remove_dir(&final_dir).map_err(|e| err(format!("{}: {e}", final_dir.display())))?;
+    }
+    if let Err(e) = cimon_runner::copy_tree_no_links(src, &final_dir) {
+        let _ = remove_dir(&final_dir);
+        return Err(err(format!("{e} — not installed")));
+    }
+    let lay = layout_of(ctx, kind, def, version, &final_dir, req);
+    if let Err(e) = probe(ctx, def, version, &final_dir, &lay) {
+        let _ = remove_dir(&final_dir);
+        return Err(e);
+    }
+    let t = now();
+    Ok(ToolchainInstall {
+        kind: kind.into(),
+        version: vkey,
+        entry_sha256: entry.into(),
+        root: final_dir.to_string_lossy().into(),
+        checksum: None,
+        source_ref: Some(format!("local:{}", src.display())),
+        installed_by: ctx.installed_by.clone(),
+        installed_at: t.clone(),
+        last_used_at: t,
+    })
+}
+
 fn fill(s: &str, version: &str) -> String {
     let url_enc: String = version.bytes().map(|b| if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_') { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
     s.replace("{version_url}", &url_enc).replace("{version}", version)

@@ -195,6 +195,46 @@ async fn not_auto_approved_needs_admin_then_trial_catalog_rule() {
     assert_eq!(v["recipe"]["commit"], edit.commit.as_str());
 }
 
+/// The catalog's source is down: an admin installs from a local copy they vouch for.
+/// The copy is probed (a wrong one is not installed) and recorded as `local:<path>`.
+#[tokio::test]
+async fn provision_from_a_local_copy_when_the_source_is_down() {
+    repos_dir();
+    make_repo("m3local", &[("README.md", "x")]);
+    // nothing listens on port 9: every download fails
+    let h = Harness::start("").await;
+    h.app.recipes.import_init(&recipes("m3local", &catalog("http://127.0.0.1:9", "archive"), ""), "admin-a", "init").unwrap();
+    let copy = |dir: &std::path::Path, says: &str| {
+        let bin = dir.join("hello-1.2.3").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hello.cmd"), format!("@echo hello {says}\r\n")).unwrap();
+    };
+    let d = tempfile::tempdir().unwrap();
+    let (good, wrong) = (d.path().join("good"), d.path().join("wrong"));
+    copy(&good, "1.2.3");
+    copy(&wrong, "9.9.9");
+    let prov = |from: Option<std::path::PathBuf>, project: Option<String>| {
+        let app = h.app.clone();
+        async move {
+            tokio::task::spawn_blocking(move || {
+                cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind: Some("hello".into()), version: Some("1.2.3".into()), from, admin: "admin-a".into(), ..Default::default() })
+            })
+            .await
+            .unwrap()
+        }
+    };
+    assert!(prov(Some(good.clone()), Some("m3local".into())).await.is_err(), "--from takes one kind, not a project");
+    let lines = prov(Some(wrong), None).await.unwrap();
+    assert!(!lines[0].ok && lines[0].outcome.contains("FAILED"), "a copy that probes wrong is refused: {lines:?}");
+    let lines = prov(Some(good.clone()), None).await.unwrap();
+    assert!(lines[0].ok && lines[0].outcome.contains("local copy"), "{lines:?}");
+    let inst = h.app.store.installs().unwrap().into_iter().find(|i| i.kind == "hello").unwrap();
+    assert_eq!(inst.source_ref.as_deref(), Some(format!("local:{}", good.display()).as_str()));
+    let c = h.task_client(&h.member_token).await;
+    let v = run_build(&c, json!({"project": "m3local"})).await;
+    assert_eq!(v["verdict"], "pass", "{v:#}");
+}
+
 #[tokio::test]
 async fn base_kind_checks() {
     repos_dir();

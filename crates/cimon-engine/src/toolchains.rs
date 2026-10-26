@@ -290,12 +290,18 @@ pub struct ProvisionArgs {
     pub version: Option<String>,
     /// Install from a trial branch's catalog entry after review (design §10.4).
     pub recipe_ref: Option<String>,
+    /// Install `kind` at `version` from this local copy instead of the catalog's source
+    /// (the admin vouches for it; recorded as `local:<path>`).
+    pub from: Option<std::path::PathBuf>,
     pub admin: String,
 }
 
 /// `cimon provision` (design §10.4): installs what auto-approve does not, from
 /// `main`'s catalog — or, with `--recipe-ref`, from a reviewed trial entry.
 pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, String> {
+    if a.from.is_some() && (a.kind.is_none() || a.version.is_none() || a.project.is_some()) {
+        return Err("--from installs one toolchain: give --kind and --version (not a project)".into());
+    }
     let main = app.recipes.require_main().map_err(|e| e.to_string())?;
     let source_ref = a.recipe_ref.clone().unwrap_or_else(|| app.config.recipes.default_branch.clone());
     let commit = app.recipes.resolve(&source_ref).map_err(|e| e.to_string())?;
@@ -364,17 +370,22 @@ pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, Str
         let mut ctx = installer_ctx(app);
         ctx.installed_by = a.admin.clone();
         let _build_guard = app.build_guard();
-        match cimon_toolchain::install(&ctx, &kind, def, &entry, &version, &req, &source_ref) {
+        let res = match &a.from {
+            Some(src) => cimon_toolchain::install_from_local(&ctx, &kind, def, &entry, &version, &req, src),
+            None => cimon_toolchain::install(&ctx, &kind, def, &entry, &version, &req, &source_ref),
+        };
+        let source = a.from.as_ref().map(|p| format!("the local copy {} (vouched for by {}, no catalog checksum)", p.display(), a.admin)).unwrap_or_else(|| source_ref.clone());
+        match res {
             Ok(inst) => {
                 let _ = app.store.upsert_install(&inst);
                 let _ = app.store.audit(cimon_store::AuditEntry {
                     user: &a.admin,
                     action: "provision",
                     recipe_commit: Some(&commit),
-                    detail: Some(format!("{kind} {vkey} from {source_ref} ({})", &entry[..8.min(entry.len())])),
+                    detail: Some(format!("{kind} {vkey} from {source} ({})", &entry[..8.min(entry.len())])),
                     ..Default::default()
                 });
-                out.push(ProvisionLine { kind, version: vkey, outcome: format!("installed from {source_ref}"), ok: true });
+                out.push(ProvisionLine { kind, version: vkey, outcome: format!("installed from {source}"), ok: true });
             }
             Err(e) => out.push(ProvisionLine { kind, version: vkey, outcome: format!("FAILED: {}", e.message), ok: false }),
         }

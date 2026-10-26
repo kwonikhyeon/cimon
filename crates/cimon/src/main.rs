@@ -78,6 +78,11 @@ enum Command {
         /// Install from this trial branch's catalog entry, after reviewing it.
         #[arg(long = "recipe-ref")]
         recipe_ref: Option<String>,
+        /// Install --kind at --version from this local copy instead of the catalog's
+        /// source (when that is down). No catalog checksum is checked — you vouch for the
+        /// copy, and the audit log records the path.
+        #[arg(long)]
+        from: Option<PathBuf>,
         /// Recorded in the audit log.
         #[arg(long, default_value_t = whoami())]
         admin: String,
@@ -199,10 +204,10 @@ fn main() -> Result<()> {
             ops::build_git_token(&cfg, url, remove)
         }
         Command::Service => service::run(cli.config.clone()),
-        Command::Provision { project, kind, version, recipe_ref, admin } => {
+        Command::Provision { project, kind, version, recipe_ref, from, admin } => {
             let cfg = load_config(&cli.config)?;
             let app = cimon_engine::App::open(cfg)?;
-            let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, admin })
+            let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, from, admin })
                 .map_err(|e| anyhow::anyhow!(e))?;
             let mut failed = false;
             for l in &lines {
