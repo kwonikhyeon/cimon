@@ -5,7 +5,9 @@
 //! passes through a person's hands.
 //!
 //! These routes take no token — the tailnet is the gate, the code the credential.
-//! Failed codes are slowed down and, past a limit, refused for a while.
+//! Failed codes are slowed down, and redeem attempts are limited per source (the
+//! Tailscale login, or none for a caller on this machine) with a much higher ceiling for
+//! all sources together — one noisy source cannot lock everyone else out.
 
 use axum::{
     extract::State,
@@ -21,10 +23,31 @@ use std::time::{Duration, Instant};
 const PS1: &str = include_str!("connect.ps1");
 const SH: &str = include_str!("connect.sh");
 
-/// Failed redeems in the last window; past the limit every redeem is refused.
-static FAILURES: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
+/// Redeem attempts in the last window, with their source. Counted before the code is
+/// looked up, so parallel requests cannot slip past the limit.
+static ATTEMPTS: Mutex<VecDeque<(Instant, String)>> = Mutex::new(VecDeque::new());
 const WINDOW: Duration = Duration::from_secs(600);
-const MAX_FAILURES: usize = 20;
+/// Per source: a person redeems once; 20 tries leave room for typos.
+const MAX_PER_SOURCE: usize = 20;
+/// All sources: 40-bit codes that live 10 minutes stay out of reach of guessing even at
+/// this rate, and a lockout needs many sources.
+const MAX_TOTAL: usize = 1000;
+
+/// Takes one attempt for `source`, or says why not.
+fn take_attempt(source: &str) -> Result<(), &'static str> {
+    let mut a = ATTEMPTS.lock().unwrap_or_else(|p| p.into_inner());
+    while a.front().is_some_and(|(t, _)| t.elapsed() > WINDOW) {
+        a.pop_front();
+    }
+    if a.iter().filter(|(_, s)| s == source).count() >= MAX_PER_SOURCE {
+        return Err("too many invite code attempts from you - wait 10 minutes");
+    }
+    if a.len() >= MAX_TOTAL {
+        return Err("too many invite code attempts on this server - wait 10 minutes, and tell the admin");
+    }
+    a.push_back((Instant::now(), source.to_string()));
+    Ok(())
+}
 
 /// A served script with this server's address in place of `{{URL}}`.
 pub(crate) fn script(app: &App, template: &str) -> Response {
@@ -56,17 +79,10 @@ pub struct Redeem {
 }
 
 pub async fn redeem(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Json<Redeem>) -> Response {
-    let recent = {
-        let mut f = FAILURES.lock().unwrap_or_else(|p| p.into_inner());
-        while f.front().is_some_and(|t| t.elapsed() > WINDOW) {
-            f.pop_front();
-        }
-        f.len()
-    };
-    if recent >= MAX_FAILURES {
-        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too_many_attempts", "message": "too many wrong invite codes — wait 10 minutes"}))).into_response();
-    }
     let login = headers.get("Tailscale-User-Login").and_then(|v| v.to_str().ok()).map(str::to_string);
+    if let Err(why) = take_attempt(login.as_deref().unwrap_or("")) {
+        return (StatusCode::TOO_MANY_REQUESTS, Json(serde_json::json!({"error": "too_many_attempts", "message": why}))).into_response();
+    }
     let device: String = r.device.unwrap_or_default().chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')).take(64).collect();
     let a = app.clone();
     let code = r.code.clone();
@@ -90,11 +106,10 @@ pub async fn redeem(State(app): State<Arc<App>>, headers: HeaderMap, Json(r): Js
             .into_response()
         }
         Ok(Ok(None)) => {
-            FAILURES.lock().unwrap_or_else(|p| p.into_inner()).push_back(Instant::now());
             let _ = app.store.audit(cimon_store::AuditEntry { user: "?", action: "invite_failed", tailnet_login: login.as_deref(), detail: Some(format!("device {device}")), ..Default::default() });
             // a wrong guess costs time
             tokio::time::sleep(Duration::from_millis(500)).await;
-            (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "invalid_code", "message": "the invite code is wrong, used or expired — ask the admin for a new one (cimon invite)"}))).into_response()
+            (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": "invalid_code", "message": "the invite code is wrong, used or expired - ask the admin for a new one (cimon invite)"}))).into_response()
         }
         Ok(Err(e)) => (StatusCode::CONFLICT, Json(serde_json::json!({"error": "conflict", "message": e.to_string()}))).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),

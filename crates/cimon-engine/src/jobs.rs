@@ -412,7 +412,8 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     }
 
     let job_plan = JobPlan { plan: plan.clone(), versions, siblings: siblings.clone(), repo: project.repo.clone(), notes };
-    let merge_key = merge_key(&job, &commit, &siblings, &plan, request.args.clean, &request.args);
+    let trial_secrets = job.trial && crate::build_secrets::trial_gets_secrets(app, &job.created_by);
+    let merge_key = merge_key(&job, &commit, &siblings, &plan, request.args.clean, &request.args, trial_secrets);
     let _ = app.store.set_intake(id, &commit, &serde_json::to_string(&siblings).unwrap(), &serde_json::to_string(&job_plan).unwrap(), &merge_key);
     let _ = app.store.set_excluded(id, &plan.excluded);
     drop(_mirror_guard);
@@ -462,7 +463,7 @@ fn try_merge(app: &App, id: i64, merge_key: &str) -> bool {
 }
 
 /// Merge key (design §8.3): everything that changes the result.
-fn merge_key(job: &cimon_store::JobRow, commit: &str, siblings: &[SiblingPin], plan: &Plan, clean: bool, args: &RunArgs) -> String {
+fn merge_key(job: &cimon_store::JobRow, commit: &str, siblings: &[SiblingPin], plan: &Plan, clean: bool, args: &RunArgs, trial_secrets: bool) -> String {
     let mut steps = args.steps.clone();
     steps.sort();
     let mut tags = args.tags.clone();
@@ -489,6 +490,10 @@ fn merge_key(job: &cimon_store::JobRow, commit: &str, siblings: &[SiblingPin], p
     let mut v = v;
     if !args.uploads.is_empty() {
         v["uploads_job"] = json!(job.id);
+    }
+    // a member's trial job runs without build secrets, an admin's with them
+    if job.trial {
+        v["trial_secrets"] = json!(trial_secrets);
     }
     cimon_core::sha256_hex(v.to_string().as_bytes())
 }

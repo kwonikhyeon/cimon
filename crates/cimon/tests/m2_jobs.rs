@@ -283,5 +283,24 @@ async fn build_secret_reaches_the_step_env() {
     assert_eq!(v["verdict"], "pass", "{v:#}");
     let (log, _) = call_any(&c, "job_log", json!({"job": v["job_id"], "step": "build"})).await;
     assert!(log["log"].as_str().unwrap().contains("token ok"), "{log:#}");
+
+    // a trial recipe is any member's to write: a member's trial job gets no secrets, an
+    // admin's does
+    let main = h.app.recipes.main_commit().unwrap();
+    let (e, err) = call_any(&c, "recipe_edit", json!({"branch": "recipe/notes", "base": main, "message": "notes", "changes": [{"path": "docs/notes.md", "content": "x"}]})).await;
+    assert!(!err, "{e}");
+    let trial = json!({"project": P, "recipe_ref": "recipe/notes"});
+    let (plan, _) = call_any(&c, "plan", json!({"project": P, "tool": "build", "recipe_ref": "recipe/notes"})).await;
+    assert!(plan["secrets"][0]["state"].as_str().unwrap().contains("관리자가 요청했을 때만"), "{plan:#}");
+    let task = start_task(&c, "build", trial.clone()).await;
+    let (_, v, _) = wait_task(&c, &task, 120).await;
+    assert_eq!(v["verdict"], "inconclusive", "{v:#}");
+    assert_eq!(v["failure_class"], "environment", "{v:#}");
+    assert!(v["summary"].as_str().unwrap().contains("관리자가 요청했을 때만"), "{v:#}");
+    let admin = h.task_client(&h.admin_token).await;
+    let task = start_task(&admin, "build", trial).await;
+    let (_, v, _) = wait_task(&admin, &task, 120).await;
+    assert_eq!(v["verdict"], "pass", "{v:#}");
+    admin.cancel().await.unwrap();
     c.cancel().await.unwrap();
 }

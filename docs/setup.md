@@ -136,7 +136,7 @@ setup 이 자동화하지 않는다. Windows 방화벽(또는 WFP)으로 `cimon-
 git 이 아닌 도구가 **자기 자격 증명**을 요구하는 프로젝트(사내 Conan·npm 레지스트리 등 — 레시피가 `${secret.<name>}` 으로 쓴다)는 그 프로젝트에 **빌드 비밀**을 둔다. `plan` 의 `secrets`, `doctor` 의 `build secret` 이 무엇이 필요한지 보인다. 그 변수를 받는 단계가 모두 읽을 수 있으니 **읽기 전용** 토큰(예: 레지스트리를 읽기만 하는 전용 사용자의 토큰)을 쓴다.
 
 ```powershell
-& $c build-secret <project> <name>                  # 값을 묻는다. 예: build-secret example-app artifactory-conan-token
+& $c build-secret <project> <name>                  # 값을 묻는다(시도 레시피 작업은 관리자가 요청할 때만 받는다). 예: build-secret example-app artifactory-conan-token
 "cimon-build" | & $c build-secret <project> <name>  # 비밀이 아닌 값(사용자 이름 등)은 파이프로
 & $c build-secret                                   # 저장된 비밀 목록(값은 보이지 않는다)
 & $c build-secret <project> <name> --remove

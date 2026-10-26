@@ -56,7 +56,8 @@ foreach ($item in $args) {
         Fail "$name - the server refused: $msg"
     }
     $value = $null
-    [Console]::Error.WriteLine(('cimon upload: {0} ({1}, {2} bytes, sha256 {3}...) - usable until {4}' -f $name, $kind, $r.bytes, $r.sha256.Substring(0, 12), $r.expires_at))
+    $fp = if ($r.sha256) { ', {0} bytes, sha256 {1}...' -f $r.bytes, $r.sha256.Substring(0, 12) } else { '' }
+    [Console]::Error.WriteLine(('cimon upload: {0} ({1}{2}) - usable until {3}' -f $name, $kind, $fp, $r.expires_at))
     $handles[$name] = $r.handle
 }
 # pass this as `uploads` in the build/test/run call

@@ -7,6 +7,24 @@ use cimon_core::Role;
 use common::*;
 use serde_json::{json, Value};
 
+/// Attempts are limited per source: a noisy caller cannot lock everyone else out.
+#[tokio::test]
+async fn redeem_attempts_are_limited_per_source() {
+    let h = Harness::start("").await;
+    let http = reqwest::Client::new();
+    let try_as = |login: &'static str| http.post(format!("{}/connect/redeem", h.base)).header("Tailscale-User-Login", login).json(&json!({"code": "ZZZZ-ZZZZ"})).send();
+    let mut codes = vec![];
+    for _ in 0..21 {
+        codes.push(try_as("noisy@example.invalid").await.unwrap().status().as_u16());
+    }
+    assert!(codes[..20].iter().all(|c| *c == 403), "{codes:?}");
+    assert_eq!(codes[20], 429, "the 21st attempt from that source");
+    assert_eq!(try_as("someone-else@example.invalid").await.unwrap().status(), 403, "another source still gets an answer");
+    let (code, _) = h.app.store.create_invite("dev-other", Role::Member, "admin-a", 10).unwrap();
+    let r = http.post(format!("{}/connect/redeem", h.base)).header("Tailscale-User-Login", "other@example.invalid").json(&json!({"code": code})).send().await.unwrap();
+    assert_eq!(r.status(), 200);
+}
+
 #[tokio::test]
 async fn invite_is_redeemed_once_and_the_scripts_carry_the_address() {
     let h = Harness::start("").await;

@@ -769,7 +769,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
   - GitHub `ssh://`·`git@github.com:` 주소는 https 로 바꾼다(SSH 키가 없다).
   - **등록된 프로젝트의 저장소는 cimon 의 mirror 에서 받는다** — 레시피 트리의 각 프로젝트 `repo`(https 와 두 ssh 표기)를 `url.<mirror>.insteadOf` 로. 자격 증명이 빌드에 들어가지 않고 네트워크를 타지 않는다. cargo 가 `rev` 로 고정한 커밋은 mirror 가 광고하지 않는 객체라 `uploadpack.allowAnySHA1InWant`, 서비스 소유 mirror 를 빌드 계정이 열도록 `safe.directory` 도 함께 둔다(빌드 계정은 mirror 에 쓸 수 없다). mirror 는 그 프로젝트를 마지막으로 받은 만큼 새롭다 — 접수가 작업의 프로젝트와 형제를 받으므로, 의존 저장소를 형제로 두면 늘 최신이다. 더 새 커밋을 원하면 git 이 mirror 경로와 함께 `not our ref` 로 실패한다.
   - 등록되지 않은 비공개 저장소만 관리자가 그 저장소 하나를 읽는 **별도 토큰**을 `cimon build-git-token <저장소 URL>`(표준 입력)로 둔다 — DPAPI 로 `config\build-git.dpapi`, 저장된 URL **에만** HTTP 헤더(`http.<url>.extraheader`)로. 모든 빌드 단계가 볼 수 있으므로 읽기 전용이어야 하고, `doctor --network` 가 접근을 확인한다.
-  - git 이 아닌 도구의 자격 증명(패키지 레지스트리 로그인 등 — Conan 은 `CONAN_LOGIN_USERNAME_<REMOTE>`·`CONAN_PASSWORD_<REMOTE>` 를 읽는다)은 **빌드 비밀**이다. 관리자가 프로젝트 하나에 `cimon build-secret <project> <name>`(표준 입력)로 두면 DPAPI 로 `config\build-secrets.dpapi`, 그 프로젝트의 레시피가 **환경 변수 값에서만** `${secret.<name>}` 으로 넘긴다 — 정적 검사가 명령줄·경로·판정 인자에서는 거절하므로 명령줄·프로세스 목록에 나오지 않는다. 그 변수를 받는 모든 단계(와 그 저장소 코드)가 읽을 수 있고, 도구가 받은 세션 토큰을 홈에 남기면(`conan remote login` → `CONAN_HOME`) 그 홈을 쓰는 뒤 단계도 쓸 수 있으므로 읽기 전용이어야 한다. 단계가 쓰는 비밀이 없으면 그 단계는 `inconclusive`/`environment` 로 끝나고 `cimon build-secret` 명령을 알려 준다. `plan` 은 고른 단계에 필요한 비밀과 있는지를, `doctor` 는 `main` 레시피가 쓰는 비밀이 모두 있는지를 보인다.
+  - git 이 아닌 도구의 자격 증명(패키지 레지스트리 로그인 등 — Conan 은 `CONAN_LOGIN_USERNAME_<REMOTE>`·`CONAN_PASSWORD_<REMOTE>` 를 읽는다)은 **빌드 비밀**이다. 관리자가 프로젝트 하나에 `cimon build-secret <project> <name>`(표준 입력)로 두면 DPAPI 로 `config\build-secrets.dpapi`, 그 프로젝트의 레시피가 **환경 변수 값에서만** `${secret.<name>}` 으로 넘긴다 — 정적 검사가 명령줄·경로·판정 인자에서는 거절하므로 명령줄·프로세스 목록에 나오지 않는다. 그 변수를 받는 모든 단계(와 그 저장소 코드)가 읽을 수 있고, 도구가 받은 세션 토큰을 홈에 남기면(`conan remote login` → `CONAN_HOME`) 그 홈을 쓰는 뒤 단계도 쓸 수 있으므로 읽기 전용이어야 한다. 단계가 쓰는 비밀이 없으면 그 단계는 `inconclusive`/`environment` 로 끝나고 `cimon build-secret` 명령을 알려 준다(fixture 를 올리기 전에 확인한다). `plan` 은 고른 단계에 필요한 비밀과 있는지를, `doctor` 는 `main` 레시피가 쓰는 비밀이 모두 있는지를 보인다. **시도 레시피 작업은 관리자가 요청했을 때만 비밀을 받는다** — 시도 브랜치는 팀원 누구나 만들 수 있어 비밀을 출력하는 단계를 넣을 수 있다. 팀원의 시도 작업에서 비밀이 필요한 단계는 `inconclusive`/`environment` 로 끝나고, 관리자의 시도 작업과 병합되지 않는다. 단일 계정 모드(`[accounts].build = ""`, 시험용)에서는 작업이 서비스 계정으로 돌아 `config\` 의 비밀 파일을 직접 풀 수 있다.
   - 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
 - `core.longpaths=true`.
 
@@ -778,7 +778,7 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 빌드 머신에 두지 않는 비밀(릴리스 서명 키, 현장 TLS 키, 그 비밀번호)이 필요한 단계는, 요청하는 사람이 자기 PC 에서 작업 하나에만 넘긴다. 레시피가 `[upload.<name>]` 으로 무엇을 어느 단계가 받는지 선언한다(recipe-spec §8a).
 
 1. **올리기**: 호출자 PC 의 업로드 스크립트가 파일(또는 환경 변수·입력 프롬프트의 한 줄 값)을 `POST /uploads?kind=file|text&label=<name>` 에 사용자 토큰으로 보낸다. 스크립트는 서버가 내준다(`GET /upload.ps1`·`/upload.sh`). connect 스크립트가 `~/.cimon/` 에 받아 둔다. 내용은 PC 에서 서버로만 가고, Claude 대화나 도구 인자에는 들어가지 않는다. 모델이 보는 것은 명령줄(경로·변수 이름)과 핸들뿐이다.
-2. **보관**: 서버는 바이트를 DPAPI 로 `state\uploads\<handle>` 에 두고(서비스만 읽는다) DB 에 이름·종류·크기·sha256·올린 사람·만료를 남긴다. 핸들(`u_` + 128비트 난수)은 올린 사람만 쓸 수 있다. 아무 작업도 받지 않으면 `[uploads].ttl_minutes`(기본 60분) 뒤 지운다. 파일 크기는 `max_bytes`(기본 1 MiB), text 는 4 KiB 한 줄이다. 한 사람이 기다리게 둘 수 있는 업로드는 `max_pending_per_user`(기본 20)개다.
+2. **보관**: 서버는 바이트를 DPAPI 로 `state\uploads\<handle>` 에 두고(서비스만 읽는다) DB 에 이름·종류·크기·sha256·올린 사람·만료를 남긴다. 응답·`plan`·결과·경고·감사 로그에는 파일의 크기·sha256 만 내고, **text 값의 해시와 길이는 내지 않는다**(비밀번호 해시는 사전 대입으로 풀린다). 기다리는 업로드 수는 기록과 같은 트랜잭션에서 센다. 핸들(`u_` + 128비트 난수)은 올린 사람만 쓸 수 있다. 아무 작업도 받지 않으면 `[uploads].ttl_minutes`(기본 60분) 뒤 지운다. 파일 크기는 `max_bytes`(기본 1 MiB), text 는 4 KiB 한 줄이다. 한 사람이 기다리게 둘 수 있는 업로드는 `max_pending_per_user`(기본 20)개다.
 3. **요청**: `build`·`test`·`run` 의 `uploads` 에 `{이름: 핸들}`. 거절하는 경우는 다음과 같다.
    - 고른 단계가 받는 업로드가 없다(`upload_missing`). 거절 메시지가 올리는 명령을 알려 준다.
    - 받지 않는 단계에 업로드를 줬다(`upload_unused`).
@@ -787,8 +787,8 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
    - 남의 핸들, 쓴 핸들, 만료된 핸들, 종류가 다른 핸들이다(`upload_invalid`).
 
    작업을 만드는 트랜잭션에서 핸들을 그 작업에 묶는다 — 동시에 같은 핸들을 쓰는 두 요청 중 하나만 된다.
-4. **실행**: 업로드를 받는 작업은 그 호출자만의 것이다. **병합하지 않고**, `clean` 이 없어도 **일회 클론**으로 짓고, 패키지 캐시(`CARGO_HOME`·`GRADLE_USER_HOME` 등)와 프로젝트 범위 `[isolate]`·`[account_env]` 홈을 **작업 전용**으로 바꾼다. 다른 작업이 warm 트리나 캐시에 심어 둔 것이 키를 받는 작업에서 돌지 않게 하려는 것이다(§15.2 「받아들이는 위험」). 시작할 때 파일을 `homes\j<id>\uploads\` 에 풀고, 단계는 `${upload.<name>}` 으로 경로를, text 는 환경 변수 값으로 받는다. 단계 로그와 판정 출력에서 text 값은 `***` 로 바꾼다. 결과 경고에 받은 업로드(이름·sha256 앞자리)를 적는다.
-5. **정리**: 작업이 끝나면(통과·실패·취소·시작 전 종료 모두) 풀어 둔 파일과 `state\uploads\` 의 바이트를 지운다. 매분 도는 정리가 놓친 것을 마저 지운다. DB 행은 기록으로 남고, 결과와 provenance 에는 이름·크기·sha256·올린 사람만 적힌다. 감사 로그에는 `upload`(올림)와 `upload_used`(어느 작업에 묶였나)가 남는다.
+4. **실행**: 업로드를 받는 작업은 그 호출자만의 것이다. **병합하지 않고**, `clean` 이 없어도 **일회 클론**으로 짓고, 형제 트리도 새로 클론하고(`beside` 형제는 거절), 패키지 캐시(`CARGO_HOME`·`GRADLE_USER_HOME` 등)와 프로젝트 범위 `[isolate]`·`[account_env]` 홈을 **작업 전용**으로 바꾼다. 다른 작업이 warm 트리나 캐시에 심어 둔 것이 키를 받는 작업에서 돌지 않게 하려는 것이다(§15.2 「받아들이는 위험」). 작업 번호는 예측할 수 있고 빌드 계정은 `homes\`·`tmp\` 에 항목을 만들 수 있으므로, **모든 작업은 시작할 때 `homes\j<id>`·`tmp\j<id>` 를 비운다**(링크는 따라가지 않고 지운다. 이미 있었으면 경고). 그 뒤 업로드 파일을 새로 만든 `homes\j<id>\uploads\` 에 새 파일로 쓴다(이미 있거나 링크 아래면 실패). 단계는 `${upload.<name>}` 으로 경로를, text 는 환경 변수 값으로 받는다. 단계 로그와 판정 출력에서 text 값은 `***` 로 바꾼다. 결과 경고에 받은 업로드(이름·sha256 앞자리)를 적는다.
+5. **정리**: 작업이 끝나면(통과·실패·취소·시작 전 종료 모두) 풀어 둔 파일과 `state\uploads\` 의 바이트를 지운다. 매분 도는 정리가 놓친 것(지우지 못한 업로드 폴더, 기록 없이 남은 바이트)을 마저 지운다. DB 행은 기록으로 남고, 결과와 provenance 에는 이름·크기·sha256·올린 사람만 적힌다. 감사 로그에는 `upload`(올림)와 `upload_used`(어느 작업에 묶였나)가 남는다.
 
 **남는 위험**: 그 커밋의 빌드 코드는 받은 키를 읽을 수 있다 — 키를 가진 PC 에서 직접 빌드할 때와 같다. 빌드 계정의 프로필(`%USERPROFILE%`)은 작업 사이에 공유되므로, 거기 남은 파일(예: PowerShell 프로필)까지는 막지 못한다. 완전히 떼려면 프로젝트별 빌드 계정이나 VM 이 필요하다(§17).
 
@@ -1159,7 +1159,7 @@ login_code_minutes = 5
 1. Tailscale 설치 → 회사 계정 로그인 → tailnet 관리자가 `group:cimon-users` 에 넣는다.
 2. Claude Code v2.1.304 이상.
 3. 관리자가 `cimon invite <이름>` 으로 **초대 코드**(Crockford base32 8자 = 40비트, 기본 10분, 한 번)를 만든다. 서버에는 코드의 해시와 이름·역할만 남는다.
-4. 팀원이 서버가 내주는 스크립트를 실행한다 — `GET /connect.ps1` · `GET /connect.sh`(서버 주소가 박혀 있고 비밀은 없다). 스크립트가 `POST /connect/redeem` 에 코드를 내면 서버가 그때 사용자를 만들어 토큰을 돌려주고(한 트랜잭션에서 초대를 쓰고 사용자를 만든다), 스크립트가 토큰을 OS 보관소에 넣고 §15.4 의 헤더 도우미와 등록을 대신 한 뒤 `claude mcp get` 으로 연결을 확인한다. 이 경로들은 토큰 없이 열려 있다 — tailnet 이 문이고 코드가 자격 증명이다. 틀린 코드는 0.5초씩 늦게 답하고, 10분에 20번 넘게 틀리면 그동안 모든 교환을 거절한다. 교환·실패는 Tailscale 신원과 함께 감사 로그에.
+4. 팀원이 서버가 내주는 스크립트를 실행한다 — `GET /connect.ps1` · `GET /connect.sh`(서버 주소가 박혀 있고 비밀은 없다). 스크립트가 `POST /connect/redeem` 에 코드를 내면 서버가 그때 사용자를 만들어 토큰을 돌려주고(한 트랜잭션에서 초대를 쓰고 사용자를 만든다), 스크립트가 토큰을 OS 보관소에 넣고 §15.4 의 헤더 도우미와 등록을 대신 한 뒤 `claude mcp get` 으로 연결을 확인한다. 이 경로들은 토큰 없이 열려 있다 — tailnet 이 문이고 코드가 자격 증명이다. 틀린 코드는 0.5초씩 늦게 답한다. 교환 시도는 코드를 찾기 전에 센다 — 출처(Tailscale 로그인, 없으면 이 머신의 호출)마다 10분에 20번, 모든 출처를 합쳐 1000번. 한 출처가 시끄러워도 다른 사람의 연결은 막히지 않고, 40비트·10분짜리 코드는 그 속도로도 맞힐 수 없다. 스크립트는 거절 이유(틀린 코드·시도 초과)를 그대로 보인다. 교환·실패는 Tailscale 신원과 함께 감사 로그에.
 5. 확인: `/mcp` 에 cimon 연결, `list_projects` 가 프로젝트 목록.
 
 토큰을 직접 주는 길(`cimon token create`, §15.4 의 수동 등록)도 남는다.

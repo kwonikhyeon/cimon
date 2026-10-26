@@ -28,9 +28,16 @@ else
 fi
 code=$(printf '%s' "$code" | tr -cd 'A-Za-z0-9-')
 device=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')
-resp=$(curl -fsS -X POST -H 'Content-Type: application/json' \
+resp=$(curl -sS -X POST -H 'Content-Type: application/json' -w '\n%{http_code}' \
   --data "{\"code\":\"$code\",\"device\":\"$device\"}" "$CIMON_URL/connect/redeem") \
-  || fail "the server refused the code - ask the admin for a new one (cimon invite)"
+  || fail "could not reach $CIMON_URL"
+status=$(printf '%s' "$resp" | tail -n 1)
+resp=$(printf '%s' "$resp" | sed '$d')
+if [ "$status" != 200 ]; then
+  # the server says why: a wrong or used code, or too many attempts
+  msg=$(printf '%s' "$resp" | sed -n 's/.*"message":"\([^"]*\)".*/\1/p')
+  fail "the server refused ($status): ${msg:-$resp}"
+fi
 token=$(printf '%s' "$resp" | sed -n 's/.*"token":"\([0-9a-f]*\)".*/\1/p')
 user=$(printf '%s' "$resp" | sed -n 's/.*"user":"\([A-Za-z0-9._-]*\)".*/\1/p')
 [ -n "$token" ] || fail "unexpected answer from the server"
@@ -39,8 +46,10 @@ mkdir -p "$HOME/.cimon"
 chmod 700 "$HOME/.cimon"
 case "$(uname -s)" in
   Darwin)
-    # -U replaces an earlier entry; the token is on this command line for a moment
-    security add-generic-password -U -a "$USER" -s cimon -w "$token" >/dev/null \
+    # -U replaces an earlier entry. The command goes to `security -i` on stdin (printf is
+    # a shell builtin) so the token is on no command line; read back to be sure it took
+    printf 'add-generic-password -U -a "%s" -s cimon -w "%s"\n' "$USER" "$token" | security -i >/dev/null 2>&1 || true
+    [ "$(security find-generic-password -a "$USER" -s cimon -w 2>/dev/null)" = "$token" ] \
       || fail "could not store the token in the keychain"
     get='security find-generic-password -a "$USER" -s cimon -w'
     ;;

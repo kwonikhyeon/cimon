@@ -49,7 +49,14 @@ function Invoke-Claude([string[]]$ArgList, [switch]$Quiet, [switch]$Capture) {
 $code = if ($env:CIMON_INVITE_CODE) { $env:CIMON_INVITE_CODE.Trim() } else { (Read-Host 'cimon invite code').Trim() }
 $body = @{ code = $code; device = $env:COMPUTERNAME } | ConvertTo-Json -Compress
 try { $r = Invoke-RestMethod -Method Post -Uri "$CimonUrl/connect/redeem" -ContentType 'application/json' -Body $body -UseBasicParsing }
-catch { Fail "the server refused the code ($($_.Exception.Message)) - ask the admin for a new one (cimon invite)" }
+catch {
+    # the server says why: a wrong or used code, or too many attempts
+    $e = $_
+    $msg = $e.ErrorDetails.Message
+    try { $msg = ($msg | ConvertFrom-Json).message } catch {}
+    if (-not $msg) { $msg = $e.Exception.Message }
+    Fail "the server refused: $msg"
+}
 
 $dir = Join-Path $env:USERPROFILE '.cimon'
 New-Item -ItemType Directory -Force $dir | Out-Null
@@ -73,7 +80,7 @@ if ($rc -ne 0) { Fail "claude mcp add-json exited $rc" }
 # register something else and still exit 0), and its own connection check — through the
 # header helper, with the token — must pass
 $got = Invoke-Claude @('mcp', 'get', 'cimon') -Capture
-if ($got -notmatch [regex]::Escape("$CimonUrl/mcp") -or $got -notmatch 'Connected') { Fail "claude mcp get cimon does not show a connected server at $CimonUrl/mcp:`n$got" }
+if ($got -notmatch [regex]::Escape("$CimonUrl/mcp") -or $got -cnotmatch '\bConnected\b') { Fail "claude mcp get cimon does not show a connected server at $CimonUrl/mcp:`n$got" }
 
 try { $h = Invoke-RestMethod -Uri "$CimonUrl/healthz" -Headers @{ Authorization = "Bearer $($r.token)" } -UseBasicParsing }
 catch { Fail "registered, but the server did not accept the token: $($_.Exception.Message)" }

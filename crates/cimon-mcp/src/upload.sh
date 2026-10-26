@@ -20,7 +20,9 @@ command -v curl >/dev/null 2>&1 || fail "curl is needed"
 auth=$(sh "$HOME/.cimon/header.sh" | sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p')
 [ -n "$auth" ] || fail "~/.cimon/header.sh printed no Authorization header"
 cfg=$(umask 077 && mktemp)
-trap 'rm -f "$cfg"' EXIT
+# also on Ctrl-C at a prompt: echo back on, the config file gone
+trap 'stty echo < /dev/tty 2>/dev/null; rm -f "$cfg"' EXIT
+trap 'exit 130' INT TERM
 printf 'header = "Authorization: %s"\n' "$auth" > "$cfg"
 unset auth
 
@@ -35,6 +37,7 @@ for item in "$@"; do
   case "$src" in
     prompt)
       kind=text
+      { : < /dev/tty; } 2>/dev/null || fail "$name=prompt needs a terminal - use $name=env:<VARIABLE>"
       printf '%s: ' "$name" > /dev/tty
       stty -echo < /dev/tty 2>/dev/null || true
       IFS= read -r value < /dev/tty || value=""
@@ -70,7 +73,9 @@ for item in "$@"; do
   bytes=$(printf '%s' "$body" | sed -n 's/.*"bytes":\([0-9]*\).*/\1/p')
   until=$(printf '%s' "$body" | sed -n 's/.*"expires_at":"\([^"]*\)".*/\1/p')
   [ -n "$handle" ] || fail "$name - unexpected answer from the server: $body"
-  printf 'cimon upload: %s (%s, %s bytes, sha256 %s...) - usable until %s\n' "$name" "$kind" "$bytes" "$sha" "$until" >&2
+  fp=""
+  [ -n "$sha" ] && fp=", $bytes bytes, sha256 $sha..."
+  printf 'cimon upload: %s (%s%s) - usable until %s\n' "$name" "$kind" "$fp" "$until" >&2
   out="$out${out:+,}\"$name\":\"$handle\""
 done
 # pass this as `uploads` in the build/test/run call

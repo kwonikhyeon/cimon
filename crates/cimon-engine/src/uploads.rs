@@ -91,14 +91,6 @@ pub fn receive(app: &App, user: &str, label: &str, kind: &str, data: &[u8]) -> R
     if data.is_empty() {
         return Err(UploadError::new(400, "empty", "nothing was sent"));
     }
-    let pending = app.store.pending_uploads(user).map_err(|e| UploadError::new(500, "store_error", e.to_string()))?;
-    if pending >= app.config.uploads.max_pending_per_user as i64 {
-        return Err(UploadError::new(
-            429,
-            "too_many_uploads",
-            format!("you have {pending} uploads no job has taken - use them or let them expire ({} min)", app.config.uploads.ttl_minutes),
-        ));
-    }
     let handle = format!("u_{}", cimon_core::random_id128());
     let sha = cimon_core::sha256_hex(&data);
     let path = blob(app, &handle);
@@ -108,17 +100,38 @@ pub fn receive(app: &App, user: &str, label: &str, kind: &str, data: &[u8]) -> R
     };
     write().map_err(|e| UploadError::new(500, "store_error", format!("could not keep the upload: {e}")))?;
     let expires = cimon_core::after_secs(app.config.uploads.ttl_minutes as i64 * 60);
-    if let Err(e) = app.store.create_upload(&handle, user, label, kind, data.len() as i64, &sha, &expires) {
-        let _ = std::fs::remove_file(&path);
-        return Err(UploadError::new(500, "store_error", e.to_string()));
+    // the limit is checked in the insert's transaction, so parallel uploads cannot pass it
+    match app.store.create_upload(&handle, user, label, kind, data.len() as i64, &sha, &expires, app.config.uploads.max_pending_per_user as i64) {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(match e {
+                cimon_store::StoreError::Conflict(_) => UploadError::new(
+                    429,
+                    "too_many_uploads",
+                    format!("you have {} uploads no job has taken - use them or let them expire ({} min)", app.config.uploads.max_pending_per_user, app.config.uploads.ttl_minutes),
+                ),
+                e => UploadError::new(500, "store_error", e.to_string()),
+            });
+        }
     }
-    let _ = app.store.audit(cimon_store::AuditEntry {
-        user,
-        action: "upload",
-        detail: Some(format!("{handle} {label} {kind} {} bytes sha256 {}", data.len(), &sha[..12])),
-        ..Default::default()
+    let mut v = json!({ "handle": handle, "label": label, "kind": kind, "expires_at": expires });
+    // a text upload is a password: its hash and length would let anyone who sees the
+    // conversation or a result try a dictionary (they are kept in the service's database
+    // only, to check the bytes before a job gets them)
+    let fp = (kind == "file").then(|| {
+        v["bytes"] = json!(data.len());
+        v["sha256"] = json!(sha);
+        format!(" {} bytes sha256 {}", data.len(), &sha[..12])
     });
-    Ok(json!({ "handle": handle, "label": label, "kind": kind, "bytes": data.len(), "sha256": sha, "expires_at": expires }))
+    let _ = app.store.audit(cimon_store::AuditEntry { user, action: "upload", detail: Some(format!("{handle} {label} {kind}{}", fp.unwrap_or_default())), ..Default::default() });
+    Ok(v)
+}
+
+/// What results, warnings and `plan` may show of an upload: a file's size and hash
+/// prefix; nothing of a text value.
+pub fn fingerprint(u: &cimon_store::UploadRow) -> Option<String> {
+    (u.kind == "file").then(|| format!("{} bytes, sha256 {}…", u.bytes, &u.sha256[..12]))
 }
 
 /// How a caller uploads `names` — what a refusal and `plan` say.
@@ -157,6 +170,10 @@ pub fn check_declared(v: &Validated, args: &RunArgs) -> Result<(), Rejection> {
         return Ok(());
     }
     let steps: Vec<&str> = v.plan.steps.iter().map(|s| s.id.as_str()).filter(|s| r.uploads.values().any(|u| u.applies_to.iter().any(|a| a == s))).collect();
+    // a `beside` sibling lives in the project's shared tree, which earlier jobs changed
+    if let Some(s) = r.project.sibling.iter().find(|s| s.place == "beside") {
+        return Err(Rejection::new("upload_sibling_beside", format!("{} get uploads, and sibling {} is placed beside the work tree, where earlier jobs build — make it isolated", steps.join(", "), s.project)));
+    }
     if v.trial {
         return Err(Rejection::new(
             "upload_trial_recipe",
@@ -218,7 +235,7 @@ pub fn plan_view(app: &App, user: &str, v: &Validated, args: &RunArgs) -> Vec<Va
             let state = match args.uploads.get(name) {
                 None => format!("필요 — {}", how_to(r, &[name])),
                 Some(h) => match waiting(app, user, h) {
-                    Some(row) if row.kind == u.kind_str() => format!("받음 — {} bytes, sha256 {}…, {} 까지", row.bytes, &row.sha256[..12], row.expires_at),
+                    Some(row) if row.kind == u.kind_str() => format!("받음 — {}{} 까지", fingerprint(&row).map(|f| format!("{f}, ")).unwrap_or_default(), row.expires_at),
                     Some(row) => format!("종류가 다르다 — {} 업로드가 필요한데 {h} 는 {}", u.kind_str(), row.kind),
                     None => format!("{h} 는 기다리는 업로드가 아니다(만료·사용됨·없음) — 다시 올린다"),
                 },
@@ -237,8 +254,15 @@ pub fn materialize(app: &App, job_id: i64, r: &Resolved) -> Result<BTreeMap<Stri
     if rows.is_empty() {
         return Ok(out);
     }
+    // homes\j<id> was emptied as the job started; the folder must be new and not under
+    // a link, and every file new in it — nothing an earlier job made can catch the bytes
     let dir = app.layout.home_job(job_id, "uploads");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let homes = app.layout.root.join("homes");
+    std::fs::create_dir_all(app.layout.homes_job_dir(job_id)).map_err(|e| format!("{}: {e}", dir.display()))?;
+    if let Some(l) = cimon_runner::link_on_path(&homes, &dir) {
+        return Err(format!("{} is a link or junction", l.display()));
+    }
+    std::fs::create_dir(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for row in rows {
         let name = row.name.clone().unwrap_or_default();
         let def = r.uploads.get(&name).ok_or_else(|| format!("upload {name} is not in this recipe"))?;
@@ -250,7 +274,11 @@ pub fn materialize(app: &App, job_id: i64, r: &Resolved) -> Result<BTreeMap<Stri
             Received::Text(String::from_utf8(data).map_err(|_| format!("upload {name} is not UTF-8"))?)
         } else {
             let p = dir.join(def.file.clone().unwrap_or_else(|| name.clone()));
-            std::fs::write(&p, &data).map_err(|e| format!("{}: {e}", p.display()))?;
+            let write = || -> std::io::Result<()> {
+                use std::io::Write;
+                std::fs::OpenOptions::new().write(true).create_new(true).open(&p)?.write_all(&data)
+            };
+            write().map_err(|e| format!("{}: {e}", p.display()))?;
             Received::File(p)
         };
         out.insert(name, v);
@@ -267,24 +295,61 @@ fn delete(app: &App, handle: &str) {
     }
 }
 
-/// Deletes the bytes of a finished job's uploads; the rows stay as the record.
+/// Deletes the bytes of a finished job's uploads — the kept copy and the one handed to
+/// its steps; the rows stay as the record.
 pub fn release_job(app: &App, job_id: i64) {
-    for row in app.store.job_uploads(job_id).unwrap_or_default() {
+    let rows = app.store.job_uploads(job_id).unwrap_or_default();
+    if rows.is_empty() {
+        return;
+    }
+    remove_handed(app, job_id);
+    for row in rows {
         if row.deleted_at.is_none() {
             delete(app, &row.handle);
         }
     }
 }
 
+/// `homes\j<id>\uploads` (a link is removed, not followed).
+fn remove_handed(app: &App, job_id: i64) {
+    let dir = app.layout.home_job(job_id, "uploads");
+    if std::fs::symlink_metadata(&dir).is_ok() {
+        if let Err(e) = cimon_workspace::remove_dir_all_robust(&dir) {
+            tracing::warn!("{} not removed (the minute sweep retries): {e}", dir.display());
+        }
+    }
+}
+
 /// Every minute: uploads nobody took in time and those of finished jobs (a job that
-/// ended before its runner started — intake failure, cancel, queue timeout).
+/// ended before its runner started — intake failure, cancel, queue timeout); a handed
+/// copy whose removal failed; bytes kept without a row (a crash between writing them and
+/// recording them).
 pub fn sweep(app: &App) {
     for h in app.store.uploads_to_delete().unwrap_or_default() {
         delete(app, &h);
     }
+    if let Ok(rd) = std::fs::read_dir(app.layout.root.join("homes")) {
+        for e in rd.flatten() {
+            let id = e.file_name().to_string_lossy().strip_prefix('j').and_then(|n| n.parse::<i64>().ok());
+            let Some(id) = id else { continue };
+            if std::fs::symlink_metadata(app.layout.home_job(id, "uploads")).is_ok() && app.store.job(id).ok().flatten().is_none_or(|j| j.state.is_terminal()) {
+                remove_handed(app, id);
+            }
+        }
+    }
+    if let Ok(rd) = std::fs::read_dir(app.layout.uploads()) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            let old = e.metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.elapsed().ok()).is_some_and(|d| d.as_secs() > 600);
+            if old && app.store.upload(&name).ok().flatten().is_none() {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
 }
 
-/// The job result's and provenance's record: fingerprints, never the bytes.
+/// The job result's and provenance's record: who handed what over — a file's size and
+/// sha256, nothing of a text value.
 pub fn record(app: &App, job_id: i64) -> Option<Value> {
     let rows = app.store.job_uploads(job_id).unwrap_or_default();
     if rows.is_empty() {
@@ -292,7 +357,14 @@ pub fn record(app: &App, job_id: i64) -> Option<Value> {
     }
     let m: serde_json::Map<String, Value> = rows
         .into_iter()
-        .map(|u| (u.name.clone().unwrap_or_default(), json!({"kind": u.kind, "bytes": u.bytes, "sha256": u.sha256, "by": u.user})))
+        .map(|u| {
+            let mut v = json!({"kind": u.kind, "by": u.user});
+            if u.kind == "file" {
+                v["bytes"] = json!(u.bytes);
+                v["sha256"] = json!(u.sha256);
+            }
+            (u.name.clone().unwrap_or_default(), v)
+        })
         .collect();
     Some(Value::Object(m))
 }

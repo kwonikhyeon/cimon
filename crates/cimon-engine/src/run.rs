@@ -162,6 +162,21 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     if build.is_some() {
         sweep(app, &mut warnings, "시작 전");
     }
+    // per-job folders start empty: the build account can create entries under homes\ and
+    // tmp\ and job ids are predictable — an earlier job could have planted a Gradle init
+    // script or a junction for this one (design §11.7)
+    match fresh_job_dirs(app, id) {
+        Ok(found) => {
+            for d in found {
+                warnings.push(Warning::new("workspace", format!("{} 가 작업 시작 전부터 있었다 — 지우고 시작했다(다른 작업이 미리 만들었을 수 있다)", d.display())));
+            }
+        }
+        Err(e) => {
+            finish_infra(app, &job, &format!("작업 폴더를 비우지 못했다: {e}"), &warnings);
+            cleanup(app, &job, None, request.args.clean, &plan, &resolved);
+            return;
+        }
+    }
     let deadline = started + Duration::from_secs(resolved.project.max_job_minutes as u64 * 60);
 
     // workspace (design §11) — its git runs as the build account
@@ -181,7 +196,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     };
     let mut siblings = BTreeMap::new();
     for s in &plan.siblings {
-        match prepare_sibling(app, &tree_git, &job, s, &ws) {
+        match prepare_sibling(app, &tree_git, &job, s, &ws, !request.args.uploads.is_empty()) {
             Ok(dir) => {
                 siblings.insert(s.project.clone(), dir);
             }
@@ -218,7 +233,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
     };
     if !uploads.is_empty() {
         let rows = app.store.job_uploads(id).unwrap_or_default();
-        let list: Vec<String> = rows.iter().map(|u| format!("{}(sha256 {}…)", u.name.clone().unwrap_or_default(), &u.sha256[..12])).collect();
+        let list: Vec<String> = rows.iter().map(|u| format!("{}{}", u.name.clone().unwrap_or_default(), crate::uploads::fingerprint(u).map(|f| format!("({f})")).unwrap_or_default())).collect();
         warnings.push(Warning::new("upload", format!("업로드 {} 를 받았다 — 일회 클론과 작업 전용 캐시로 짓고, 작업이 끝나면 지운다", list.join(", "))));
     }
     let account = build.as_ref().map(|b| b.account()).unwrap_or(cimon_runner::Account::Current);
@@ -241,7 +256,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         cancel,
         deadline,
         clean: request.args.clean,
-        secrets: crate::build_secrets::load(&app.layout).map(|mut all| all.remove(&job.project).unwrap_or_default()),
+        secrets: crate::build_secrets::for_job(app, &job.project, job.trial, &job.created_by),
         uploads,
     };
     crate::fixtures::account_env(&mut ctx, true);
@@ -423,7 +438,9 @@ fn prepare_workspace(
     Ok((dir, recreated, Some(slot)))
 }
 
-fn prepare_sibling(app: &App, git: &dyn cimon_workspace::TreeGit, job: &JobRow, s: &jobs::SiblingPin, ws: &Path) -> Result<PathBuf, String> {
+/// `fresh`: a job that gets uploads clones the sibling anew rather than reuse a tree an
+/// earlier job could have changed (design §11.7; `beside` siblings are refused for it).
+fn prepare_sibling(app: &App, git: &dyn cimon_workspace::TreeGit, job: &JobRow, s: &jobs::SiblingPin, ws: &Path, fresh: bool) -> Result<PathBuf, String> {
     let mirror = Mirror::open(&app.layout.mirror(&s.project_key)).ok_or("sibling mirror missing")?;
     let dir = if s.place == "beside" {
         ws.parent().ok_or("work tree has no parent")?.join(&s.project)
@@ -431,9 +448,29 @@ fn prepare_sibling(app: &App, git: &dyn cimon_workspace::TreeGit, job: &JobRow, 
         app.layout.sibling_isolated(&job.project_key, job.id).join(&s.project)
     };
     check_no_links(&app.layout.ws(), &dir)?;
-    let (_, _, _) = WorkTree::prepare_warm(git, &mirror, &dir, &s.commit, &[]).map_err(|e| e.to_string())?;
+    if fresh {
+        WorkTree::create(git, &mirror, &dir, &s.commit).map_err(|e| e.to_string())?;
+    } else {
+        WorkTree::prepare_warm(git, &mirror, &dir, &s.commit, &[]).map_err(|e| e.to_string())?;
+    }
     mirror.keep(&format!("j{}-sibling", job.id), &s.commit).map_err(|e| e.to_string())?;
     Ok(dir)
+}
+
+/// Empties `homes\j<id>` and `tmp\j<id>` before a job starts (a link is removed, not
+/// followed). Returns what was already there.
+fn fresh_job_dirs(app: &App, id: i64) -> Result<Vec<PathBuf>, String> {
+    let mut found = vec![];
+    for d in [app.layout.homes_job_dir(id), app.layout.tmp_job(id)] {
+        let Ok(md) = std::fs::symlink_metadata(&d) else { continue };
+        found.push(d.clone());
+        let res = if md.is_file() { std::fs::remove_file(&d) } else { cimon_workspace::remove_dir_all_robust(&d) };
+        res.map_err(|e| format!("{}: {e}", d.display()))?;
+        if std::fs::symlink_metadata(&d).is_ok() {
+            return Err(format!("{} is still there", d.display()));
+        }
+    }
+    Ok(found)
 }
 
 /// Removes per-job directories (design §9.1 step 7, §16.4 crash leftovers).
@@ -585,6 +622,16 @@ fn run_steps(ctx: &mut JobCtx<'_>, slot: Option<i64>, recreated: bool) -> Vec<St
                 let _ = app.store.update_step(id, &recs[i].row());
                 continue;
             }
+        }
+        // a missing secret is the admin's to fix — say so before a fixture's env fails to
+        // expand it (which would read as infra or code)
+        if let Err(o) = ctx.check_secrets(&step) {
+            recs[i].result = verdict_result(o.verdict);
+            recs[i].outcome = Some(o);
+            recs[i].finished = Some(now());
+            let _ = app.store.update_step(id, &recs[i].row());
+            fixtures.step_done(ctx, &sid, &mut recs);
+            continue;
         }
         // fixture up
         if let Some(fname) = step.def.fixture.clone() {
@@ -1037,13 +1084,21 @@ impl JobCtx<'_> {
     /// blank out ordinary words). Build secrets are not among them — they also hold
     /// plain values such as a registry user name (setup.md), which logs must keep.
     pub fn redactions(&self) -> Vec<String> {
-        self.uploads
-            .values()
-            .filter_map(|u| match u {
-                crate::uploads::Received::Text(t) if t.len() >= 4 => Some(t.clone()),
-                _ => None,
-            })
-            .collect()
+        let mut out = vec![];
+        for u in self.uploads.values() {
+            if let crate::uploads::Received::Text(t) = u {
+                if t.len() >= 4 {
+                    out.push(t.clone());
+                    // as a judge script prints it inside JSON
+                    let quoted = serde_json::to_string(t).unwrap_or_default();
+                    let esc = quoted.get(1..quoted.len().saturating_sub(1)).unwrap_or_default();
+                    if esc != t {
+                        out.push(esc.to_string());
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// A job that gets uploads keeps nothing another job could have left — package
@@ -1060,7 +1115,7 @@ impl JobCtx<'_> {
         if needs.is_empty() {
             return Ok(());
         }
-        let have = self.secrets.as_ref().map_err(|e| Outcome::inconclusive(FailureClass::Environment, format!("비밀을 읽지 못했다: {e}")))?;
+        let have = self.secrets.as_ref().map_err(|e| Outcome::inconclusive(FailureClass::Environment, e.clone()))?;
         match needs.iter().find(|n| !have.contains_key(*n)) {
             Some(n) => Err(Outcome::inconclusive(FailureClass::Environment, crate::build_secrets::missing(&self.job.project, n))),
             None => Ok(()),

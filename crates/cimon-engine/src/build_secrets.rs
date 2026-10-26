@@ -6,7 +6,12 @@
 //! an environment value, `${secret.<name>}`. The static check allows it nowhere else,
 //! so it never reaches a command line or a path. Every step that gets the variable can
 //! read it: store read-only credentials.
+//!
+//! A trial recipe is anyone's to write — a member could add a step that prints a secret
+//! — so a trial job gets the secrets only when an admin, who can read them anyway, asked
+//! for it (and has looked at the branch).
 
+use crate::App;
 use cimon_core::Layout;
 use cimon_recipe::{vars, Resolved, Step};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,6 +45,23 @@ pub fn step_needs(r: &Resolved, step: &Step, clean: bool) -> BTreeSet<String> {
     }
     texts.extend(step.def.env.values());
     vars::secret_refs(texts)
+}
+
+/// Why a trial job asked for by a member gets no secrets.
+pub const TRIAL_DENIED: &str = "시도 레시피 작업은 관리자가 요청했을 때만 빌드 비밀을 받는다 — 시도 브랜치는 팀원 누구나 만들 수 있어 비밀을 출력하는 단계를 넣을 수 있다";
+
+/// Whether a job of `requester` on a trial recipe gets the project's secrets.
+pub fn trial_gets_secrets(app: &App, requester: &str) -> bool {
+    app.store.user(requester).ok().flatten().is_some_and(|u| u.is_admin())
+}
+
+/// The secrets a job (or `plan`) gets: the project's, or why none — the message is
+/// what the step that needs one ends with.
+pub fn for_job(app: &App, project: &str, trial: bool, requester: &str) -> Result<BTreeMap<String, String>, String> {
+    if trial && !trial_gets_secrets(app, requester) {
+        return Err(TRIAL_DENIED.into());
+    }
+    load(&app.layout).map(|mut all| all.remove(project).unwrap_or_default()).map_err(|e| format!("비밀을 읽지 못했다: {e}"))
 }
 
 /// What a job and `plan` say about a secret the project has not been given.

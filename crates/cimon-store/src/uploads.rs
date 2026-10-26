@@ -41,22 +41,26 @@ fn row(r: &rusqlite::Row<'_>) -> rusqlite::Result<UploadRow> {
 }
 
 impl Store {
+    /// Records an upload unless `user` already has `max_pending` waiting (`Conflict`) —
+    /// counted and inserted in one transaction.
     #[allow(clippy::too_many_arguments)]
-    pub fn create_upload(&self, handle: &str, user: &str, label: &str, kind: &str, bytes: i64, sha256: &str, expires_at: &str) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO uploads (handle, user, label, kind, bytes, sha256, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            params![handle, user, label, kind, bytes, sha256, now(), expires_at],
-        )?;
-        Ok(())
-    }
-
-    /// Uploads of `user` no job has taken yet and that have not expired.
-    pub fn pending_uploads(&self, user: &str) -> Result<i64> {
-        Ok(self.conn().query_row(
-            "SELECT COUNT(*) FROM uploads WHERE user = ?1 AND job_id IS NULL AND deleted_at IS NULL AND expires_at > ?2",
-            params![user, now()],
-            |r| r.get(0),
-        )?)
+    pub fn create_upload(&self, handle: &str, user: &str, label: &str, kind: &str, bytes: i64, sha256: &str, expires_at: &str, max_pending: i64) -> Result<()> {
+        self.tx(|tx| {
+            let t = now();
+            let pending: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM uploads WHERE user = ?1 AND job_id IS NULL AND deleted_at IS NULL AND expires_at > ?2",
+                params![user, t],
+                |r| r.get(0),
+            )?;
+            if pending >= max_pending {
+                return Err(StoreError::Conflict(format!("{user} has {pending} uploads waiting")));
+            }
+            tx.execute(
+                "INSERT INTO uploads (handle, user, label, kind, bytes, sha256, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![handle, user, label, kind, bytes, sha256, t, expires_at],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn upload(&self, handle: &str) -> Result<Option<UploadRow>> {

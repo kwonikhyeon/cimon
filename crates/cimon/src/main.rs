@@ -191,14 +191,44 @@ fn service_config() -> Option<PathBuf> {
     None
 }
 
-/// The value of `--config` in a service command line (setup quotes it).
+/// The value of `--config` (or `--config=`) in a service command line (setup quotes
+/// it), with `%VAR%` expanded — an ImagePath is REG_EXPAND_SZ, read unexpanded.
 fn config_arg(line: &str) -> Option<PathBuf> {
-    let rest = line.split_once(" --config ")?.1.trim_start();
+    let rest = match line.split_once(" --config ") {
+        Some((_, r)) => r.trim_start(),
+        None => line.split_once(" --config=")?.1,
+    };
     let p = match rest.strip_prefix('"') {
         Some(q) => q.split('"').next()?,
         None => rest.split_whitespace().next()?,
     };
+    let p = expand_env(p);
     (!p.is_empty()).then(|| PathBuf::from(p))
+}
+
+/// `%NAME%` → the variable's value; an unset one stays as written.
+fn expand_env(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%').map(|j| (&after[..j], &after[j + 1..])) {
+            Some((name, tail)) if !name.is_empty() => {
+                match std::env::var(name) {
+                    Ok(v) => out.push_str(&v),
+                    Err(_) => out.push_str(&format!("%{name}%")),
+                }
+                rest = tail;
+            }
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -208,6 +238,10 @@ fn config_from_a_service_command_line() {
     assert_eq!(p(r#""C:\Program Files\cimon\cimon.exe" service --config "C:\cimon\config\cimon.toml""#).as_deref(), Some(r"C:\cimon\config\cimon.toml"));
     assert_eq!(p(r#"C:\cimon\cimon.exe service --config D:\c\cimon.toml"#).as_deref(), Some(r"D:\c\cimon.toml"));
     assert_eq!(p(r#""C:\cimon\cimon.exe" service"#), None);
+    assert_eq!(p(r#""C:\cimon\cimon.exe" service --config="C:\c d\cimon.toml""#).as_deref(), Some(r"C:\c d\cimon.toml"));
+    std::env::set_var("CIMON_TEST_ROOT", r"E:\svc");
+    assert_eq!(p(r#""C:\cimon\cimon.exe" service --config "%CIMON_TEST_ROOT%\cimon.toml""#).as_deref(), Some(r"E:\svc\cimon.toml"));
+    assert_eq!(p(r#""C:\cimon\cimon.exe" service --config "%NOT_SET_X%\c.toml""#).as_deref(), Some(r"%NOT_SET_X%\c.toml"));
 }
 
 pub fn load_config(cli: &Option<PathBuf>) -> Result<Config> {

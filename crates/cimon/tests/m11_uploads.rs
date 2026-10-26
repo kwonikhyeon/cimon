@@ -18,6 +18,7 @@ findstr /c:\"KEYSTORE-BYTES\" \"%~1\" >nul || (echo keystore wrong & exit /b 1)\
 if not exist \"%~2\\release.jks\" (echo dir wrong & exit /b 1)\r\n\
 echo password is %STORE_PASSWORD%\r\n\
 echo caches %GRADLE_USER_HOME%\r\n\
+if exist \"%GRADLE_USER_HOME%\\gradle\\init.d\\planted.gradle\" (echo planted init script & exit /b 1)\r\n\
 echo release ok\r\n";
 
 fn recipes() -> MemTree {
@@ -108,8 +109,9 @@ async fn an_upload_reaches_its_step_once_and_is_gone_after() {
     let keystore = k["handle"].as_str().unwrap().to_string();
     let (s, p) = upload(&h, &h.member_token, "store-password", "text", format!("{PASSWORD}\r\n").as_bytes()).await;
     assert_eq!(s, 200, "{p}");
-    assert_eq!(p["bytes"], PASSWORD.len(), "the line ending is not part of the value");
+    assert!(p.get("sha256").is_none() && p.get("bytes").is_none(), "a password's hash or length is never shown: {p}");
     let password = p["handle"].as_str().unwrap().to_string();
+    assert_eq!(h.app.store.upload(&password).unwrap().unwrap().bytes, PASSWORD.len() as i64, "the line ending is not part of the value");
     let blob = h.app.layout.uploads().join(&keystore);
     assert!(blob.is_file());
     assert!(!std::fs::read(&blob).unwrap().windows(14).any(|w| w == b"KEYSTORE-BYTES"), "kept protected, not as sent");
@@ -145,6 +147,13 @@ async fn an_upload_reaches_its_step_once_and_is_gone_after() {
     let (v, _) = call_any(&admin, "build", json!({"project": P, "steps": ["release"], "uploads": both})).await;
     assert_eq!(refused(&v), "upload_invalid", "someone else's upload: {v}");
 
+    // an earlier job planted a Gradle init script for the next job id — it is gone
+    let next: i64 = h.app.store.tx(|tx| Ok(tx.query_row("SELECT COALESCE(MAX(id), 0) + 1 FROM jobs", [], |r| r.get(0))?)).unwrap();
+    let planted = h.app.layout.home_job(next, "caches").join("gradle").join("init.d");
+    std::fs::create_dir_all(&planted).unwrap();
+    std::fs::write(planted.join("planted.gradle"), "x").unwrap();
+    std::fs::create_dir_all(h.app.layout.tmp_job(next)).unwrap();
+
     // the job: the step gets the file and the value, the log does not show the value
     let task = start_task(&c, "build", json!({"project": P, "steps": ["release"], "uploads": both})).await;
     let (_, v, _) = wait_task(&c, &task, 120).await;
@@ -154,6 +163,10 @@ async fn an_upload_reaches_its_step_once_and_is_gone_after() {
     assert_eq!(v["uploads"]["keystore"]["sha256"], cimon_core::sha256_hex(KEYSTORE.as_bytes()), "{v:#}");
     assert_eq!(v["uploads"]["store-password"]["by"], "member-b", "{v:#}");
     assert!(v["warnings"].as_array().unwrap().iter().any(|w| w["source"] == "upload"), "{v:#}");
+    assert_eq!(cimon_core::parse_job_label(v["job_id"].as_str().unwrap()), Some(next));
+    let planted_warnings = v["warnings"].as_array().unwrap().iter().filter(|w| w["message"].as_str().unwrap_or_default().contains("작업 시작 전부터 있었다")).count();
+    assert_eq!(planted_warnings, 2, "homes and tmp were there before the job: {v:#}");
+    assert!(v["uploads"]["store-password"].get("sha256").is_none() && v["uploads"]["store-password"].get("bytes").is_none(), "{v:#}");
     let (log, _) = call_any(&c, "job_log", json!({"job": v["job_id"], "step": "release"})).await;
     let log = log["log"].as_str().unwrap().to_string();
     assert!(log.contains("release ok"), "{log}");

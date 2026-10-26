@@ -193,6 +193,9 @@ SOME_PATH = "${ws}/tools"
 도구가 읽는 자격 증명은 **빌드 비밀**(`${secret.<name>}`, §13)로 넘긴다. 비밀은 환경 변수 값(`[env]`·`[workspace].clean_env`·fixture `env`·단계 `env`)에서만 쓸 수 있다. 그 변수를 받는 단계만 보게 하려면 `[env]` 보다 그 단계의 `env` 에 둔다.
 
 ```toml
+[isolate]
+CONAN_HOME = "project"        # 로그인 세션이 남는 홈 — 격리하지 않으면 빌드 계정 프로필의 공용 홈이라 모든 프로젝트의 작업이 쓴다
+
 [[step]]
 id = "conan-login"
 kind = "setup"
@@ -202,7 +205,9 @@ env = { CONAN_LOGIN_USERNAME_COMPANY = "cimon-build", CONAN_PASSWORD_COMPANY = "
 when = "always"
 ```
 
-도구가 받은 세션 토큰을 홈에 남기면(위 `conan remote login` 은 `CONAN_HOME` 에) 그 홈을 쓰는 뒤 단계도 그것을 쓸 수 있다 — 비밀은 읽기 전용이어야 한다.
+도구가 받은 세션 토큰을 홈에 남기면(위 `conan remote login` 은 `CONAN_HOME` 에) 그 홈을 쓰는 뒤 단계도 그것을 쓸 수 있다 — 비밀은 읽기 전용이어야 하고, 그 홈은 `[isolate]` 로 프로젝트(또는 작업) 범위에 둔다.
+
+**시도 레시피 작업은 관리자가 요청했을 때만 빌드 비밀을 받는다.** 시도 브랜치는 팀원 누구나 만들 수 있어서, 비밀을 출력하는 단계를 넣을 수 있기 때문이다. 팀원이 요청한 시도 작업에서 비밀이 필요한 단계는 `inconclusive`/`environment` 로 끝난다. 관리자는 남이 만든 시도 브랜치를 돌리기 전에 diff 를 본다.
 
 ### 7.2 `[isolate]`
 
@@ -322,7 +327,9 @@ env = { KEYSTORE_PATH = "${upload.keystore}", KEYSTORE_PASSWORD = "${upload.keys
   - 같은 요청과 **병합하지 않는다**.
   - 핸들은 올린 사람의 것만, 한 번만 쓴다. 기다리는 동안 만료되면(`[uploads].ttl_minutes`) `upload_invalid` 이다.
 - `${upload.*}` 는 `applies_to` 단계의 문자열에서만 쓸 수 있다. `[env]`·`[workspace]`·fixture 에 쓰면 오류다. text 업로드를 명령줄에 쓰면 오류다 — 로그와 프로세스 목록에 남는다.
-- 단계 로그와 판정 출력에서 text 업로드 값은 `***` 로 가린다. 결과와 provenance 에는 이름·크기·sha256·올린 사람만 남는다.
+- 단계 로그와 판정 출력에서 text 업로드 값은 `***` 로 가린다(JSON 으로 이스케이프한 형태도). 4바이트보다 짧은 값과 다른 인코딩으로 찍힌 값은 가리지 못한다 — 가리기는 안전망이지 보장이 아니므로, 값을 출력하는 스크립트를 쓰지 않는다.
+- 결과와 provenance 에는 이름·종류·올린 사람, 파일이면 크기·sha256 이 남는다. **text 값의 해시와 길이는 어디에도 내지 않는다** — 비밀번호의 해시는 사전 대입으로 풀린다.
+- 형제 트리는 새로 클론한다. `place = "beside"` 형제가 있는 프로젝트는 업로드를 받을 수 없다(`upload_sibling_beside`) — 그 트리는 다른 작업들이 쓰는 자리다.
 - 시도 실행으로는 업로드 단계를 돌릴 수 없다. 그래서 업로드 단계를 바꾼 제안은 「시도 실행으로 확인되지 않는 변경」 에 든다(design §6.5) — 반영한 뒤 `main` 으로 확인한다.
 - `[upload.*]` 는 프로젝트의 `recipe.toml` 에만 둔다. 프리셋과 include 에 두면 오류다.
 
