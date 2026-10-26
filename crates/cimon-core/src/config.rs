@@ -219,9 +219,11 @@ fn d_platform() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(deny_unknown_fields)]
 pub struct BootstrapConfig {
-    /// Path of the rustup-init / rustup executable installed by `cimon setup`.
+    /// rustup-init version `cimon setup` installs into `toolchains\_bootstrap\`
+    /// (design §10.1), e.g. "1.29.2". Required by setup — no silent "latest".
     #[serde(default)]
     pub rustup: Option<String>,
+    /// uv release `cimon setup` installs, e.g. "0.13.5".
     #[serde(default)]
     pub uv: Option<String>,
 }

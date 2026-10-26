@@ -149,8 +149,9 @@ pub fn installer_ctx(app: &App) -> cimon_toolchain::Ctx {
     cimon_toolchain::Ctx {
         layout: app.layout.clone(),
         github_api: app.config.github.api_url.clone(),
-        rustup: app.config.bootstrap.rustup.clone().map(PathBuf::from).or_else(|| Some(app.layout.bootstrap().join("cargo").join("bin").join("rustup.exe")).filter(|p| p.exists())),
-        uv: app.config.bootstrap.uv.clone().map(PathBuf::from).or_else(|| Some(app.layout.bootstrap().join("uv").join("uv.exe")).filter(|p| p.exists())),
+        // installed by `cimon setup` at the versions in [bootstrap]
+        rustup: Some(app.layout.bootstrap().join("cargo").join("bin").join("rustup.exe")).filter(|p| p.exists()),
+        uv: Some(app.layout.bootstrap().join("uv").join("uv.exe")).filter(|p| p.exists()),
         account: app.build_account(),
         mirrors: app.layout.mirrors(),
         installed_by: "cimon".into(),

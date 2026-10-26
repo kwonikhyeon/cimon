@@ -148,7 +148,11 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         Ok(())
     }));
     let boot = layout.bootstrap();
-    steps.push(step(format!("bootstrap rustup and uv into {}", boot.display()), move || bootstrap(&boot)));
+    let (rv, uv) = (cfg.bootstrap.rustup.clone(), cfg.bootstrap.uv.clone());
+    steps.push(step(
+        format!("bootstrap rustup-init {} and uv {} into {}", rv.as_deref().unwrap_or("<unset>"), uv.as_deref().unwrap_or("<unset>"), boot.display()),
+        move || bootstrap(&boot, rv.as_deref(), uv.as_deref()),
+    ));
     println!("{} setup step(s){}:", steps.len(), if dry_run { " (dry run — nothing is changed)" } else { "" });
     let mut failed = 0;
     for s in steps {
@@ -165,7 +169,7 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         }
     }
     println!(
-        "\nManual steps (design §15.3, §16.2):\n  - tailscale up --unattended=true --advertise-tags=tag:cimon ; tailscale serve --bg --https=443 http://127.0.0.1:8770\n  - restrict the build account's outbound traffic (Windows Defender Firewall / WFP) to the registries in the project notes\n  - store the GitHub read token: cimon github-token (reads stdin)\n  - first admin: cimon token create <name> --admin ; recipes: cimon recipe import --init <dir> --author <name>\n  - then: cimon doctor ; sc start {SERVICE_NAME}"
+        "\nManual steps (docs/setup.md):\n  - tailscale up --unattended=true --advertise-tags=tag:cimon ; tailscale serve --bg --https=443 http://127.0.0.1:8770\n  - restrict the build account's outbound traffic (Windows Defender Firewall / WFP) to the registries in the project notes\n  - store the GitHub read token: cimon github-token (reads one line from stdin)\n  - first admin: cimon token create <name> --admin ; recipes: cimon recipe import --init <dir> --author <name>\n  - then: cimon doctor --network ; sc.exe start {SERVICE_NAME}"
     );
     if failed > 0 {
         bail!("{failed} setup step(s) failed");
@@ -173,12 +177,24 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn bootstrap(dir: &Path) -> Result<()> {
+/// A version pin from `[bootstrap]`: required, and only characters a release name has
+/// (it goes into a download URL).
+fn bootstrap_version<'a>(v: Option<&'a str>, key: &str, latest_at: &str) -> Result<&'a str> {
+    match v.map(str::trim) {
+        Some(v) if !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+')) => Ok(v),
+        Some(v) if !v.is_empty() => bail!("[bootstrap].{key} = {v:?} is not a version"),
+        _ => bail!("[bootstrap].{key} is not set — pin the version to install (the current one is listed at {latest_at})"),
+    }
+}
+
+fn bootstrap(dir: &Path, rustup: Option<&str>, uv: Option<&str>) -> Result<()> {
+    let rustup = bootstrap_version(rustup, "rustup", "https://static.rust-lang.org/rustup/release-stable.toml")?;
+    let uv = bootstrap_version(uv, "uv", "https://github.com/astral-sh/uv/releases")?;
     std::fs::create_dir_all(dir)?;
     let client = reqwest::blocking::Client::builder().user_agent(concat!("cimon/", env!("CARGO_PKG_VERSION"))).build()?;
-    // rustup-init with its published sha256
-    let base = "https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe";
-    let exe = client.get(base).send()?.error_for_status()?.bytes()?;
+    // rustup-init of the pinned version, with its published sha256
+    let base = format!("https://static.rust-lang.org/rustup/archive/{rustup}/x86_64-pc-windows-msvc/rustup-init.exe");
+    let exe = client.get(&base).send()?.error_for_status()?.bytes()?;
     let sum = client.get(format!("{base}.sha256")).send()?.error_for_status()?.text()?;
     let want = sum.split_whitespace().next().unwrap_or_default();
     if cimon_core::sha256_hex(&exe) != want {
@@ -194,8 +210,8 @@ fn bootstrap(dir: &Path) -> Result<()> {
     if !status.success() {
         bail!("rustup-init failed");
     }
-    // uv from its GitHub release, verified by the asset digest
-    let rel: serde_json::Value = client.get("https://api.github.com/repos/astral-sh/uv/releases/latest").send()?.error_for_status()?.json()?;
+    // uv from the pinned GitHub release, verified by the asset digest
+    let rel: serde_json::Value = client.get(format!("https://api.github.com/repos/astral-sh/uv/releases/tags/{uv}")).send()?.error_for_status()?.json()?;
     let asset = rel["assets"].as_array().and_then(|a| a.iter().find(|x| x["name"] == "uv-x86_64-pc-windows-msvc.zip")).context("uv release asset")?;
     let digest = asset["digest"].as_str().and_then(|d| d.strip_prefix("sha256:")).context("uv asset has no digest")?;
     let zip = client.get(asset["browser_download_url"].as_str().unwrap()).send()?.error_for_status()?.bytes()?;
