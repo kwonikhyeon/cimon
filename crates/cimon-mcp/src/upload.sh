@@ -20,8 +20,10 @@ command -v curl >/dev/null 2>&1 || fail "curl is needed"
 auth=$(sh "$HOME/.cimon/header.sh" | sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p')
 [ -n "$auth" ] || fail "~/.cimon/header.sh printed no Authorization header"
 cfg=$(umask 077 && mktemp)
-# also on Ctrl-C at a prompt: echo back on, the config file gone
-trap 'stty echo < /dev/tty 2>/dev/null; rm -f "$cfg"' EXIT
+# also on Ctrl-C at a prompt: echo back on (only if a prompt turned it off - there may
+# be no terminal at all), the config file gone. set -e applies in a trap: nothing may fail
+echo_off=""
+trap '[ -z "$echo_off" ] || { stty echo < /dev/tty; } 2>/dev/null || true; rm -f "$cfg"' EXIT
 trap 'exit 130' INT TERM
 printf 'header = "Authorization: %s"\n' "$auth" > "$cfg"
 unset auth
@@ -37,11 +39,14 @@ for item in "$@"; do
   case "$src" in
     prompt)
       kind=text
-      { : < /dev/tty; } 2>/dev/null || fail "$name=prompt needs a terminal - use $name=env:<VARIABLE>"
+      # in a subshell: a failed redirection on a special builtin would end this shell
+      (exec < /dev/tty) 2>/dev/null || fail "$name=prompt needs a terminal - use $name=env:<VARIABLE>"
       printf '%s: ' "$name" > /dev/tty
-      stty -echo < /dev/tty 2>/dev/null || true
+      echo_off=1
+      { stty -echo < /dev/tty; } 2>/dev/null || true
       IFS= read -r value < /dev/tty || value=""
-      stty echo < /dev/tty 2>/dev/null || true
+      { stty echo < /dev/tty; } 2>/dev/null || true
+      echo_off=""
       printf '\n' > /dev/tty
       ;;
     env:*)
