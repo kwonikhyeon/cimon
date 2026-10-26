@@ -46,6 +46,12 @@ pub struct KindDef {
     pub asset: Option<String>,
     #[serde(default)]
     pub package: Option<String>,
+    /// uv-tool: the exact Python the tool is installed on (uv downloads it into the
+    /// install). Without it uv takes the newest interpreter it can get, which the
+    /// package's wheels may not cover yet. Left out of the serialized form when unset,
+    /// so existing entries hash the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub python: Option<String>,
     #[serde(default)]
     pub script: Option<ScriptInstaller>,
 }

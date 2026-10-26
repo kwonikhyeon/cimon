@@ -606,7 +606,7 @@ probe = { run = ["node", "--version"], expect = "v{version}" }
 | `github-release` | GitHub release asset 을 받아 푼다 | `repo`, `tag`, `asset` | release API 의 asset `digest`(sha256). 없으면 설치 거절 |
 | `rustup` | `rustup toolchain install {version} --profile minimal -c …`. PATH 에는 rustup 프록시 디렉터리 | `components` | rustup 이 검증 |
 | `uv-python` | `uv python install {version}`. 레시피가 `packages` 를 주면 그 조합의 가상 환경을 만들고(`--no-build` — 휠만) 그 `Scripts` 를 PATH 에 | — | uv(PyPI 해시) |
-| `uv-tool` | `uv tool install --no-build {package}=={version}` 을 버전별 디렉터리로 — **휠만**. 휠이 없는 패키지는 설치 실패(빌드 스크립트가 서비스 계정으로 돌지 않게) | `package` | PyPI 해시 |
+| `uv-tool` | `uv tool install --no-build --python {python} {package}=={version}` 을 버전별 디렉터리로 — **휠만**. 휠이 없는 패키지는 설치 실패(빌드 스크립트가 서비스 계정으로 돌지 않게). `python` 은 도구가 돌 정확한 Python 버전 — uv 가 그 인터프리터를 설치 안에 받는다(설치한 사람의 사용자 폴더 Python 을 쓰지 않는다). 없으면 경고: uv 가 가장 새 Python 을 골라, 그 버전용 휠이 아직 없는 패키지는 설치에 실패한다 | `package`, `python` | PyPI 해시 |
 | `script` | 등록된 프로젝트 mirror 에 있는 설치 스크립트를 **빌드 계정으로** staging 에서 실행: `script = { from_project = "<id>", ref = "<전체 커밋 SHA>", path = "<경로>", args = [...] }`(`args` 에 `{version}`·`{root}` — `{root}` 는 staging 경로) | `script` | 스크립트가 받은 파일을 검증해야 한다. 검증하지 않는 스크립트는 쓰지 않는다 |
 | `base` | 설치하지 않는다. 검사만 | `check` 또는 `probe` | — |
 

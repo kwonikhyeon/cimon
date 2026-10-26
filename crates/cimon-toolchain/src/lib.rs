@@ -154,9 +154,7 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
             }
             "uv-python" => {
                 let uv = ctx.uv.clone().ok_or_else(|| err("[bootstrap].uv is not set — run `cimon setup`"))?;
-                let mut env = BTreeMap::new();
-                env.insert("UV_PYTHON_INSTALL_DIR".into(), root.join("python").to_string_lossy().into());
-                env.insert("UV_CACHE_DIR".into(), ctx.layout.bootstrap().join("uv-cache").to_string_lossy().into());
+                let env = uv_isolated(ctx, &root);
                 run_service(&uv, &["python".into(), "install".into(), version.into()], &staging, env.clone(), Duration::from_secs(1800))?;
                 if let Some(pkgs) = req.packages.as_ref().filter(|p| !p.is_empty()) {
                     let venv = root.join("venv");
@@ -169,12 +167,16 @@ pub fn install(ctx: &Ctx, kind: &str, def: &KindDef, entry: &str, version: &str,
             "uv-tool" => {
                 let uv = ctx.uv.clone().ok_or_else(|| err("[bootstrap].uv is not set — run `cimon setup`"))?;
                 let pkg = def.package.as_deref().ok_or_else(|| err("uv-tool needs package"))?;
-                let mut env = BTreeMap::new();
+                let mut env = uv_isolated(ctx, &root);
                 env.insert("UV_TOOL_DIR".into(), root.join("tools").to_string_lossy().into());
                 env.insert("UV_TOOL_BIN_DIR".into(), root.join("bin").to_string_lossy().into());
-                env.insert("UV_CACHE_DIR".into(), ctx.layout.bootstrap().join("uv-cache").to_string_lossy().into());
                 let spec = if pkg.contains("==") { fill(pkg, version) } else { format!("{pkg}=={version}") };
-                run_service(&uv, &["tool".into(), "install".into(), "--no-build".into(), spec], &staging, env, Duration::from_secs(1800))?;
+                let mut args: Vec<String> = vec!["tool".into(), "install".into(), "--no-build".into()];
+                if let Some(py) = &def.python {
+                    args.extend(["--python".into(), py.clone()]);
+                }
+                args.push(spec);
+                run_service(&uv, &args, &staging, env, Duration::from_secs(1800))?;
             }
             "script" => {
                 let s = def.script.as_ref().ok_or_else(|| err("script installer needs script"))?;
@@ -484,6 +486,21 @@ fn check_ok(what: &Path, r: &cimon_runner::ExecResult) -> Result<(), InstallErro
         return Err(err(format!("{} exited {:?}: {}", what.display(), r.exit_code, r.tail.iter().rev().take(5).cloned().collect::<Vec<_>>().join(" | "))));
     }
     Ok(())
+}
+
+/// uv environment that keeps an install inside its toolchain root. uv writes its
+/// interpreter's absolute path into every venv and tool launcher, and by default picks
+/// an interpreter from the installing user's profile (`%APPDATA%\uv\python`, the
+/// user's own Pythons) and reads that user's `uv.toml` — an install made by an admin
+/// then pointed into the admin's profile, which the build account cannot read. Only
+/// interpreters uv manages, downloaded into the root, and no user config.
+fn uv_isolated(ctx: &Ctx, root: &Path) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    env.insert("UV_PYTHON_INSTALL_DIR".into(), root.join("python").to_string_lossy().into());
+    env.insert("UV_PYTHON_PREFERENCE".into(), "only-managed".into());
+    env.insert("UV_NO_CONFIG".into(), "1".into());
+    env.insert("UV_CACHE_DIR".into(), ctx.layout.bootstrap().join("uv-cache").to_string_lossy().into());
+    env
 }
 
 /// Runs a bootstrap tool (rustup, uv) as the service account — they verify their own

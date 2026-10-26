@@ -183,8 +183,18 @@ pub fn check_tree(tree: &dyn Tree) -> Report {
 fn check_catalog(tree: &dyn Tree, c: &Catalog, projects: &[String], report: &mut Report) {
     let text = tree.read_str("toolchains.toml").unwrap_or_default();
     let sha = regex::Regex::new("^[0-9a-f]{40}$").unwrap();
+    let python_exact = regex::Regex::new(r"^[0-9]+\.[0-9]+\.[0-9]+$").unwrap();
     for (name, k) in &c.kinds {
         let line = line_of(text, &format!("[kind.{name}]"));
+        // a warning, not an error: a catalog written before the field must still pass,
+        // so that it can be fixed through a proposal
+        if k.installer == "uv-tool" && k.python.is_none() {
+            report.push(Diag::warning(
+                "toolchains.toml",
+                line,
+                format!("kind {name}: uv-tool without python = \"<exact version>\" — uv installs on the newest Python it can get, which the package's wheels may not cover"),
+            ));
+        }
         let mut err = |m: String| report.push(Diag::error("toolchains.toml", line, format!("kind {name}: {m}")));
         if !matches!(k.tier.as_str(), "managed" | "base") {
             err(format!("tier must be managed or base, got {:?}", k.tier));
@@ -234,6 +244,9 @@ fn check_catalog(tree: &dyn Tree, c: &Catalog, projects: &[String], report: &mut
             "uv-tool" => {
                 if k.package.is_none() {
                     err("uv-tool needs package".into());
+                }
+                if let Some(v) = k.python.as_ref().filter(|v| !python_exact.is_match(v)) {
+                    err(format!("uv-tool python must be an exact x.y.z version (3.13 lets uv take any 3.13.*), got {v:?}"));
                 }
             }
             "script" => match &k.script {

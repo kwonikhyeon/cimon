@@ -207,6 +207,8 @@ fn main() -> Result<()> {
         Command::Provision { project, kind, version, recipe_ref, from, admin } => {
             let cfg = load_config(&cli.config)?;
             let app = cimon_engine::App::open(cfg)?;
+            // install scripts and probes run as the build account, as in the service
+            app.logon_build_account()?;
             let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, from, admin })
                 .map_err(|e| anyhow::anyhow!(e))?;
             let mut failed = false;

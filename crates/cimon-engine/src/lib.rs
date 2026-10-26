@@ -130,6 +130,24 @@ impl App {
         self.engine.build_account.lock().unwrap().clone()
     }
 
+    /// Logs on the build account (not in single-account mode). The service does it at
+    /// start; an admin command that installs toolchains (`cimon provision`) must too —
+    /// otherwise its probes and install scripts run as the admin, who can read what the
+    /// build account cannot, and a broken install passes.
+    pub fn logon_build_account(&self) -> anyhow::Result<()> {
+        if self.config.accounts.single_account() {
+            return Ok(());
+        }
+        #[cfg(windows)]
+        {
+            let helper = self.helper().ok_or_else(|| anyhow::anyhow!("cannot locate cimon.exe for the build-account helper"))?;
+            let acct = cimon_runner::BuildAccount::logon(&self.config.accounts.build, &self.layout.config_dir().join("build-account.dpapi"), &helper)
+                .map_err(|e| anyhow::anyhow!("build account {}: {e}", self.config.accounts.build))?;
+            *self.engine.build_account.lock().unwrap() = Some(Arc::new(acct));
+        }
+        Ok(())
+    }
+
     pub fn helper(&self) -> Option<PathBuf> {
         self.engine.helper.lock().unwrap().clone()
     }
@@ -141,15 +159,7 @@ pub fn start(app: &Arc<App>) -> anyhow::Result<()> {
     for d in app.layout.all_dirs() {
         std::fs::create_dir_all(&d)?;
     }
-    if !app.config.accounts.single_account() {
-        #[cfg(windows)]
-        {
-            let helper = app.helper().ok_or_else(|| anyhow::anyhow!("cannot locate cimon.exe for the build-account helper"))?;
-            let acct = cimon_runner::BuildAccount::logon(&app.config.accounts.build, &app.layout.config_dir().join("build-account.dpapi"), &helper)
-                .map_err(|e| anyhow::anyhow!("build account {}: {e}", app.config.accounts.build))?;
-            *app.engine.build_account.lock().unwrap() = Some(Arc::new(acct));
-        }
-    }
+    app.logon_build_account()?;
     for n in jobs::recover(app) {
         tracing::warn!("{n}");
     }

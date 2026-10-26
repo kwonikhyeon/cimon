@@ -29,6 +29,23 @@ fn examples_pass() {
 }
 
 #[test]
+fn uv_tool_python_pin() {
+    let with = |extra: &str| {
+        let mut t = examples();
+        let cat = t.read_str("toolchains.toml").unwrap().to_string();
+        t.insert("toolchains.toml", format!("{cat}\n[kind.pytool]\ntier = \"managed\"\ninstaller = \"uv-tool\"\npackage = \"pytool\"\n{extra}probe = {{ run = [\"pytool\", \"--version\"], expect = \"pytool {{version}}\" }}\n"));
+        check_tree(&t)
+    };
+    let r = with("");
+    assert!(r.ok(), "a missing pin is not an error: {:#?}", r.errors);
+    assert!(r.warnings.iter().any(|d| d.message.contains("uv-tool without python")), "{:#?}", r.warnings);
+    let r = with("python = \"3.13\"\n");
+    assert!(r.errors.iter().any(|d| d.message.contains("exact x.y.z version")), "{:#?}", r.errors);
+    let r = with("python = \"3.13.14\"\n");
+    assert!(r.ok() && !r.warnings.iter().any(|d| d.message.contains("uv-tool")), "{:#?} {:#?}", r.errors, r.warnings);
+}
+
+#[test]
 fn ignore_version_files_rules() {
     const R: &str = "projects/example-app/recipe.toml";
     const BASE: &str = "rust        = { version_file = \"backend/rust-toolchain.toml\" }";
