@@ -26,7 +26,8 @@ static FAILURES: Mutex<VecDeque<Instant>> = Mutex::new(VecDeque::new());
 const WINDOW: Duration = Duration::from_secs(600);
 const MAX_FAILURES: usize = 20;
 
-fn script(app: &App, template: &str) -> Response {
+/// A served script with this server's address in place of `{{URL}}`.
+pub(crate) fn script(app: &App, template: &str) -> Response {
     let url = app.config.server.public_url.trim_end_matches('/');
     // the address goes inside single quotes in both scripts
     if url.is_empty() || !url.chars().all(|c| c.is_ascii_graphic() && c != '\'' && c != '"' && c != '`' && c != '$' && c != '\\') {

@@ -173,6 +173,12 @@ impl Store {
     /// Inserts a job and its first task in one transaction; the task is only returned
     /// to the client after this commits (design §7.5).
     pub fn insert_job_with_task(&self, job: &NewJob, task_id: &str, via_task: bool, client_info: Option<&str>) -> Result<i64> {
+        self.insert_job_with_uploads(job, task_id, via_task, client_info, &[])
+    }
+
+    /// [`Self::insert_job_with_task`] that also takes the caller's uploads (recipe
+    /// name, handle) — all or nothing: an upload already gone fails the insert.
+    pub fn insert_job_with_uploads(&self, job: &NewJob, task_id: &str, via_task: bool, client_info: Option<&str>, uploads: &[(String, String)]) -> Result<i64> {
         self.tx(|tx| {
             let t = now();
             tx.execute(
@@ -201,6 +207,7 @@ impl Store {
                 "INSERT INTO tasks (task_id, job_id, origin_job_id, requested_by, client_info, via_task, created_at) VALUES (?1, ?2, ?2, ?3, ?4, ?5, ?6)",
                 params![task_id, id, job.created_by, client_info, via_task as i64, t],
             )?;
+            Store::bind_uploads(tx, id, &job.created_by, uploads)?;
             Ok(id)
         })
     }

@@ -5,10 +5,11 @@ pub mod connect;
 pub mod recipe_tools;
 pub mod server;
 pub mod tools;
+pub mod uploads;
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{header, Request, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -41,13 +42,23 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
     let mcp_routes = Router::new()
         .nest_service("/mcp", mcp)
         .route_layer(middleware::from_fn_with_state(app.clone(), require_token));
+    // a little over the largest file, so the engine's limit is the one that answers
+    let upload_limit = usize::try_from(app.config.uploads.max_bytes).unwrap_or(usize::MAX).saturating_add(64 << 10);
+    let upload_routes = Router::new()
+        .route("/uploads", post(uploads::receive))
+        .layer(DefaultBodyLimit::max(upload_limit))
+        .route_layer(middleware::from_fn_with_state(app.clone(), require_token))
+        .with_state(app.clone());
     Router::new()
         .route("/healthz", get(healthz))
         .route("/artifacts/{job}/{name}", get(download))
         .route("/connect.ps1", get(connect::ps1))
         .route("/connect.sh", get(connect::sh))
         .route("/connect/redeem", post(connect::redeem))
+        .route("/upload.ps1", get(uploads::ps1))
+        .route("/upload.sh", get(uploads::sh))
         .with_state(app.clone())
+        .merge(upload_routes)
         .merge(mcp_routes)
 }
 

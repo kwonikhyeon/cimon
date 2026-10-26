@@ -200,6 +200,73 @@ fn secrets_only_in_env_values() {
     assert_eq!(r.errors.len(), 2, "{:#?}", r.errors);
 }
 
+/// `[upload.<name>]` (recipe-spec §8a): declared once, reaching only its steps — a file
+/// as a path anywhere in them, a text value only as an env value.
+#[test]
+fn uploads_reach_only_their_steps() {
+    const R: &str = "projects/example-app/recipe.toml";
+    const UPLOADS: &str = r#"
+[upload.keystore]
+file = "release.jks"
+applies_to = ["release-apk"]
+refs = ["main", "release/**"]
+
+[upload.keystore-password]
+kind = "text"
+applies_to = ["release-apk"]
+
+[[step]]
+id = "release-apk"
+kind = "package"
+run = ["./gradlew.bat", ":app:assembleRelease", "-Pstore=${upload.keystore}", "-Pdir=${upload.keystore.dir}"]
+cwd = "${vars.gradle_dir}"
+env = { STORE = "${upload.keystore}", STORE_PASSWORD = "${upload.keystore-password}" }
+"#;
+    let with = |edit: &dyn Fn(String) -> String| {
+        let mut t = examples();
+        let s = t.read_str(R).unwrap().to_string();
+        t.insert(R, edit(format!("{s}{UPLOADS}")));
+        check_tree(&t)
+    };
+    let r = with(&|s| s);
+    assert!(r.ok(), "{:#?}", r.errors);
+    assert!(r.warnings.is_empty(), "{:#?}", r.warnings);
+    let u = &r.resolved["example-app"].uploads;
+    assert_eq!(u.keys().collect::<Vec<_>>(), ["keystore", "keystore-password"]);
+
+    let cases: &[(&str, &str, &str)] = &[
+        ("\"-Pdir=${upload.keystore.dir}\"]", "\"-Ppw=${upload.keystore-password}\"]", "a text upload may only be an env value"),
+        ("STORE_PASSWORD = \"${upload.keystore-password}\"", "STORE_PASSWORD = \"${upload.keystore-password.dir}\"", "a text upload is a value, not a file"),
+        ("STORE = \"${upload.keystore}\"", "STORE = \"${upload.nope}\"", "unknown upload ${upload.nope}"),
+        ("STORE = \"${upload.keystore}\"", "STORE = \"${upload.keystore.path}\"", "an upload has no field \"path\""),
+        ("GRADLE_OPTS = \"-Dorg.gradle.daemon=false\"\n", "GRADLE_OPTS = \"-Dorg.gradle.daemon=false\"\nSTORE = \"${upload.keystore}\"\n", "an upload reaches only the steps in its applies_to"),
+        ("run = [\"./gradlew.bat\", \":app:assembleDebug\", \"--console=plain\"]", "run = [\"./gradlew.bat\", \":app:assembleDebug\", \"-Ps=${upload.keystore}\"]", "step \"build-apk\" is not in [upload.keystore].applies_to"),
+        ("applies_to = [\"release-apk\"]\nrefs", "applies_to = [\"release-apk\", \"test-backend\"]\nrefs", "\"test-backend\" is a default step"),
+        ("applies_to = [\"release-apk\"]\nrefs", "applies_to = [\"release-apkk\"]\nrefs", "applies_to names unknown step \"release-apkk\""),
+        ("kind = \"text\"", "kind = \"blob\"", "kind must be file or text"),
+        ("file = \"release.jks\"", "file = \"../release.jks\"", "must be a plain file name"),
+        ("kind = \"text\"", "file = \"release.jks\"", "is also upload keystore's"),
+        ("kind = \"text\"", "kind = \"text\"\nfile = \"pw.txt\"", "file is for kind = \"file\" only"),
+        ("refs = [\"main\", \"release/**\"]", "refs = []", "refs is empty"),
+        ("[upload.keystore-password]", "[upload.Keystore-Password]", "a name is [a-z0-9][a-z0-9_-]*"),
+    ];
+    for (from, to, want) in cases {
+        let r = with(&|s: String| {
+            assert!(s.contains(from), "{from:?}");
+            s.replacen(from, to, 1)
+        });
+        assert!(r.errors.iter().any(|d| d.message.contains(want)), "{to:?} should fail with {want:?}: {:#?}", r.errors);
+    }
+
+    // a preset or an include cannot ask for uploads
+    let mut t = examples();
+    let s = t.read_str(R).unwrap().to_string();
+    t.insert(R, format!("{s}{UPLOADS}").replacen("schema = 1\n", "schema = 1\nextends = [\"p\"]\n", 1));
+    t.insert("presets/p.toml", "schema = 1\n[upload.cert]\napplies_to = [\"release-apk\"]\n");
+    let r = check_tree(&t);
+    assert!(r.errors.iter().any(|d| d.message.contains("a preset may not use upload")), "{:#?}", r.errors);
+}
+
 #[test]
 fn layering_holes_are_errors() {
     let mut t = examples();

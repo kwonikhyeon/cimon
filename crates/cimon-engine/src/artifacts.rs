@@ -218,6 +218,7 @@ fn run_inspect_script(ctx: &JobCtx<'_>, run: &[String], file: &Path) -> Result<V
         fail_on_output: vec![],
         capture_prefixes: vec!["{".into()],
         preamble: vec![],
+        redact: vec![],
     };
     let r = cimon_runner::execute(&spec, &ctx.account, ctx.cancel);
     if r.exit_code != Some(0) {
@@ -358,7 +359,7 @@ pub fn write_provenance(ctx: &JobCtx<'_>, recs: &[StepRec], verdict: Verdict) {
     let app = ctx.app;
     let job = app.store.require_job(ctx.job.id).unwrap_or_else(|_| ctx.job.clone());
     let arts: Vec<Value> = app.store.artifacts(job.id).unwrap_or_default().into_iter().map(|a| json!({"name": a.name, "sha256": a.sha256, "bytes": a.bytes, "inspect": a.inspect_json.and_then(|s| serde_json::from_str::<Value>(&s).ok())})).collect();
-    let v = json!({
+    let mut v = json!({
         "job": job_label(job.id),
         "project": job.project,
         "ref": job.ref_,
@@ -378,6 +379,10 @@ pub fn write_provenance(ctx: &JobCtx<'_>, recs: &[StepRec], verdict: Verdict) {
         "signed": false,
         "created_at": now(),
     });
+    // what the caller handed over — fingerprints only (design §11.7)
+    if let Some(u) = crate::uploads::record(app, job.id) {
+        v["uploads"] = u;
+    }
     let dir = app.layout.job_artifacts(job.id);
     let _ = std::fs::create_dir_all(&dir);
     let _ = std::fs::write(dir.join("provenance.json"), serde_json::to_vec_pretty(&v).unwrap());

@@ -224,7 +224,7 @@ fn fixture_env(ctx: &JobCtx<'_>, def: &FixtureDef, out_dir: &std::path::Path) ->
         cimon_runner::env_set(&mut env, k, v.clone());
     }
     for (name, scope) in &ctx.resolved.isolate {
-        let d = if scope == "job" { ctx.app.layout.home_job(ctx.job.id, name) } else { ctx.app.layout.home_project(&ctx.job.project_key, name) };
+        let d = if scope == "job" || ctx.private_caches() { ctx.app.layout.home_job(ctx.job.id, name) } else { ctx.app.layout.home_project(&ctx.job.project_key, name) };
         let _ = std::fs::create_dir_all(&d);
         cimon_runner::env_set(&mut env, name, d.to_string_lossy().into());
     }
@@ -270,6 +270,7 @@ fn run_argv(ctx: &JobCtx<'_>, name: &str, what: &str, argv: &[String], timeout: 
         fail_on_output: vec![],
         capture_prefixes: vec![String::new()],
         preamble: vec![],
+        redact: ctx.redactions(),
     };
     Ok(exec::execute(&spec, &ctx.account, cancel))
 }
@@ -297,7 +298,7 @@ pub fn account_env(ctx: &mut JobCtx<'_>, set: bool) {
     };
     let mut args = vec!["__account-env".to_string(), if set { "set".into() } else { "clear".into() }];
     for (name, scope) in &ctx.resolved.account_env {
-        let d = if scope == "job" { ctx.app.layout.home_job(ctx.job.id, name) } else { ctx.app.layout.home_project(&ctx.job.project_key, name) };
+        let d = if scope == "job" || ctx.private_caches() { ctx.app.layout.home_job(ctx.job.id, name) } else { ctx.app.layout.home_project(&ctx.job.project_key, name) };
         let _ = std::fs::create_dir_all(&d);
         args.push(if set { format!("{name}={}", d.display()) } else { name.clone() });
     }
@@ -313,6 +314,7 @@ pub fn account_env(ctx: &mut JobCtx<'_>, set: bool) {
         fail_on_output: vec![],
         capture_prefixes: vec![],
         preamble: vec![],
+        redact: vec![],
     };
     let r = exec::execute(&spec, &acct.account(), &AtomicBool::new(false));
     if r.exit_code != Some(0) {

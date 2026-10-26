@@ -60,9 +60,20 @@ pub struct RunArgs {
     pub params: BTreeMap<String, Value>,
     #[serde(default)]
     pub clean: bool,
+    /// `[upload.<name>]` → the handle `POST /uploads` returned (design §11.7).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub uploads: BTreeMap<String, String>,
     /// only for `plan`
     #[serde(default)]
     pub tool: Option<String>,
+}
+
+impl RunArgs {
+    /// A job that gets uploads builds in a one-off clone with its own caches
+    /// (design §11.7), whatever the call said.
+    pub fn effective_clean(&self, plan: &Plan) -> bool {
+        self.clean || !plan.uploads.is_empty()
+    }
 }
 
 /// Everything a validated call pins down before the job exists.
@@ -184,7 +195,9 @@ pub fn validate(app: &App, tool: Tool, args: &RunArgs) -> Result<Validated, Reje
     };
     let plan = select::select(&r, tool, &req).map_err(|e| Rejection::new(e.code, e.message))?;
     let rref = args.recipe_ref.clone().unwrap_or_else(|| app.config.recipes.default_branch.clone());
-    Ok(Validated { tool, recipe_ref: rref, recipe_commit: commit, recipe_sha256: sha, trial, resolved: r, plan, ref_, project_key })
+    let v = Validated { tool, recipe_ref: rref, recipe_commit: commit, recipe_sha256: sha, trial, resolved: r, plan, ref_, project_key };
+    crate::uploads::check_declared(&v, args)?;
+    Ok(v)
 }
 
 pub fn describe(app: &App, project: &str, recipe_ref: Option<&str>) -> Result<Value, Rejection> {
@@ -226,6 +239,7 @@ pub fn describe(app: &App, project: &str, recipe_ref: Option<&str>) -> Result<Va
         "recipe": {"ref": recipe_ref.unwrap_or(&app.config.recipes.default_branch), "commit": commit, "sha256": sha, "trial": trial},
         "toolchains": r.toolchains,
         "params": params,
+        "uploads": r.uploads.iter().map(|(n, u)| json!({"name": n, "kind": u.kind_str(), "applies_to": u.applies_to, "refs": u.refs.clone().unwrap_or_else(|| vec![r.project.default_ref.clone()]), "description": u.description})).collect::<Vec<_>>(),
         "steps": steps,
         "fixtures": r.fixtures.keys().collect::<Vec<_>>(),
         "summary": format!("{} — 단계 {n_steps}개, 레시피 {}{}", r.id, short(&commit), if trial { " (시도 브랜치)" } else { "" }),
@@ -233,7 +247,7 @@ pub fn describe(app: &App, project: &str, recipe_ref: Option<&str>) -> Result<Va
 }
 
 /// `plan`: what a call would do, without fetching (design §7.2).
-pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
+pub fn plan(app: &App, user: &str, args: &RunArgs) -> Result<Value, Rejection> {
     let tool = match args.tool.as_deref() {
         None => return Err(Rejection::new("invalid_param", "plan needs tool: build | test | run")),
         Some(t) => Tool::parse(t).ok_or_else(|| Rejection::new("invalid_param", format!("tool must be build, test or run, got {t:?}")))?,
@@ -254,7 +268,7 @@ pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
         .iter()
         .chain(plan.steps.iter().map(|s| &s.id))
         .filter_map(|id| v.resolved.step(id))
-        .flat_map(|s| crate::build_secrets::step_needs(&v.resolved, s, args.clean))
+        .flat_map(|s| crate::build_secrets::step_needs(&v.resolved, s, args.effective_clean(plan)))
         .collect();
     let secrets: Vec<Value> = needs
         .iter()
@@ -275,7 +289,7 @@ pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
         if plan.excluded.is_empty() { String::new() } else { format!(" · 제외 {}", plan.excluded.len()) },
         if plan.artifacts.is_empty() { String::new() } else { format!(" · 산출물 {}", plan.artifacts.join(", ")) },
     );
-    Ok(json!({
+    let mut out = json!({
         "project": args.project,
         "tool": tool.as_str(),
         "ref": v.ref_,
@@ -289,7 +303,12 @@ pub fn plan(app: &App, args: &RunArgs) -> Result<Value, Rejection> {
         "secrets": secrets,
         "unknown": unknowns,
         "summary": summary,
-    }))
+    });
+    if !plan.uploads.is_empty() {
+        out["uploads"] = json!(crate::uploads::plan_view(app, user, &v, args));
+        out["clean"] = json!("업로드를 받는 작업 — 일회 클론과 작업 전용 캐시로 짓는다");
+    }
+    Ok(out)
 }
 
 pub fn short(c: &str) -> &str {

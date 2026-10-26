@@ -103,6 +103,10 @@ pub struct RecipeFile {
     pub account_env: BTreeMap<String, String>,
     #[serde(default)]
     pub params: BTreeMap<String, ParamDef>,
+    /// Files and values the caller uploads for one job (recipe-spec §8a) — the project's
+    /// `recipe.toml` only.
+    #[serde(default)]
+    pub upload: BTreeMap<String, UploadDef>,
     #[serde(default)]
     pub step: Vec<StepDef>,
     #[serde(default)]
@@ -187,6 +191,37 @@ pub struct ParamDef {
     pub applies_to: Option<Vec<String>>,
     #[serde(default)]
     pub description: Option<String>,
+}
+
+/// `[upload.<name>]` (recipe-spec §8a): something the caller sends from their own
+/// machine for one job — a signing key, a site's TLS key — that the build machine does
+/// not keep. The caller uploads it outside the conversation and passes the handle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadDef {
+    /// `file` (default): `${upload.<name>}` is the path of the file. `text`: one line
+    /// (a password), `${upload.<name>}` is the value — env values only.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The file's name in the job's upload folder (file only; default: the upload name).
+    #[serde(default)]
+    pub file: Option<String>,
+    /// The steps that get it. Selecting one makes the upload required.
+    pub applies_to: Vec<String>,
+    /// Branches a job that gets it may build (default: the project's `default_ref`).
+    #[serde(default)]
+    pub refs: Option<Vec<String>>,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+impl UploadDef {
+    pub fn is_text(&self) -> bool {
+        self.kind.as_deref() == Some("text")
+    }
+    pub fn kind_str(&self) -> &str {
+        self.kind.as_deref().unwrap_or("file")
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash, PartialOrd, Ord)]
@@ -438,6 +473,9 @@ pub fn fragment_violations(r: &RecipeFile) -> Vec<&'static str> {
     if !r.account_env.is_empty() {
         v.push("account_env");
     }
+    if !r.upload.is_empty() {
+        v.push("upload");
+    }
     v
 }
 
@@ -449,6 +487,10 @@ pub fn preset_violations(r: &RecipeFile) -> Vec<&'static str> {
     }
     if !r.include.is_empty() {
         v.push("include");
+    }
+    // what a caller hands over is the project's to ask for, not a shared preset's
+    if !r.upload.is_empty() {
+        v.push("upload");
     }
     v
 }

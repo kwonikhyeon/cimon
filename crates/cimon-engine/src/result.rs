@@ -53,7 +53,7 @@ pub fn build_with_steps(
         })
         .collect();
     let excluded: Vec<Value> = plan.plan.excluded.iter().map(|(s, r)| json!({"step": s, "reason": r})).collect();
-    json!({
+    let mut v = json!({
         "job_id": job_label(job.id),
         "done": true,
         "tool": job.tool,
@@ -74,7 +74,11 @@ pub fn build_with_steps(
         "toolchains": toolchains,
         "steps": steps,
         "clean": request.map(|r| r.args.clean).unwrap_or(false),
-    })
+    });
+    if let Some(u) = crate::uploads::record(app, job.id) {
+        v["uploads"] = u;
+    }
+    v
 }
 
 /// The stored result with fresh artifact links, task-specific fields and the web link.

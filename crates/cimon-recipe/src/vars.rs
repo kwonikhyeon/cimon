@@ -63,8 +63,12 @@ pub struct Known<'a> {
     pub artifacts: Vec<&'a str>,
     pub allow_value: bool,
     /// `${secret.x}` — environment values only, so a secret never lands on a command
-    /// line, in a path or in a judge's arguments.
+    /// line, in a path or in a judge's arguments. Also where a text upload may go.
     pub allow_secret: bool,
+    /// `[upload.<name>]` declarations, and the step being checked: an upload reaches
+    /// only the steps in its `applies_to` (recipe-spec §8a).
+    pub uploads: Option<&'a BTreeMap<String, crate::model::UploadDef>>,
+    pub step: Option<&'a str>,
 }
 
 /// A name `cimon build-secret` stores and `${secret.<name>}` reads.
@@ -100,6 +104,27 @@ pub fn validate_ref(name: &str, k: &Known<'_>) -> Result<Option<String>, String>
         "secret" if !k.allow_secret => Err(format!("${{{name}}}: a secret may only be an env value — on a command line or in a path it would show up in logs and process lists")),
         "secret" if valid_secret_name(rest) => Ok(None),
         "secret" => Err(format!("${{{name}}}: a secret name is [a-z0-9][a-z0-9_-]*")),
+        "upload" => {
+            let (n, field) = match rest.split_once('.') {
+                Some((n, f)) => (n, Some(f)),
+                None => (rest, None),
+            };
+            let Some(u) = k.uploads.and_then(|m| m.get(n)) else {
+                return Err(format!("unknown upload ${{{name}}} — no [upload.{n}]"));
+            };
+            let Some(step) = k.step else {
+                return Err(format!("${{{name}}}: an upload reaches only the steps in its applies_to — not [env], [workspace] or fixtures"));
+            };
+            if !u.applies_to.iter().any(|a| a == step) {
+                return Err(format!("${{{name}}}: step {step:?} is not in [upload.{n}].applies_to"));
+            }
+            match (u.is_text(), field) {
+                (_, Some(f)) if f != "dir" => Err(format!("${{{name}}}: an upload has no field {f:?} — ${{upload.{n}}} or ${{upload.{n}.dir}}")),
+                (true, Some(_)) => Err(format!("${{{name}}}: a text upload is a value, not a file")),
+                (true, None) if !k.allow_secret => Err(format!("${{{name}}}: a text upload may only be an env value — on a command line it would show up in logs and process lists")),
+                _ => Ok(None),
+            }
+        }
         "job" if matches!(rest, "id" | "commit" | "commit_short") => Ok(None),
         "step" if rest == "out" => Ok(None),
         "artifact" if k.artifacts.contains(&rest) => Ok(None),
@@ -150,7 +175,7 @@ mod tests {
     #[test]
     fn secrets_only_where_allowed() {
         let vars = BTreeMap::new();
-        let k = |allow_secret| Known { vars: &vars, params: vec![], toolchains: vec![], siblings: vec![], artifacts: vec![], allow_value: false, allow_secret };
+        let k = |allow_secret| Known { vars: &vars, params: vec![], toolchains: vec![], siblings: vec![], artifacts: vec![], allow_value: false, allow_secret, uploads: None, step: None };
         assert!(validate_ref("secret.artifactory-conan", &k(true)).is_ok());
         assert!(validate_ref("secret.artifactory-conan", &k(false)).is_err(), "not on a command line");
         assert!(validate_ref("secret.Artifactory", &k(true)).is_err());

@@ -123,6 +123,7 @@ include = ["scenarios.toml"]      # 같은 디렉터리의 조각(§10)
 [isolate]        # §7.2
 [account_env]    # §7.3
 [params.<name>]  # §8
+[upload.<name>]  # §8a
 [[step]]         # §9
 [fixture.<name>] # §11
 ```
@@ -280,8 +281,50 @@ applies_to = ["package"]
 - `${param.<name>}` 은 `applies_to` 에 든 단계에서만 쓸 수 있다 — 다른 단계에서 쓰면 오류. 값 없음인 파라미터를 `${param.x}` 로 참조하면 오류다(`default` 를 두라).
 - **호출자가 명시한 파라미터가 선택된 어느 단계에도 적용되지 않으면 거절한다**(`param_not_applicable`). 값이 무시된 채 결과에 「적용함」 으로 적히는 것을 막는다.
 - **단계가 그 값을 실제로 쓰는지는 레시피가 책임진다.** 프로젝트 스크립트가 같은 값을 내부에서 하드코딩해 덮어쓰면 그 단계는 `applies_to` 에 넣지 않는다. 의심되면 산출물 `inspect` 로 결과에 실제 값을 드러낸다.
-- **비밀은 파라미터로 받지 않는다.** 결과와 감사 로그에 값이 남는다.
+- **비밀은 파라미터로 받지 않는다.** 결과와 감사 로그에 값이 남는다. 호출자가 주는 비밀은 §8a 업로드로.
 - 파라미터 값(기본값을 채운 것)은 결과에 기록되고, 중복 병합 키에 들어간다.
+
+## 8a. `[upload.<name>]` — 호출자가 자기 PC 에서 보내는 파일·값
+
+빌드 머신에 두지 않는 비밀(릴리스 서명 키, 현장 TLS 키, 그 비밀번호)이 필요한 단계를 위한 것이다. 호출자는 자기 PC 에서 업로드 스크립트로 서버에 직접 올린다. 내용은 대화를 거치지 않는다. 받은 핸들은 `build`·`test`·`run` 의 `uploads` 로 넘긴다. 서버는 그 작업 하나에만 주고, 작업이 끝나면 지운다(design §11.7).
+
+```toml
+[upload.keystore]
+file = "release.jks"                # 작업의 업로드 폴더에 놓일 이름(기본: 업로드 이름)
+applies_to = ["package-release"]
+refs = ["main", "release/**"]       # 이 업로드를 받는 작업이 지을 수 있는 브랜치(기본: default_ref)
+description = "릴리스 서명 키스토어"
+
+[upload.keystore-password]
+kind = "text"
+applies_to = ["package-release"]
+
+[[step]]
+id = "package-release"
+kind = "package"
+run = ["powershell", "-File", "deploy/release.ps1", "-KeystoreDir", "${upload.keystore.dir}"]
+env = { KEYSTORE_PATH = "${upload.keystore}", KEYSTORE_PASSWORD = "${upload.keystore-password}" }
+```
+
+| 필드 | 뜻 |
+|---|---|
+| `kind` | `file`(기본) — `${upload.<name>}` 이 파일 경로, `${upload.<name>.dir}` 이 그 폴더. `text` — 한 줄 값(비밀번호). `${upload.<name>}` 이 값이고 **환경 변수 값에서만** 쓴다 |
+| `file` | `file` 의 파일 이름(`[A-Za-z0-9._-]`). 한 작업의 파일 업로드는 모두 한 폴더에 놓이므로 서로 달라야 한다 |
+| `applies_to` | **필수.** 이 업로드를 받는 단계. setup 과 기본 단계(`default = true`)는 넣을 수 없다 — 넣으면 모든 요청이 업로드를 내야 한다 |
+| `refs` | 이 업로드를 받는 작업이 지을 수 있는 브랜치(glob). 기본은 `default_ref` 하나 |
+| `description` | `describe_project`·`plan` 에 보인다 |
+
+- **고른 단계 중 하나라도 `applies_to` 에 들면 그 업로드는 필수다.** 없으면 `upload_missing` 으로 거절하면서 올리는 명령을 알려 준다. 고른 단계가 받지 않는 업로드를 주면 `upload_unused`, 모르는 이름이면 `unknown_upload` 이다.
+- 업로드를 받는 작업에는 제약이 붙는다.
+  - **`main` 레시피로만** 짓는다. 시도 레시피는 `upload_trial_recipe` 로 거절한다 — 누구나 올린 레시피가 업로드를 어디로든 보낼 수 있다.
+  - **`refs` 의 브랜치로만** 짓는다. 커밋 SHA 는 받지 않는다(`upload_ref_not_allowed`).
+  - `clean` 을 주지 않아도 **일회 클론과 작업 전용 캐시**로 짓는다.
+  - 같은 요청과 **병합하지 않는다**.
+  - 핸들은 올린 사람의 것만, 한 번만 쓴다. 기다리는 동안 만료되면(`[uploads].ttl_minutes`) `upload_invalid` 이다.
+- `${upload.*}` 는 `applies_to` 단계의 문자열에서만 쓸 수 있다. `[env]`·`[workspace]`·fixture 에 쓰면 오류다. text 업로드를 명령줄에 쓰면 오류다 — 로그와 프로세스 목록에 남는다.
+- 단계 로그와 판정 출력에서 text 업로드 값은 `***` 로 가린다. 결과와 provenance 에는 이름·크기·sha256·올린 사람만 남는다.
+- 시도 실행으로는 업로드 단계를 돌릴 수 없다. 그래서 업로드 단계를 바꾼 제안은 「시도 실행으로 확인되지 않는 변경」 에 든다(design §6.5) — 반영한 뒤 `main` 으로 확인한다.
+- `[upload.*]` 는 프로젝트의 `recipe.toml` 에만 둔다. 프리셋과 include 에 두면 오류다.
 
 ---
 
@@ -510,6 +553,7 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 | `${sibling.<project>.root}` · `${sibling.<project>.commit}` | 형제 트리 |
 | `${value}` | `params.*.args` 안에서만 — 그 파라미터 값 |
 | `${secret.<name>}` | 관리자가 `cimon build-secret <project> <name>` 으로 이 프로젝트에 둔 값(design §11.6). **환경 변수 값에서만**. 이름은 `[a-z0-9][a-z0-9_-]*`. 없으면 그 단계가 `inconclusive`/`environment` |
+| `${upload.<name>}` · `${upload.<name>.dir}` | §8a — 호출자가 이 작업에 올린 파일의 경로와 그 폴더, text 업로드면 값(환경 변수 값에서만). `applies_to` 단계에서만 |
 
 ---
 
@@ -551,8 +595,9 @@ collect = [".runtime/cimon-${job.id}/logs/**"]
 |---|---|
 | schema·모르는 키·타입 | `timeot_min` |
 | 참조 | 모르는 프리셋, 카탈로그에 없는 툴체인 종류, 모르는 `after`·`fixture`·`uses`·`applies_to`·`requires_artifacts`, 등록되지 않은 형제 프로젝트 |
-| 변수 | 모르는 `${…}`, 닫히지 않은 `${`, 값 없는(`default` 없는) 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}`, `[env]` 에서 단계마다 다른 값(`${param.*}`·`${artifact.*}`·`${step.out}`), 환경 변수 값 밖의 `${secret.*}`, 형식에 맞지 않는 비밀 이름 |
+| 변수 | 모르는 `${…}`, 닫히지 않은 `${`, 값 없는(`default` 없는) 파라미터 참조, `applies_to` 밖에서 `${param.x}`, 요청되지 않을 수 있는 `${artifact.x}`, `[env]` 에서 단계마다 다른 값(`${param.*}`·`${artifact.*}`·`${step.out}`), 환경 변수 값 밖의 `${secret.*}`, 형식에 맞지 않는 비밀 이름, `applies_to` 밖이나 `[env]`·`[workspace]`·fixture 의 `${upload.*}`, 환경 변수 값 밖의 text 업로드 |
 | 파라미터 | `applies_to` 없음, 소비처(`env`·`args`·`${param.x}`) 없음 |
+| 업로드 | `applies_to` 없음·모르는 단계·setup·기본 단계, `kind` 가 `file`·`text` 가 아님, 파일 이름 형식·중복, text 의 `file`, 빈 `refs`, 프리셋·include 의 `[upload.*]` |
 | 순환 | `after` 순환 |
 | 중복 | include 끼리 같은 step id, 산출물 이름 중복 |
 | 겹치기 | 앞 층에 없는 id 를 끄는 `disabled`, include 의 `disabled`·위 층이 끈 id 재정의, 프리셋·include 의 `schema` |

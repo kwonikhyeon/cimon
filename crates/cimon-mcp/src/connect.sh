@@ -60,6 +60,9 @@ cat > "$HOME/.cimon/header.sh" <<EOF
 printf '{"Authorization":"Bearer %s"}' "\$($get)"
 EOF
 chmod 700 "$HOME/.cimon/header.sh"
+# for steps that need a file from this machine (a signing key): sh ~/.cimon/upload.sh
+curl -fsS "$CIMON_URL/upload.sh" -o "$HOME/.cimon/upload.sh" && chmod 700 "$HOME/.cimon/upload.sh" \
+  || printf 'cimon connect: could not fetch upload.sh - get it later from %s/upload.sh\n' "$CIMON_URL" >&2
 
 claude mcp remove --scope user cimon >/dev/null 2>&1 || true   # replace an earlier registration
 claude mcp add-json --scope user cimon "{\"type\":\"http\",\"url\":\"$CIMON_URL/mcp\",\"headersHelper\":\"sh '$HOME/.cimon/header.sh'\"}" \

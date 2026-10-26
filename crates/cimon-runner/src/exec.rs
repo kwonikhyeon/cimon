@@ -27,6 +27,9 @@ pub struct ExecSpec {
     pub capture_prefixes: Vec<String>,
     /// Lines written before the command's output (pre-clean report, command line).
     pub preamble: Vec<String>,
+    /// Values the command's environment carries that its output must not show (text
+    /// uploads): replaced by `***` in the log, the tail and the matches.
+    pub redact: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -84,10 +87,43 @@ struct LogState {
     first_error: Option<String>,
     fail_hits: Vec<String>,
     captured: Vec<String>,
+    /// Longest first, so a value that contains another is replaced whole.
+    redact: Vec<Vec<u8>>,
+}
+
+/// `raw` with every occurrence of each value replaced by `***`.
+fn redact<'a>(raw: &'a [u8], values: &[Vec<u8>]) -> std::borrow::Cow<'a, [u8]> {
+    let mut out: Option<Vec<u8>> = None;
+    for s in values {
+        let cur: &[u8] = out.as_deref().unwrap_or(raw);
+        if s.is_empty() || !cur.windows(s.len()).any(|w| w == s.as_slice()) {
+            continue;
+        }
+        let mut v = Vec::with_capacity(cur.len());
+        let mut i = 0;
+        while i < cur.len() {
+            if cur[i..].starts_with(s) {
+                v.extend_from_slice(b"***");
+                i += s.len();
+            } else {
+                v.push(cur[i]);
+                i += 1;
+            }
+        }
+        out = Some(v);
+    }
+    match out {
+        Some(v) => std::borrow::Cow::Owned(v),
+        None => std::borrow::Cow::Borrowed(raw),
+    }
 }
 
 impl LogState {
     fn line(&mut self, raw: &[u8], patterns: &[Regex], fail: &[String], capture: &[String]) {
+        let values = std::mem::take(&mut self.redact);
+        let raw = redact(raw, &values).into_owned();
+        self.redact = values;
+        let raw = raw.as_slice();
         // matching looks at the first MATCH_BYTES of a line; the log keeps all of it
         let text = decode(&raw[..raw.len().min(MATCH_BYTES)]);
         let clean = strip_ansi(text.trim_end_matches(['\r', '\n']));
@@ -288,13 +324,20 @@ pub fn execute(spec: &ExecSpec, account: &Account, cancel: &AtomicBool) -> ExecR
         first_error: None,
         fail_hits: vec![],
         captured: vec![],
+        redact: {
+            let mut v: Vec<Vec<u8>> = spec.redact.iter().filter(|s| !s.is_empty()).map(|s| s.as_bytes().to_vec()).collect();
+            v.sort_by_key(|s| std::cmp::Reverse(s.len()));
+            v
+        },
     }));
     {
         let mut st = state.lock().unwrap();
-        for l in &spec.preamble {
-            st.write(format!("[cimon] {l}\n").as_bytes());
+        let mut head: Vec<String> = spec.preamble.iter().map(|l| format!("[cimon] {l}\n")).collect();
+        head.push(format!("[cimon] $ {} {}\n[cimon] cwd {}\n", spec.program.display(), spec.args.join(" "), spec.cwd.display()));
+        for l in head {
+            let b = redact(l.as_bytes(), &st.redact).into_owned();
+            st.write(&b);
         }
-        st.write(format!("[cimon] $ {} {}\n[cimon] cwd {}\n", spec.program.display(), spec.args.join(" "), spec.cwd.display()).as_bytes());
     }
     let patterns = Arc::new(spec.error_patterns.clone());
     let fail = Arc::new(spec.fail_on_output.clone());
@@ -551,7 +594,26 @@ mod tests {
             fail_on_output: vec!["SKIP (no sibling".into()],
             capture_prefixes: vec!["test result:".into()],
             preamble: vec![],
+            redact: vec![],
         }
+    }
+
+    /// A value the environment carries never reaches the log, the tail or the error
+    /// line — whatever the command prints (design §11.7).
+    #[test]
+    fn redacted_values_never_reach_the_log() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = spec(d.path(), &["/c", "echo error: login failed for s3cr3t-pass-xyz and s3cr3t&& echo pw=%PW%"], 30);
+        s.env.insert("PW".into(), "s3cr3t-pass-xyz".into());
+        s.redact = vec!["s3cr3t".into(), "s3cr3t-pass-xyz".into()];
+        let r = execute(&s, &Account::Current, &AtomicBool::new(false));
+        assert_eq!(r.exit_code, Some(0), "{r:?}");
+        let log = std::fs::read_to_string(d.path().join("log.txt")).unwrap();
+        assert!(!log.contains("s3cr3t"), "{log}");
+        assert!(log.contains("login failed for *** and ***"), "longest first, then the shorter: {log}");
+        assert!(log.contains("pw=***"), "{log}");
+        assert_eq!(r.first_error.as_deref(), Some("error: login failed for *** and ***"));
+        assert!(r.tail.iter().all(|l| !l.contains("s3cr3t")), "{:?}", r.tail);
     }
 
     #[test]
@@ -633,6 +695,7 @@ mod tests {
             first_error: None,
             fail_hits: vec![],
             captured: vec![],
+            redact: vec![],
         };
         st.write(b"start\n");
         st.write(&vec![b'x'; 10_000]);

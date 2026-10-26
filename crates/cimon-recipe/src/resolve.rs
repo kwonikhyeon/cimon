@@ -39,6 +39,8 @@ pub struct Resolved {
     pub isolate: BTreeMap<String, String>,
     pub account_env: BTreeMap<String, String>,
     pub params: BTreeMap<String, ParamDef>,
+    /// `[upload.<name>]` of the project's recipe.toml (recipe-spec §8a).
+    pub uploads: BTreeMap<String, UploadDef>,
     pub steps: Vec<Step>,
     pub fixtures: BTreeMap<String, FixtureDef>,
     /// Files that make up this recipe (for the recipe sha256 and diffs).
@@ -164,6 +166,7 @@ pub fn resolve_project(tree: &dyn Tree, id: &str) -> Result<Resolved, Vec<Diag>>
         isolate: BTreeMap::new(),
         account_env: BTreeMap::new(),
         params: BTreeMap::new(),
+        uploads: recipe.upload.clone(),
         steps: vec![],
         fixtures: BTreeMap::new(),
         files: vec![],

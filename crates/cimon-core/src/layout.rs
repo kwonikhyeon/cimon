@@ -17,6 +17,10 @@ impl Layout {
     pub fn db(&self) -> PathBuf {
         self.state_dir().join("cimon.db")
     }
+    /// Uploads waiting for (or held by) a job — service-only, DPAPI-protected.
+    pub fn uploads(&self) -> PathBuf {
+        self.state_dir().join("uploads")
+    }
     pub fn draining_flag(&self) -> PathBuf {
         self.state_dir().join("draining")
     }

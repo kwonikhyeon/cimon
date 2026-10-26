@@ -91,6 +91,9 @@ pub fn create(app: &Arc<App>, user: &str, tool: Tool, args: RunArgs, via_task: b
         return Err(Rejection::new("queue_full", format!("you already have {queued} jobs waiting ({}) — wait or cancel_job", mine.join(", "))));
     }
     let v: Validated = recipes::validate(app, tool, &args)?;
+    let uploads = crate::uploads::check_handles(app, user, &v, &args)?;
+    let mut args = args;
+    args.clean = args.effective_clean(&v.plan);
     let request = JobRequest { args: args.clone(), project: v.resolved.project.clone() };
     let task_id = format!("t_{}", cimon_core::random_id128());
     let new = NewJob {
@@ -108,7 +111,15 @@ pub fn create(app: &Arc<App>, user: &str, tool: Tool, args: RunArgs, via_task: b
         status_message: "접수: 대기".into(),
         expires_at: after_secs(RECORD_DAYS * 86400),
     };
-    let id = app.store.insert_job_with_task(&new, &task_id, via_task, None)?;
+    let id = app.store.insert_job_with_uploads(&new, &task_id, via_task, None, &uploads).map_err(|e| match e {
+        // an upload another call took between the check and the insert
+        cimon_store::StoreError::Conflict(m) => Rejection::new("upload_invalid", m),
+        e => e.into(),
+    })?;
+    if !uploads.is_empty() {
+        let detail = uploads.iter().map(|(n, h)| format!("{n}={h}")).collect::<Vec<_>>().join(" ");
+        let _ = app.store.audit(cimon_store::AuditEntry { user, action: "upload_used", job_id: Some(id), detail: Some(detail), ..Default::default() });
+    }
     app.engine.intake.notify_one();
     let job = app.store.require_job(id)?;
     Ok(CreatedTask { task_id, job_id: id, created_at: job.created_at, status: "접수: 대기".into() })
@@ -208,6 +219,7 @@ pub fn finish_simple_if(
     };
     if applied {
         release_keeps(app, &job);
+        crate::uploads::release_job(app, job_id);
     }
     applied
 }
@@ -472,6 +484,12 @@ fn merge_key(job: &cimon_store::JobRow, commit: &str, siblings: &[SiblingPin], p
         "params": plan.params,
         "clean": clean,
     });
+    // a job that gets uploads is its caller's alone: nothing merges into it, and it
+    // merges into nothing (design §11.7)
+    let mut v = v;
+    if !args.uploads.is_empty() {
+        v["uploads_job"] = json!(job.id);
+    }
     cimon_core::sha256_hex(v.to_string().as_bytes())
 }
 
@@ -620,6 +638,7 @@ pub fn refresh_queue_positions(app: &App) {
 
 /// Periodic housekeeping: queue timeouts (design §8.3).
 pub fn tick(app: &App) {
+    crate::uploads::sweep(app);
     let limit = app.config.queue.max_queue_hours as i64 * 3600;
     if let Ok(jobs) = app.store.jobs_in_states(&[JobState::Intake, JobState::Provisioning, JobState::Ready]) {
         for j in jobs {

@@ -507,6 +507,48 @@ fn check_project(tree: &dyn Tree, catalog: Option<&Catalog>, projects: &[String]
         }
     }
 
+    // uploads (recipe-spec §8a)
+    let mut upload_files: BTreeMap<String, String> = BTreeMap::new();
+    for (name, u) in &r.uploads {
+        let needle = format!("[upload.{name}]");
+        if !vars::valid_secret_name(name) {
+            cx.err_recipe(&needle, format!("upload {name:?}: a name is [a-z0-9][a-z0-9_-]*"));
+        }
+        if !matches!(u.kind_str(), "file" | "text") {
+            cx.err_recipe(&needle, format!("upload {name}: kind must be file or text"));
+        }
+        if u.is_text() {
+            if u.file.is_some() {
+                cx.err_recipe(&needle, format!("upload {name}: file is for kind = \"file\" only"));
+            }
+        } else {
+            let f = u.file.clone().unwrap_or_else(|| name.clone());
+            if !valid_upload_file_name(&f) {
+                cx.err_recipe(&needle, format!("upload {name}: file {f:?} must be a plain file name ([A-Za-z0-9._-], not . or ..)"));
+            }
+            // every file of a job lands in one folder (Windows: names are case-insensitive)
+            if let Some(other) = upload_files.insert(f.to_ascii_lowercase(), name.clone()) {
+                cx.err_recipe(&needle, format!("upload {name}: file {f:?} is also upload {other}'s — the files of a job share one folder"));
+            }
+        }
+        if u.applies_to.is_empty() {
+            cx.err_recipe(&needle, format!("upload {name}: applies_to is required — name the steps that get it"));
+        }
+        for a in &u.applies_to {
+            match r.step(a) {
+                None => cx.err_recipe(&needle, format!("upload {name}: applies_to names unknown step {a:?}")),
+                Some(st) if st.kind == Kind::Setup => cx.err_recipe(&needle, format!("upload {name}: {a:?} is a setup step — setup runs in every job, which would all need the upload")),
+                Some(st) if st.is_default() => {
+                    cx.err_recipe(&needle, format!("upload {name}: {a:?} is a default step — every plain request would have to hand the upload over; set default = false"))
+                }
+                Some(_) => {}
+            }
+        }
+        if u.refs.as_ref().is_some_and(|v| v.is_empty()) {
+            cx.err_recipe(&needle, format!("upload {name}: refs is empty — leave it out to allow only the default_ref"));
+        }
+    }
+
     // steps
     let producers = r.artifact_producers();
     let mut artifact_names = BTreeSet::new();
@@ -801,7 +843,14 @@ pub(crate) fn known<'a>(r: &'a Resolved, artifacts: &'a BTreeSet<String>, allow_
         artifacts: artifacts.iter().map(|s| s.as_str()).collect(),
         allow_value,
         allow_secret: false,
+        uploads: Some(&r.uploads),
+        step: None,
     }
+}
+
+/// The name a file upload lands under in the job's upload folder.
+fn valid_upload_file_name(f: &str) -> bool {
+    !f.is_empty() && f.len() <= 100 && f != "." && f != ".." && f.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_artifacts: &BTreeSet<String>, allow_secret: bool) {
@@ -815,7 +864,7 @@ fn check_refs(cx: &mut Ctx<'_>, s: &crate::resolve::Step, text: &str, fixture_ar
                 continue;
             }
         }
-        let k = Known { allow_secret, ..known(cx.r, fixture_artifacts, false) };
+        let k = Known { allow_secret, step: Some(s.id()), ..known(cx.r, fixture_artifacts, false) };
         match vars::validate_ref(&v, &k) {
             Err(e) => cx.err_step(s, e),
             Ok(Some(p)) => {

@@ -216,6 +216,23 @@ CREATE TABLE IF NOT EXISTS invites (
   redeemed_login TEXT
 );
 
+-- what a caller sent from their own machine for one job (design §11.7); the bytes
+-- are a DPAPI file under state\uploads\, deleted when the job ends
+CREATE TABLE IF NOT EXISTS uploads (
+  handle     TEXT PRIMARY KEY,
+  user       TEXT NOT NULL,
+  label      TEXT NOT NULL,
+  kind       TEXT NOT NULL,
+  bytes      INTEGER NOT NULL,
+  sha256     TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  job_id     INTEGER,
+  name       TEXT,
+  deleted_at TEXT
+);
+CREATE INDEX IF NOT EXISTS uploads_job ON uploads(job_id);
+
 CREATE TABLE IF NOT EXISTS login_codes (
   code_sha256 TEXT PRIMARY KEY,
   user        TEXT NOT NULL,

@@ -127,6 +127,8 @@ pub struct JobCtx<'a> {
     pub clean: bool,
     /// This project's `cimon build-secret`s (design §11.6) — or why they could not be read.
     pub secrets: Result<BTreeMap<String, String>, String>,
+    /// What the caller uploaded for this job, by recipe name (design §11.7).
+    pub uploads: BTreeMap<String, crate::uploads::Received>,
 }
 
 pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
@@ -206,6 +208,19 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
             return;
         }
     };
+    let uploads = match crate::uploads::materialize(app, id, &resolved) {
+        Ok(u) => u,
+        Err(e) => {
+            jobs::finish_simple(app, id, JobState::Done, Some(Verdict::Inconclusive), Some(FailureClass::Infra), Some("upload_unreadable"), &format!("업로드를 작업에 넣지 못했다: {e}"));
+            cleanup(app, &job, slot, request.args.clean, &plan, &resolved);
+            return;
+        }
+    };
+    if !uploads.is_empty() {
+        let rows = app.store.job_uploads(id).unwrap_or_default();
+        let list: Vec<String> = rows.iter().map(|u| format!("{}(sha256 {}…)", u.name.clone().unwrap_or_default(), &u.sha256[..12])).collect();
+        warnings.push(Warning::new("upload", format!("업로드 {} 를 받았다 — 일회 클론과 작업 전용 캐시로 짓고, 작업이 끝나면 지운다", list.join(", "))));
+    }
     let account = build.as_ref().map(|b| b.account()).unwrap_or(cimon_runner::Account::Current);
     let mut ctx = JobCtx {
         app,
@@ -227,6 +242,7 @@ pub fn run_job(app: &Arc<App>, id: i64, cancel: &AtomicBool) {
         deadline,
         clean: request.args.clean,
         secrets: crate::build_secrets::load(&app.layout).map(|mut all| all.remove(&job.project).unwrap_or_default()),
+        uploads,
     };
     crate::fixtures::account_env(&mut ctx, true);
 
@@ -314,6 +330,7 @@ impl cimon_workspace::TreeGit for BuildGit<'_> {
             fail_on_output: vec![],
             capture_prefixes: vec![],
             preamble: vec![format!("git {}", args[cimon_workspace::GIT_OPTIONS.len()..].join(" "))],
+            redact: vec![],
         };
         if let Some(p) = spec.log_path.parent() {
             std::fs::create_dir_all(p)?;
@@ -427,6 +444,7 @@ pub fn cleanup_job_dirs(app: &App, id: i64) {
 
 fn cleanup(app: &App, job: &JobRow, _slot: Option<i64>, clean: bool, plan: &JobPlan, _r: &Resolved) {
     cleanup_job_dirs(app, job.id);
+    crate::uploads::release_job(app, job.id);
     if let Some(m) = Mirror::open(&app.layout.mirror(&job.project_key)) {
         m.unkeep(&format!("j{}", job.id));
     }
@@ -467,6 +485,7 @@ fn sweep(app: &App, warnings: &mut Vec<Warning>, when: &str) {
         fail_on_output: vec![],
         capture_prefixes: vec!["{".into()],
         preamble: vec![],
+        redact: vec![],
     };
     let res = exec::execute(&spec, &acct.account(), &AtomicBool::new(false));
     let report: Option<cimon_runner::SweepReport> = res.captured.iter().rev().find_map(|l| serde_json::from_str(l).ok());
@@ -729,6 +748,7 @@ fn run_one(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, label: &str, rec: &m
         fail_on_output: step.def.fail_on_output.clone(),
         capture_prefixes: vec!["test result:".into()],
         preamble,
+        redact: ctx.redactions(),
     };
     // status ticker
     let done = Arc::new(AtomicBool::new(false));
@@ -838,6 +858,7 @@ fn run_script_judge(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step, res: &cimon
         fail_on_output: vec![],
         capture_prefixes: vec!["{".into()],
         preamble: vec![],
+        redact: ctx.redactions(),
     };
     let jr = exec::execute(&spec, &ctx.account, ctx.cancel);
     cimon_judge::judge_script_output(&jr, &jr.captured)
@@ -985,18 +1006,50 @@ impl JobCtx<'_> {
                         _ => None,
                     }
                 }
+                // a file upload's path (or its folder); a text upload is env_lookup's
+                "upload" => {
+                    let (n, field) = rest.split_once('.').map(|(n, f)| (n, Some(f))).unwrap_or((rest, None));
+                    match (self.uploads.get(n)?, field) {
+                        (crate::uploads::Received::File(p), None) => Some(p.to_string_lossy().into()),
+                        (crate::uploads::Received::File(p), Some("dir")) => p.parent().map(|d| d.to_string_lossy().into()),
+                        _ => None,
+                    }
+                }
                 _ => None,
             }
         }
     }
 
-    /// [`Self::lookup`] plus `${secret.<name>}` — for environment values only (design §11.6).
+    /// [`Self::lookup`] plus `${secret.<name>}` and text uploads — for environment
+    /// values only (design §11.6, §11.7).
     pub fn env_lookup<'b>(&'b self, step: &str, out_dir: &'b Path) -> impl Fn(&str) -> Option<String> + 'b {
         let lookup = self.lookup(step, out_dir);
         move |name: &str| match name.strip_prefix("secret.") {
             Some(s) => self.secrets.as_ref().ok().and_then(|m| m.get(s).cloned()),
-            None => lookup(name),
+            None => match name.strip_prefix("upload.").and_then(|n| self.uploads.get(n)) {
+                Some(crate::uploads::Received::Text(t)) => Some(t.clone()),
+                _ => lookup(name),
+            },
         }
+    }
+
+    /// Values a step's output must not show: the job's text uploads (short ones would
+    /// blank out ordinary words). Build secrets are not among them — they also hold
+    /// plain values such as a registry user name (setup.md), which logs must keep.
+    pub fn redactions(&self) -> Vec<String> {
+        self.uploads
+            .values()
+            .filter_map(|u| match u {
+                crate::uploads::Received::Text(t) if t.len() >= 4 => Some(t.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A job that gets uploads keeps nothing another job could have left — package
+    /// caches and project-scoped homes become the job's own (design §11.7).
+    pub fn private_caches(&self) -> bool {
+        !self.request.args.uploads.is_empty()
     }
 
     /// Every secret `step`'s environment names is stored: run_one checks before it
@@ -1030,7 +1083,7 @@ impl JobCtx<'_> {
         for (k, v) in &self.tool_env.exports {
             cimon_runner::env_set(&mut env, k, v.clone());
         }
-        let caches = app.layout.caches(pk);
+        let caches = if self.private_caches() { app.layout.home_job(id, "caches") } else { app.layout.caches(pk) };
         for (k, sub) in [("CARGO_HOME", "cargo"), ("npm_config_cache", "npm"), ("UV_CACHE_DIR", "uv"), ("GRADLE_USER_HOME", "gradle"), ("NUGET_PACKAGES", "nuget")] {
             let d = caches.join(sub);
             let _ = std::fs::create_dir_all(&d);
@@ -1040,7 +1093,7 @@ impl JobCtx<'_> {
             cimon_runner::env_set(&mut env, "RUSTUP_HOME", rh.to_string_lossy().into());
         }
         for (name, scope) in &self.resolved.isolate {
-            let d = if scope == "job" { app.layout.home_job(id, name) } else { app.layout.home_project(pk, name) };
+            let d = if scope == "job" || self.private_caches() { app.layout.home_job(id, name) } else { app.layout.home_project(pk, name) };
             std::fs::create_dir_all(&d).map_err(|e| e.to_string())?;
             cimon_runner::env_set(&mut env, name, d.to_string_lossy().into());
         }

@@ -296,6 +296,22 @@ fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolv
                 }
             }
         }
+        // uploads: who may hand a job what, and which steps get it — a changed upload
+        // changes the steps it applies to, before and after
+        let unames: BTreeSet<&String> = o.uploads.keys().chain(n.uploads.keys()).collect();
+        for u in unames {
+            let a = o.uploads.get(u).map(|x| serde_json::to_value(x).unwrap()).unwrap_or(Value::Null);
+            let b = n.uploads.get(u).map(|x| serde_json::to_value(x).unwrap()).unwrap_or(Value::Null);
+            if a != b {
+                pd.risks.insert(Risk::Permission);
+                pd.settings.push(FieldChange { field: format!("upload.{u}"), from: a, to: b, risk: Some(Risk::Permission) });
+                for s in o.uploads.get(u).into_iter().chain(n.uploads.get(u)).flat_map(|x| x.applies_to.clone()) {
+                    if n.step(&s).is_some() {
+                        changed_steps.insert(s);
+                    }
+                }
+            }
+        }
         // fixtures: a changed fixture changes the steps that use it
         let fnames: BTreeSet<&String> = o.fixtures.keys().chain(n.fixtures.keys()).collect();
         for f in fnames {
@@ -340,7 +356,7 @@ fn diff_project(old: &dyn Tree, new: &dyn Tree, o: Option<&Resolved>, n: &Resolv
             pd.settings.push(FieldChange { field: format!("script(간접):{f}"), from: Value::Null, to: Value::Null, risk: Some(Risk::Exec) });
         }
     }
-    let project_wide = pd.settings.iter().any(|f| !f.field.starts_with("params.") && !f.field.starts_with("fixture."));
+    let project_wide = pd.settings.iter().any(|f| !f.field.starts_with("params.") && !f.field.starts_with("fixture.") && !f.field.starts_with("upload."));
 
     // steps
     for s in &n.steps {

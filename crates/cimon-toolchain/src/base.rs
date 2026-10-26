@@ -97,6 +97,7 @@ fn run_probe(bins: &[PathBuf], run: &[String], cwd: &Path) -> Result<String, Str
         fail_on_output: vec![],
         capture_prefixes: vec![],
         preamble: vec![],
+        redact: vec![],
     };
     let r = cimon_runner::execute(&spec, &cimon_runner::Account::Current, &AtomicBool::new(false));
     let _ = std::fs::remove_dir_all(&tmp);

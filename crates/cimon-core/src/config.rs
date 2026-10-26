@@ -49,6 +49,8 @@ pub struct Config {
     pub web: WebConfig,
     #[serde(default)]
     pub github: GithubConfig,
+    #[serde(default)]
+    pub uploads: UploadsConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +264,37 @@ fn d_max_queued() -> u32 {
 }
 fn d_max_queue_hours() -> u32 {
     12
+}
+
+/// `[uploads]` (design §11.7): what a caller may send for one job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadsConfig {
+    /// An upload no job has taken by then is deleted.
+    #[serde(default = "d_upload_ttl")]
+    pub ttl_minutes: u32,
+    /// Largest file upload (a text upload is at most 4 KiB).
+    #[serde(default = "d_upload_max")]
+    pub max_bytes: u64,
+    /// Untaken uploads one user may have at a time.
+    #[serde(default = "d_upload_pending")]
+    pub max_pending_per_user: u32,
+}
+
+impl Default for UploadsConfig {
+    fn default() -> Self {
+        UploadsConfig { ttl_minutes: d_upload_ttl(), max_bytes: d_upload_max(), max_pending_per_user: d_upload_pending() }
+    }
+}
+
+fn d_upload_ttl() -> u32 {
+    60
+}
+fn d_upload_max() -> u64 {
+    1 << 20
+}
+fn d_upload_pending() -> u32 {
+    20
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

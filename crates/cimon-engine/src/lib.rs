@@ -14,6 +14,7 @@ pub mod recipes;
 pub mod result;
 pub mod run;
 pub mod toolchains;
+pub mod uploads;
 
 use cimon_core::{Config, Layout};
 use cimon_recipestore::RecipeStore;

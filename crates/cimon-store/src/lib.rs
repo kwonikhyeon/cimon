@@ -10,10 +10,12 @@ use std::sync::{Mutex, MutexGuard};
 pub mod jobs;
 pub mod misc;
 pub mod proposals;
+pub mod uploads;
 
 pub use jobs::*;
 pub use misc::*;
 pub use proposals::*;
+pub use uploads::*;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {

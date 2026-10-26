@@ -130,7 +130,7 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 | 「취소해」 · 「대기열 보여 줘」 | `cancel_job` · `queue` |
 | 「이 프로젝트는 어떤 단계·산출물이 있어?」 | `describe_project` |
 
-입력은 `project` 와 선택 항목들이다 — `ref`(브랜치 이름이나 커밋 SHA, 기본은 프로젝트의 `default_ref`), `steps`·`tags`, `artifacts`(받을 산출물 이름), `params`(레시피에 선언된 것만), `clean`(warm 트리 대신 일회 클론).
+입력은 `project` 와 선택 항목들이다 — `ref`(브랜치 이름이나 커밋 SHA, 기본은 프로젝트의 `default_ref`), `steps`·`tags`, `artifacts`(받을 산출물 이름), `params`(레시피에 선언된 것만), `clean`(warm 트리 대신 일회 클론), `uploads`(아래 「비밀 파일이 필요한 빌드」).
 
 **기다리는 동안**: `build`·`test`·`run` 은 MCP task 로 돌아 바로 돌아온다. Claude Code 가 끝날 때까지 확인하므로 대화를 이어 가도 된다. 끝나면 판정·요약·산출물 링크가 온다. task 를 모르는 클라이언트는 작업 id(`j000123`)를 받고 `job_status` 로 확인한다.
 
@@ -146,6 +146,29 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 | `inconclusive` · `infra` | fetch·다운로드 실패, 서비스 재시작 | 다시 요청, 반복되면 관리자 |
 
 경고(`warnings`)도 읽는다 — warm 슬롯을 다시 만들었다, 빌드 계정에 남은 프로세스를 정리했다 같은 것이 여기 온다.
+
+## 비밀 파일이 필요한 빌드 (업로드)
+
+릴리스 서명 키나 현장 TLS 키처럼 빌드 머신에 두지 않는 파일이 필요한 단계가 있다. 이런 단계는 **내 PC 에서 그 작업 하나에만** 넘긴다. `describe_project` 의 `uploads` 가 프로젝트가 받는 것(이름·종류·받는 단계·허용 브랜치)을 보여 준다.
+
+1. **올린다** — 내 PC 에서 실행한다. connect 스크립트가 `~/.cimon/` 에 업로드 스크립트를 받아 둔다. 없으면 `irm https://cimon.<tailnet>.ts.net/upload.ps1 -OutFile $HOME\.cimon\upload.ps1`(macOS·Linux 는 `curl -fsSL …/upload.sh -o ~/.cimon/upload.sh`)로 받는다.
+
+   ```powershell
+   powershell -NoProfile -ExecutionPolicy Bypass -File $HOME\.cimon\upload.ps1 `
+     keystore=C:\keys\release.jks keystore-password=env:KEYSTORE_PASSWORD key-password=prompt
+   ```
+   ```sh
+   sh ~/.cimon/upload.sh keystore=$HOME/keys/release.jks keystore-password=env:KEYSTORE_PASSWORD key-password=prompt
+   ```
+
+   `<이름>=<파일>` 은 파일을, `<이름>=env:<변수>` 는 그 환경 변수 값을, `<이름>=prompt` 는 화면에 보이지 않게 입력받은 값을 올린다. 끝나면 `{"keystore":"u_…","keystore-password":"u_…"}` 한 줄이 나온다.
+2. **요청한다** — 그 줄을 그대로 `uploads` 로 준다. 「`<project>` release 단계 빌드해 줘, uploads 는 {…}」.
+
+- 내용은 내 PC 에서 서버로만 간다. **Claude 에게 파일 내용이나 비밀번호를 붙여 넣지 않는다** — 대화 기록에 남는다. Claude 가 업로드 명령을 대신 실행해도 Claude 가 보는 것은 경로·변수 이름·핸들뿐이다(`prompt` 는 직접 실행할 때만 된다).
+- 핸들은 올린 사람만, **한 번만**, 기본 **60분 안에** 쓴다. 지나면 다시 올린다.
+- 업로드를 받는 작업은 레시피의 `refs` 브랜치(기본 `default_ref`)와 `main` 레시피로만 돈다. 시도 레시피나 다른 브랜치로 요청하면 거절된다. 일회 클론과 작업 전용 캐시로 지으므로 평소보다 오래 걸린다.
+- 단계 로그에서 text 값은 `***` 로 가려진다. 결과에는 이름·크기·sha256 만 남는다. 작업이 끝나면 서버는 받은 파일을 지운다.
+- 빌드 코드는 받은 키를 읽을 수 있다 — 내 PC 에서 직접 빌드할 때와 같다. 믿는 브랜치만 이렇게 짓는다.
 
 ## 산출물 받기
 
@@ -173,6 +196,8 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 | 401 | 토큰이 틀렸거나 꺼졌다 — 관리자에게 `cimon token rotate <이름>` |
 | headersHelper 오류 | `powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<me>/.cimon/header.ps1` 을 직접 실행해 JSON 한 줄이 나오는지 |
 | `queue_full` | 내 대기 작업이 상한(기본 5개)이다 — 기다리거나 `cancel_job` |
+| `upload_missing` · `upload_invalid` | 고른 단계에 업로드가 필요하다, 또는 핸들이 만료·사용됐다 — 「비밀 파일이 필요한 빌드」 대로 다시 올린다 |
+| `upload_ref_not_allowed` · `upload_trial_recipe` | 업로드를 받는 작업은 허용 브랜치와 `main` 레시피로만 — `describe_project` 의 `uploads.refs` |
 | `draining` | 관리자가 업그레이드 중이다 — 잠시 뒤 다시 |
 | `ref_not_allowed` · `unknown_project` | 그 프로젝트가 허용한 브랜치·등록된 id 인지 — `describe_project`, `list_projects` |
 | 느리다 | `tailscale status` 에 `relay` 가 보이면 중계(DERP) 경로다. 다운로드는 이어받기로 |

@@ -127,15 +127,26 @@ pub fn conditions(app: &App, p: &ProposalRow, head: &str) -> Result<Conditions, 
             }
             let caps = &app.config.runner.capabilities;
             let step_of = |s: &String| r.step(s);
-            let excluded: Vec<&String> = required.iter().filter(|s| step_of(s).is_some_and(|st| !st.def.needs.iter().all(|n| caps.contains(n)))).collect();
-            if !excluded.is_empty() {
+            // a step that gets uploads runs only with main's recipe (design §11.7)
+            let gets_upload = |s: &String| r.uploads.values().any(|u| u.applies_to.contains(s));
+            let upload_steps: Vec<&String> = required.iter().filter(|s| gets_upload(s)).collect();
+            if !upload_steps.is_empty() {
+                untestable.push(format!(
+                    "{}: 바뀐 단계 {} 는 업로드를 받아서 시도 레시피로는 돌 수 없다 — 반영한 뒤 main 으로 확인한다",
+                    pd.id,
+                    upload_steps.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ));
+            }
+            let needs_excluded: Vec<&String> = required.iter().filter(|s| step_of(s).is_some_and(|st| !st.def.needs.iter().all(|n| caps.contains(n)))).collect();
+            if !needs_excluded.is_empty() {
                 untestable.push(format!(
                     "{}: 바뀐 단계 {} 는 이 러너({})에서 돌 수 없다(needs) — 시도 실행으로 확인되지 않는다",
                     pd.id,
-                    excluded.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                    needs_excluded.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
                     app.config.runner.name
                 ));
             }
+            let excluded: Vec<&String> = needs_excluded.into_iter().chain(upload_steps).collect();
             let setup_changed = required.iter().any(|s| step_of(s).is_some_and(|st| st.kind == cimon_recipe::Kind::Setup));
             let runnable: Vec<String> = required
                 .iter()

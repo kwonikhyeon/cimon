@@ -474,6 +474,7 @@ fn exec(account: &cimon_runner::Account, program: &Path, args: &[String], cwd: &
         fail_on_output: vec![],
         capture_prefixes: vec![String::new()],
         preamble: vec![],
+        redact: vec![],
     };
     cimon_runner::execute(&spec, account, &AtomicBool::new(false))
 }

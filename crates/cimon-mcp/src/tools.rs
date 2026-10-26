@@ -76,7 +76,12 @@ fn run_args_schema(with_tool: bool) -> Value {
         "tags": {"type": "array", "items": {"type": "string"}},
         "artifacts": {"type": "array", "items": {"type": "string"}, "description": "받을 산출물 이름. [] 면 수집 안 함"},
         "params": {"type": "object", "description": "레시피에 선언된 파라미터만"},
-        "clean": {"type": "boolean", "description": "warm 트리 대신 일회 클론"}
+        "clean": {"type": "boolean", "description": "warm 트리 대신 일회 클론"},
+        "uploads": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+            "description": "레시피 [upload.<name>] → 핸들(u_…). 요청하는 PC 에서 ~/.cimon/upload.ps1(upload.sh) 로 올려 받은 핸들만 준다 — 파일·비밀번호 내용을 대화나 인자에 넣지 않는다"
+        }
     });
     if with_tool {
         props["tool"] = json!({"type": "string", "enum": ["build", "test", "run"]});
@@ -171,7 +176,7 @@ fn call_blocking(app: &Arc<App>, user: &cimon_core::AuthUser, name: &str, args: 
         }
         "plan" => {
             let a: RunArgs = parse(args)?;
-            ok_structured(recipes::plan(app, &a)?)
+            ok_structured(recipes::plan(app, &user.name, &a)?)
         }
         "recipe_show" => {
             #[derive(Deserialize)]

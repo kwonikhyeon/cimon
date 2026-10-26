@@ -40,6 +40,9 @@ pub struct Plan {
     /// Parameters the caller set explicitly.
     pub explicit_params: Vec<String>,
     pub fixtures: Vec<String>,
+    /// `[upload.<name>]` the selected steps get — the call must hand each over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub uploads: Vec<String>,
 }
 
 impl Plan {
@@ -277,6 +280,8 @@ pub fn select(r: &Resolved, tool: Tool, req: &SelectRequest) -> Result<Plan, Rej
         f
     };
 
+    let uploads: Vec<String> = r.uploads.iter().filter(|(_, u)| steps.iter().any(|s| u.applies_to.contains(&s.id))).map(|(n, _)| n.clone()).collect();
+
     Ok(Plan {
         setup,
         steps,
@@ -286,6 +291,7 @@ pub fn select(r: &Resolved, tool: Tool, req: &SelectRequest) -> Result<Plan, Rej
         params,
         explicit_params: explicit,
         fixtures,
+        uploads,
     })
 }
 

@@ -174,6 +174,7 @@ cimon/
 ```
 D:\cimon\                              서비스  빌드
   state\cimon.db                       rw      -      작업 저장소
+  state\uploads\<handle>               rw      -      호출자가 작업 하나에 준 파일·값(DPAPI, §11.7) — 작업이 끝나면 지운다
   config\cimon.toml                    rw      -      설정
   config\link.key                      rw      -      산출물 링크 서명 키(cimon setup 이 만든다)
   config\build-account.dpapi           rw      -      빌드 계정 비밀번호(DPAPI, cimon setup)
@@ -370,7 +371,8 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
   "tags": ["android"],
   "artifacts": ["app-debug.apk"],
   "params": { "backend_url": "http://192.168.0.20:8800" },
-  "clean": false
+  "clean": false,
+  "uploads": { "keystore": "u_…" }
 }
 ```
 
@@ -383,6 +385,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 | `artifacts` | 선택된 단계의 `default = true` 산출물 | 이름 목록. `[]` 면 수집 안 함. 이름을 대면 그 생산 단계가 **도구의 후보 종류와 상관없이** 들어간다 |
 | `params` | 각 `default` | 선언된 것만. **선택된 어느 단계에도 적용되지 않는 파라미터를 명시하면 거절**(`param_not_applicable`) |
 | `clean` | `false` | warm 트리 대신 일회 클론(§11.4) |
+| `uploads` | 없음 | 레시피 `[upload.<name>]` → 핸들(§11.7). 고른 단계가 받는 업로드는 필수, 받지 않는 업로드를 주면 거절 |
 
 | 도구 | `steps`·`tags` 로 고를 수 있는 종류 | 아무것도 고르지 않으면 |
 |---|---|---|
@@ -770,6 +773,25 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
   - 어느 프로젝트가 어느 저장소를 받는지는 레시피 저장소 노트.
 - `core.longpaths=true`.
 
+### 11.7 업로드 — 호출자가 작업 하나에 주는 파일·값
+
+빌드 머신에 두지 않는 비밀(릴리스 서명 키, 현장 TLS 키, 그 비밀번호)이 필요한 단계는, 요청하는 사람이 자기 PC 에서 작업 하나에만 넘긴다. 레시피가 `[upload.<name>]` 으로 무엇을 어느 단계가 받는지 선언한다(recipe-spec §8a).
+
+1. **올리기**: 호출자 PC 의 업로드 스크립트가 파일(또는 환경 변수·입력 프롬프트의 한 줄 값)을 `POST /uploads?kind=file|text&label=<name>` 에 사용자 토큰으로 보낸다. 스크립트는 서버가 내준다(`GET /upload.ps1`·`/upload.sh`). connect 스크립트가 `~/.cimon/` 에 받아 둔다. 내용은 PC 에서 서버로만 가고, Claude 대화나 도구 인자에는 들어가지 않는다. 모델이 보는 것은 명령줄(경로·변수 이름)과 핸들뿐이다.
+2. **보관**: 서버는 바이트를 DPAPI 로 `state\uploads\<handle>` 에 두고(서비스만 읽는다) DB 에 이름·종류·크기·sha256·올린 사람·만료를 남긴다. 핸들(`u_` + 128비트 난수)은 올린 사람만 쓸 수 있다. 아무 작업도 받지 않으면 `[uploads].ttl_minutes`(기본 60분) 뒤 지운다. 파일 크기는 `max_bytes`(기본 1 MiB), text 는 4 KiB 한 줄이다. 한 사람이 기다리게 둘 수 있는 업로드는 `max_pending_per_user`(기본 20)개다.
+3. **요청**: `build`·`test`·`run` 의 `uploads` 에 `{이름: 핸들}`. 거절하는 경우는 다음과 같다.
+   - 고른 단계가 받는 업로드가 없다(`upload_missing`). 거절 메시지가 올리는 명령을 알려 준다.
+   - 받지 않는 단계에 업로드를 줬다(`upload_unused`).
+   - 시도 레시피다(`upload_trial_recipe`) — 누구나 시도 브랜치를 만들 수 있으므로 시도 레시피는 업로드를 어디로든 보낼 수 있다.
+   - 업로드의 `refs` 밖의 브랜치이거나 커밋 SHA 다(`upload_ref_not_allowed`).
+   - 남의 핸들, 쓴 핸들, 만료된 핸들, 종류가 다른 핸들이다(`upload_invalid`).
+
+   작업을 만드는 트랜잭션에서 핸들을 그 작업에 묶는다 — 동시에 같은 핸들을 쓰는 두 요청 중 하나만 된다.
+4. **실행**: 업로드를 받는 작업은 그 호출자만의 것이다. **병합하지 않고**, `clean` 이 없어도 **일회 클론**으로 짓고, 패키지 캐시(`CARGO_HOME`·`GRADLE_USER_HOME` 등)와 프로젝트 범위 `[isolate]`·`[account_env]` 홈을 **작업 전용**으로 바꾼다. 다른 작업이 warm 트리나 캐시에 심어 둔 것이 키를 받는 작업에서 돌지 않게 하려는 것이다(§15.2 「받아들이는 위험」). 시작할 때 파일을 `homes\j<id>\uploads\` 에 풀고, 단계는 `${upload.<name>}` 으로 경로를, text 는 환경 변수 값으로 받는다. 단계 로그와 판정 출력에서 text 값은 `***` 로 바꾼다. 결과 경고에 받은 업로드(이름·sha256 앞자리)를 적는다.
+5. **정리**: 작업이 끝나면(통과·실패·취소·시작 전 종료 모두) 풀어 둔 파일과 `state\uploads\` 의 바이트를 지운다. 매분 도는 정리가 놓친 것을 마저 지운다. DB 행은 기록으로 남고, 결과와 provenance 에는 이름·크기·sha256·올린 사람만 적힌다. 감사 로그에는 `upload`(올림)와 `upload_used`(어느 작업에 묶였나)가 남는다.
+
+**남는 위험**: 그 커밋의 빌드 코드는 받은 키를 읽을 수 있다 — 키를 가진 PC 에서 직접 빌드할 때와 같다. 빌드 계정의 프로필(`%USERPROFILE%`)은 작업 사이에 공유되므로, 거기 남은 파일(예: PowerShell 프로필)까지는 막지 못한다. 완전히 떼려면 프로젝트별 빌드 계정이나 VM 이 필요하다(§17).
+
 ---
 
 ## 12. 산출물
@@ -996,6 +1018,11 @@ min_free_gb = 100
 cache_max_gb_per_project = 50
 log_max_mb_per_step = 200
 
+[uploads]                                          # 호출자가 작업 하나에 주는 파일·값(§11.7)
+ttl_minutes = 60
+max_bytes = 1048576
+max_pending_per_user = 20
+
 [web]                                              # 리뷰 화면(M9)
 enabled = false
 session_hours = 12
@@ -1029,7 +1056,7 @@ login_code_minutes = 5
 | 설치 스크립트가 서비스 계정으로 돈다 | 서비스 계정은 받은 것을 실행하지 않는다 — 설치 스크립트·probe 는 빌드 계정으로 staging 에서. 스크립트 위치는 커밋 SHA 로 고정(§10.3) |
 | 빌드 스크립트가 작업 트리의 `.git`(훅·설정)을 심어 서비스 계정으로 실행시킨다 | 작업 트리의 git 은 빌드 계정으로 돈다. 서비스는 작업 트리에서 git 을 돌리지 않고, 거기서 읽거나 지우는 파일은 연 핸들의 실제 경로로 확인한다(§11.1) |
 | 빌드 스크립트가 다른 프로젝트를 오염시킨다 | 캐시를 프로젝트별로. 남는 위험은 아래 「받아들이는 위험」 |
-| 빌드 스크립트가 비밀을 훔친다 | 서명 키·배포 자격 증명을 두지 않는다. 빌드 계정에는 기본적으로 GitHub 자격 증명도 없다 |
+| 빌드 스크립트가 비밀을 훔친다 | 서명 키·배포 자격 증명을 두지 않는다. 빌드 계정에는 기본적으로 GitHub 자격 증명도 없다. 서명 키가 필요한 단계는 호출자가 작업 하나에만 업로드하고, 그 작업은 `main` 레시피·허용 브랜치·일회 클론·작업 전용 캐시로만 돈다(§11.7) |
 | 빌드 스크립트가 네트워크로 퍼진다 | tailnet 에서 `tag:cimon` 이 출발하는 grant 없음, 기본 규칙(모두→모두) 삭제(§15.3). 빌드 계정 아웃바운드는 Windows 방화벽으로 GitHub·패키지 레지스트리·사내 아티팩트 저장소만 |
 | 파라미터로 명령을 주입한다 · 저장소가 도구를 가로챈다 | 선언된 파라미터만, 모양 검증, argv 로(§9.3). 경로 구분자 없는 명령은 구성한 `PATH` 에서만 |
 | 레시피 저장소가 사라진다 | 원격이 없으므로 반영마다·매일 번들 백업을 빌드 머신 밖으로(§16.5). 외부 사본이 하루를 넘게 낡으면 `recipe_*` 결과마다 경고 |

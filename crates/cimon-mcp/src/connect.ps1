@@ -60,6 +60,9 @@ $secure = Get-Content (Join-Path $env:USERPROFILE '.cimon\token.dpapi') | Conver
 $token = [System.Net.NetworkCredential]::new('', $secure).Password
 @{ Authorization = "Bearer $token" } | ConvertTo-Json -Compress
 '@
+# for steps that need a file from this PC (a signing key): upload.ps1 next to the helper
+try { Invoke-WebRequest -Uri "$CimonUrl/upload.ps1" -OutFile (Join-Path $dir 'upload.ps1') -UseBasicParsing }
+catch { Write-Host "cimon connect: could not fetch upload.ps1 - get it later from $CimonUrl/upload.ps1" -ForegroundColor Yellow }
 
 $helperCmd = 'powershell -NoProfile -ExecutionPolicy Bypass -File "' + ($helper -replace '\\', '/') + '"'
 $json = @{ type = 'http'; url = "$CimonUrl/mcp"; headersHelper = $helperCmd } | ConvertTo-Json -Compress
