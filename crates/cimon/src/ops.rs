@@ -239,9 +239,14 @@ fn bootstrap(dir: &Path, rustup: Option<&str>, uv: Option<&str>) -> Result<()> {
 pub fn github_token(cfg: &Config) -> Result<()> {
     let mut token = String::new();
     std::io::stdin().read_line(&mut token)?;
-    let token = token.trim();
+    // PowerShell puts a UTF-8 BOM in front of what it pipes to a program; a token
+    // stored with it fails every fetch
+    let token = token.trim().trim_start_matches('\u{feff}').trim();
     if token.is_empty() {
         bail!("no token on stdin");
+    }
+    if !token.chars().all(|c| c.is_ascii_graphic()) {
+        bail!("that is not a GitHub token (it has spaces or non-ASCII characters) — give the token alone on one line");
     }
     let layout = Layout::new(&cfg.paths.root);
     std::fs::create_dir_all(layout.config_dir())?;

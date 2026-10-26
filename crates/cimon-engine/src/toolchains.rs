@@ -330,6 +330,17 @@ pub fn provision(app: &App, a: &ProvisionArgs) -> Result<Vec<ProvisionLine>, Str
         }
         (None, None) => return Err("give a project, or --kind with --version".into()),
     }
+    // a script installer reads its script from another project's mirror — fetch that
+    // first (the installer itself only reads the mirror, and says provision fetches it)
+    let mut fetched = std::collections::BTreeSet::new();
+    for (kind, _, _) in &wanted {
+        let Some(s) = cat.kinds.get(kind).and_then(|d| d.script.as_ref()) else { continue };
+        if !fetched.insert(s.from_project.clone()) {
+            continue;
+        }
+        let r = cimon_recipe::resolve_project(&*tree, &s.from_project).map_err(|d| d.iter().map(|x| x.to_string()).collect::<Vec<_>>().join("; "))?;
+        cimon_workspace::Mirror::fetch_with(&app.layout.mirror(&s.from_project), &r.project.repo, &crate::git_auth(app)).map_err(|e| format!("fetching {}: {e}", s.from_project))?;
+    }
     let mut out = vec![];
     for (kind, version, req) in wanted {
         let Some(def) = cat.kinds.get(&kind) else {
