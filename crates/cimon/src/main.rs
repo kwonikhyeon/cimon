@@ -2,6 +2,7 @@
 
 use cimon::{init_tracing, serve};
 
+mod ctl;
 mod lsa;
 mod ops;
 mod recipe_cli;
@@ -19,6 +20,10 @@ struct Cli {
     /// D:\cimon\config\cimon.toml.
     #[arg(long, global = true)]
     config: Option<PathBuf>,
+    /// Wait for Enter before exiting — for a window that closes with the command (what
+    /// the tray app opens elevated, docs/tray.md §5.1).
+    #[arg(long, global = true)]
+    pause: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -88,6 +93,11 @@ enum Command {
     /// Entry point used by the Windows service control manager.
     #[command(hide = true)]
     Service,
+    /// Start, stop or control the service (docs/tray.md §4.3).
+    Ctl {
+        #[command(subcommand)]
+        action: ctl::CtlCmd,
+    },
     /// Install toolchains that auto-approve does not (design §10.4).
     Provision {
         /// Every toolchain of this project (including optional ones).
@@ -249,9 +259,24 @@ pub fn load_config(cli: &Option<PathBuf>) -> Result<Config> {
     Config::load(&path).with_context(|| format!("loading {}", path.display()))
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    let pause = cli.pause;
+    let code = match run(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            1
+        }
+    };
+    if pause {
+        ops::pause_for_enter(code);
+    }
+    std::process::exit(code);
+}
+
+fn run(cli: Cli) -> Result<i32> {
+    let r: Result<()> = match cli.command {
         Command::Serve => {
             init_tracing();
             let cfg = load_config(&cli.config)?;
@@ -305,7 +330,7 @@ fn main() -> Result<()> {
         Command::Doctor { network } => {
             let cfg = load_config(&cli.config)?;
             let failed = ops::doctor(&cfg, network)?;
-            std::process::exit(if failed == 0 { 0 } else { 1 });
+            return Ok(if failed == 0 { 0 } else { 1 });
         }
         Command::Drain { off, wait } => {
             let cfg = load_config(&cli.config)?;
@@ -343,14 +368,14 @@ fn main() -> Result<()> {
                     whoami()
                 );
             }
-            std::process::exit(if failed { 1 } else { 0 });
+            return Ok(if failed { 1 } else { 0 });
         }
-        Command::Exec { spec } => std::process::exit(cimon_runner::exec::child_exec_main(&spec)),
-        Command::Sweep => std::process::exit(cimon_runner::sweep_main()),
-        Command::AccountEnv { args } => std::process::exit(cimon_runner::account_env_main(&args)),
+        Command::Exec { spec } => return Ok(cimon_runner::exec::child_exec_main(&spec)),
+        Command::Sweep => return Ok(cimon_runner::sweep_main()),
+        Command::AccountEnv { args } => return Ok(cimon_runner::account_env_main(&args)),
         Command::Recipe { action } => {
             let code = recipe_cli::run(action, &cli.config)?;
-            std::process::exit(code);
+            return Ok(code);
         }
         Command::User { action: UserCmd::Role { name, role } } => {
             let cfg = load_config(&cli.config)?;
@@ -363,7 +388,9 @@ fn main() -> Result<()> {
             eprintln!("{name} is now {}", role.as_str());
             Ok(())
         }
-    }
+        Command::Ctl { action } => return ctl::run(action),
+    };
+    r.map(|()| 0)
 }
 
 

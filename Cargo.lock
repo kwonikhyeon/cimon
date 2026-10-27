@@ -343,6 +343,7 @@ dependencies = [
  "anyhow",
  "axum",
  "cimon-core",
+ "cimon-ctl",
  "cimon-engine",
  "cimon-mcp",
  "cimon-recipe",

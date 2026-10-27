@@ -1,8 +1,11 @@
 //! The Win32 side: one hidden window owning the icon and the menu, a status thread, and
 //! short worker threads for anything that blocks (HTTP, service control).
 
+mod actions;
+mod elevate;
 mod icon;
 mod log;
+mod menu;
 mod poll;
 mod settings;
 mod token;
@@ -25,10 +28,6 @@ pub const WM_NOTICE: u32 = WM_APP + 3;
 const NIN_SELECT: u32 = WM_USER;
 const NIN_KEYSELECT: u32 = WM_USER + 1;
 
-// menu commands
-const ID_WEB: usize = 10;
-const ID_QUIT: usize = 99;
-
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -38,6 +37,7 @@ type Notices = Arc<Mutex<Vec<(String, String, bool)>>>;
 
 struct Tray {
     icon: icon::Icon,
+    shield: windows_sys::Win32::Graphics::Gdi::HBITMAP,
     shared: Arc<Mutex<poll::Snapshot>>,
     poke: Sender<()>,
     taskbar_created: u32,
@@ -75,7 +75,7 @@ pub fn run() {
         let (poke, rx) = std::sync::mpsc::channel();
         let first = model::view(cimon_ctl::query().unwrap_or(cimon_ctl::State::Other), None);
         let icon = icon::Icon::add(hwnd, first.color, &first.tip);
-        TRAY.with(|t| *t.borrow_mut() = Some(Tray { icon, shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
+        TRAY.with(|t| *t.borrow_mut() = Some(Tray { icon, shield: menu::shield(), shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
         poll::spawn(hwnd as usize, shared, rx);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -110,22 +110,13 @@ fn refresh(t: &mut Tray) {
 }
 
 unsafe fn show_menu(hwnd: HWND) {
-    let Some((tip, _snap)) = with_tray(|t| {
+    let Some((menu, snap)) = with_tray(|t| {
         let snap = t.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        (model::view(snap.svc, snap.probe.as_ref()).tip, snap)
+        let tip = model::view(snap.svc, snap.probe.as_ref()).tip;
+        (menu::build(&snap, &tip, t.shield), snap)
     }) else {
         return;
     };
-    let menu = CreatePopupMenu();
-    let item = |flags: u32, id: usize, text: &str| {
-        let w = wide(text);
-        AppendMenuW(menu, flags, id, w.as_ptr());
-    };
-    item(MF_STRING | MF_GRAYED, 0, &tip);
-    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    item(MF_STRING, ID_WEB, "웹 화면 열기");
-    AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
-    item(MF_STRING, ID_QUIT, "트레이 끝내기");
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
     // the menu closes when the user clicks elsewhere only if this window is foreground
@@ -133,12 +124,34 @@ unsafe fn show_menu(hwnd: HWND) {
     let cmd = TrackPopupMenuEx(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY | TPM_BOTTOMALIGN, pt.x, pt.y, hwnd, std::ptr::null()) as usize;
     PostMessageW(hwnd, WM_NULL, 0, 0);
     DestroyMenu(menu);
-    command(hwnd, cmd);
+    command(hwnd, cmd, &snap);
 }
 
-fn command(hwnd: HWND, cmd: usize) {
+/// Asks before something that cuts running jobs short.
+fn confirm(hwnd: HWND, text: &str) -> bool {
+    let (t, c) = (wide(text), wide("cimon"));
+    // SAFETY: NUL-terminated strings, owner window is the tray's
+    unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND) == IDYES }
+}
+
+/// A service action on a worker thread; its answer comes back as a balloon.
+fn act(hwnd: HWND, a: actions::Action) {
+    let Some((notices, poke)) = with_tray(|t| (t.notices.clone(), t.poke.clone())) else { return };
+    let h = hwnd as usize;
+    std::thread::spawn(move || {
+        match actions::perform(a) {
+            Ok(Some(msg)) => post_notice(h, &notices, "cimon", &msg, false),
+            Ok(None) => {}
+            Err(e) => post_notice(h, &notices, "cimon 을 제어하지 못했다", &e, true),
+        }
+        let _ = poke.send(());
+    });
+}
+
+fn command(hwnd: HWND, cmd: usize, snap: &poll::Snapshot) {
+    let (running, queued, _) = menu::jobs(snap);
     match cmd {
-        ID_WEB => {
+        menu::ID_WEB => {
             let Some(notices) = with_tray(|t| t.notices.clone()) else { return };
             let h = hwnd as usize;
             std::thread::spawn(move || match web::login_link() {
@@ -146,7 +159,17 @@ fn command(hwnd: HWND, cmd: usize) {
                 Err(e) => post_notice(h, &notices, "웹 화면을 열지 못했다", &e, true),
             });
         }
-        ID_QUIT => {
+        menu::ID_START => act(hwnd, actions::Action::Start),
+        menu::ID_STOP_NOW | menu::ID_RESTART => {
+            let restart = cmd == menu::ID_RESTART;
+            if running > 0 && !confirm(hwnd, &format!("실행 중인 작업 {running}개가 중단된다(interrupted, 대기 {queued}개는 다음 시작 때 돈다). 지금 {}할까?", if restart { "재시작" } else { "중지" })) {
+                return;
+            }
+            act(hwnd, if restart { actions::Action::Restart } else { actions::Action::StopNow });
+        }
+        menu::ID_STOP_IDLE => act(hwnd, actions::Action::DrainStop),
+        menu::ID_CANCEL_DRAIN => act(hwnd, actions::Action::CancelDrain),
+        menu::ID_QUIT => {
             // SAFETY: ends the message loop
             unsafe { DestroyWindow(hwnd) };
         }

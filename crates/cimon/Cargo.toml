@@ -20,6 +20,7 @@ cimon-web.workspace = true
 cimon-recipe.workspace = true
 cimon-recipestore.workspace = true
 cimon-runner.workspace = true
+cimon-ctl.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 clap.workspace = true

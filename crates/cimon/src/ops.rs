@@ -6,7 +6,7 @@ use std::path::Path;
 
 /// The service runs as this virtual account (no password to manage).
 pub const SERVICE_ACCOUNT: &str = r"NT SERVICE\cimon";
-pub const SERVICE_NAME: &str = "cimon";
+pub const SERVICE_NAME: &str = cimon_ctl::SERVICE;
 
 /// One planned or executed setup action.
 struct Step {
@@ -531,4 +531,15 @@ pub fn doctor(cfg: &Config, network: bool) -> Result<usize> {
     }
     println!("{failed} check(s) failed");
     Ok(failed)
+}
+
+/// `--pause`: the exit code and a prompt, then wait for Enter — the window an elevated
+/// command opens closes when it ends, and its output is the only answer the user gets.
+pub fn pause_for_enter(code: i32) {
+    use std::io::Write;
+    println!();
+    println!("[exit code {code}] {} — press Enter to close", if code == 0 { "done" } else { "failed" });
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    let _ = std::io::stdin().read_line(&mut line);
 }

@@ -38,6 +38,13 @@ impl State {
     }
 }
 
+/// What a caller may ask of the service without elevating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Right {
+    StartStop,
+    Control,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum CtlError {
     /// The caller may not do this — elevate, or join `cimon-operators` (docs/tray.md §4.1).
@@ -125,10 +132,19 @@ mod win {
         let code = UserEventCode::from_raw(code).map_err(|e| CtlError::Other(format!("{e:?}")))?;
         open(ServiceAccess::USER_DEFINED_CONTROL)?.notify(code).map(|_| ()).map_err(map)
     }
+
+    /// Whether this caller's token may do `right` (opening the service asks the SCM).
+    pub fn may(right: Right) -> bool {
+        open(match right {
+            Right::StartStop => ServiceAccess::START | ServiceAccess::STOP,
+            Right::Control => ServiceAccess::USER_DEFINED_CONTROL,
+        })
+        .is_ok()
+    }
 }
 
 #[cfg(windows)]
-pub use win::{notify, query, start, stop};
+pub use win::{may, notify, query, start, stop};
 
 #[cfg(not(windows))]
 mod other {
@@ -145,10 +161,13 @@ mod other {
     pub fn notify(_code: u32) -> Result<(), CtlError> {
         Err(CtlError::NotInstalled)
     }
+    pub fn may(_right: Right) -> bool {
+        false
+    }
 }
 
 #[cfg(not(windows))]
-pub use other::{notify, query, start, stop};
+pub use other::{may, notify, query, start, stop};
 
 #[cfg(test)]
 mod tests {
