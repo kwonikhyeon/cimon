@@ -161,7 +161,24 @@ async fn login_code_expires_and_web_off() {
     assert!(err);
     assert_eq!(v["error"], "web_disabled");
     assert_eq!(reqwest::get(format!("{}/ui/", off.base)).await.unwrap().status(), 404);
+    let r = reqwest::Client::new().post(format!("{}/login-link", off.base)).bearer_auth(&off.member_token).send().await.unwrap();
+    assert_eq!(r.status(), 409, "the tray's link while the screen is off");
     c.cancel().await.unwrap();
+}
+
+/// `POST /login-link` — the `web_login` link for callers without MCP (the tray app).
+#[tokio::test]
+async fn login_link_for_the_tray() {
+    let h = Harness::start("[web]
+enabled = true
+").await;
+    let http = reqwest::Client::new();
+    assert_eq!(http.post(format!("{}/login-link", h.base)).send().await.unwrap().status(), 401);
+    let v: serde_json::Value = http.post(format!("{}/login-link", h.base)).bearer_auth(&h.member_token).send().await.unwrap().json().await.unwrap();
+    let url = v["url"].as_str().unwrap();
+    assert!(url.contains("/ui/login?code="), "{v}");
+    let r = browser().get(url.replace(h.app.config.server.public_url.trim_end_matches('/'), &h.base)).send().await.unwrap();
+    assert!(r.status().is_success() || r.status().is_redirection(), "the link signs in: {}", r.status());
 }
 
 async fn call_any<S: rmcp::Service<rmcp::RoleClient>>(c: &rmcp::service::RunningService<rmcp::RoleClient, S>, name: &str, args: serde_json::Value) -> (serde_json::Value, bool) {

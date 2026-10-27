@@ -1,0 +1,17 @@
+[package]
+name = "cimon-tray"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "cimon-tray"
+path = "src/main.rs"
+
+[dependencies]
+cimon-ctl.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }

@@ -2,7 +2,7 @@
 
 빌드 머신에 로그인한 관리자가 작업 표시줄 알림 영역(「숨겨진 아이콘 표시」)에서 cimon 서비스의 상태를 보고, 켜고 끄고, 관리자 명령을 실행하게 하는 작은 Windows 앱이다. 지금은 이 일들이 매번 관리자 PowerShell 을 열고 `sc.exe`·`cimon.exe` 를 손으로 치는 일이다 — 특히 새 버전을 올리는 세 줄(중지·복사·시작).
 
-상태: 설계. 구현 전.
+상태: 구현 중 — T1(상태 표시) 완료.
 
 ## 1. 범위
 
@@ -76,7 +76,7 @@ cimon — 실행 중 · 작업 1 · 대기 0        (회색, 상태 줄)
 트레이 끝내기
 ```
 
-왼쪽 클릭은 메뉴를 연다(왼쪽 더블클릭은 웹 화면).
+왼쪽·오른쪽 클릭 모두 메뉴를 연다.
 
 - 관리자 항목 옆에는 방패 아이콘을 둔다 — 누르면 UAC 가 뜬다는 표시다.
 - 시작·중지·재시작은 cimon-operators 권한이 있으면 방패 없이 바로 된다. 없으면 방패를 달고 UAC 로 간다.
@@ -96,7 +96,7 @@ cimon — 실행 중 · 작업 1 · 대기 0        (회색, 상태 줄)
 
 Windows 11 은 새 알림 아이콘을 숨겨진 아이콘 칸(^)에 넣는다. 작업 표시줄로 꺼내는 것은 사용자가 끌어다 놓거나 설정(개인 설정 > 작업 표시줄 > 기타 시스템 트레이 아이콘)에서 켜는 일이다. 앱이 스스로 꺼내는 공식 방법은 없고, 레지스트리를 고치는 우회는 쓰지 않는다.
 
-- 아이콘은 **고정 GUID**(`NIF_GUID`)로 등록한다. 그래야 Windows 가 사용자가 고른 위치를 실행이 바뀌어도 기억한다. GUID 는 실행 파일 경로와 묶이므로 경로는 `C:\Program Files\cimon\cimon-tray.exe` 로 고정한다.
+- 아이콘은 **고정 GUID**(`NIF_GUID`)로 등록한다. 그래야 Windows 가 사용자가 고른 위치를 실행이 바뀌어도 기억한다. GUID 는 처음 쓴 실행 파일 경로와 묶이므로 `%ProgramFiles%\cimon\cimon-tray.exe` 에서 돌 때만 쓴다 — 빌드 폴더에서 띄운 트레이가 GUID 를 차지하지 않게, 그 밖에서는 창 기준 id 로 등록한다.
 - 메뉴의 「작업 표시줄에 항상 보이게…」 는 `ms-settings:taskbar` 를 연다.
 
 ## 4. 서비스 제어와 권한
@@ -191,7 +191,7 @@ cimon-operators 가 아니면 시작·중지·재시작도 UAC 로 올린 `cimon
 
 ### 5.4 웹 화면 열기
 
-리뷰 화면은 1회용 로그인 링크로 들어간다(지금은 MCP `web_login` 만 준다). 트레이를 위해 **`POST /ui/login-link`(사용자 토큰)** 를 더한다. `web_login` 과 같은 링크를 돌려주고, 트레이가 기본 브라우저로 연다. 웹 화면이 꺼져 있으면(`[web].enabled = false`) 메뉴 항목을 숨긴다.
+리뷰 화면은 1회용 로그인 링크로 들어간다(지금은 MCP `web_login` 만 준다). 트레이를 위해 **`POST /login-link`(사용자 토큰)** 를 더한다. `web_login` 과 같은 링크를 돌려주고, 트레이가 기본 브라우저로 연다. 웹 화면이 꺼져 있으면(`[web].enabled = false`) 메뉴 항목을 숨긴다.
 
 ## 6. 로그인할 때 시작과 설정
 
@@ -230,7 +230,7 @@ crates/cimon-tray/      (새) 바이너리, #![windows_subsystem = "windows"]
 | `cimon/src/service.rs` | 사용자 정의 제어 128·129 처리. 「작업 끝나면 중지」 감시는 서빙 루프의 작업 하나가 맡는다 |
 | `cimon/src/main.rs` | `ctl <start\|stop\|drain-stop\|cancel-drain\|restart\|status>` · `upgrade --from` · `edit-config` · 전역 `--pause` |
 | `cimon/src/ops.rs` | setup 이 서비스 DACL 을 명시적으로 쓰고(§4.1) `cimon-tray.exe` 를 함께 복사 · `setup --operator <user> [--remove]` · `drain` 이 제어 128 을 보냄 · doctor 의 서비스 DACL 검사(IU·SU 에 `CR`, 누구에게든 `DC` 가 있으면 실패) |
-| `cimon-web` | `POST /ui/login-link` |
+| `cimon-mcp` | `POST /login-link`(토큰 인증, `cimon_web::login_link`) |
 | 문서 | setup.md(트레이 설치·`--operator`), design §4.2·§16.6, 이 문서 |
 
 ### 7.3 순서

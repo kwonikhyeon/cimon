@@ -47,6 +47,7 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
     let upload_routes = Router::new()
         .route("/uploads", post(uploads::receive))
         .layer(DefaultBodyLimit::max(upload_limit))
+        .route("/login-link", post(login_link))
         .route_layer(middleware::from_fn_with_state(app.clone(), require_token))
         .with_state(app.clone());
     Router::new()
@@ -161,6 +162,19 @@ async fn require_token(State(app): State<Arc<App>>, mut req: Request<Body>, next
     }
     req.extensions_mut().insert(user);
     next.run(req).await
+}
+
+/// `POST /login-link`: a one-time review-screen login link for the token's user — what
+/// the `web_login` tool gives, for callers that do not speak MCP (the tray app,
+/// docs/tray.md §5.4).
+async fn login_link(State(app): State<Arc<App>>, axum::Extension(user): axum::Extension<AuthUser>) -> Response {
+    match cimon_web::login_link(&app, &user.name) {
+        Ok(url) => {
+            let _ = app.store.audit(cimon_store::AuditEntry { user: &user.name, action: "web_login", detail: Some("login-link".into()), ..Default::default() });
+            Json(serde_json::json!({ "url": url, "expires_minutes": app.config.web.login_code_minutes })).into_response()
+        }
+        Err(e) => (StatusCode::CONFLICT, Json(serde_json::json!({ "error": "web_disabled", "message": e }))).into_response(),
+    }
 }
 
 /// `Tailscale-User-Login` as received (audit only).

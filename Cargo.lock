@@ -384,6 +384,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cimon-ctl"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.21",
+ "windows-service",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "cimon-engine"
 version = "0.1.0"
 dependencies = [
@@ -531,6 +540,16 @@ dependencies = [
  "toml",
  "tracing",
  "zip",
+]
+
+[[package]]
+name = "cimon-tray"
+version = "0.1.0"
+dependencies = [
+ "cimon-ctl",
+ "reqwest 0.12.28",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
