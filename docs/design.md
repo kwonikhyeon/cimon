@@ -159,6 +159,7 @@ cimon/
     cimon-web/               리뷰 화면(M9) — axum 라우트, maud 템플릿, 포함된 정적 자원
     cimon/                   바이너리: serve · service · setup · doctor · drain · github-token · token · user · provision ·
                              recipe(check·show·import·export·restore), 숨은 도우미 __exec · __sweep · __account-env
+    cimon-tray/              (설계) 알림 영역 앱 — 상태·켜고 끄기·관리자 명령(UAC). docs/tray.md
   examples/recipes/          형식 예시(레시피 검사기의 시험 입력)
   docs/
 ```
@@ -1207,6 +1208,8 @@ login_code_minutes = 5
 1. **새 실행 파일로 `cimon recipe check` 를 `main` 에 돌려 통과해야** 한다 — 검사가 엄격해져 `main` 이 깨지면 모든 편집이 막힌다(§6.3).
 2. 드레인: 새 작업을 거절하고(`draining`), 실행 중인 작업이 끝나면 멈춘다.
 3. 교체·재시작. 레시피 변경에는 필요 없다.
+
+이 세 단계와 실패 시 되돌리기를 한 명령(`cimon upgrade --from <exe>`)으로 묶는 설계는 docs/tray.md §5.3.
 
 ---
 

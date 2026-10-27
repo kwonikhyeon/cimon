@@ -13,6 +13,7 @@ cimon(「시몬」)은 Claude Code 가 MCP tasks 로 부르는 원격 빌드·�
 | [docs/design.md](docs/design.md) | 서비스 구조 · MCP 인터페이스 · 작업 모델 · 보안 · 운영 · 구현 순서 |
 | [docs/recipe-spec.md](docs/recipe-spec.md) | 레시피 파일 형식 |
 | [docs/review-ui.md](docs/review-ui.md) | 레시피 리뷰 웹 화면 |
+| [docs/tray.md](docs/tray.md) | (설계) 빌드 머신 알림 영역 앱 — 상태, 켜고 끄기, 관리자 명령 |
 | [examples/recipes/](examples/recipes/) | 형식 예시(레시피 검사기의 시험 입력) |
 
 ## 쓰기(팀원)
