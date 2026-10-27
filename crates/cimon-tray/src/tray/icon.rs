@@ -74,7 +74,7 @@ fn draw(c: Color) -> HICON {
 }
 
 /// Whether this is the installed tray (`%ProgramFiles%\cimon\cimon-tray.exe`).
-fn installed() -> bool {
+pub fn installed() -> bool {
     let (Ok(exe), Some(pf)) = (std::env::current_exe(), std::env::var_os("ProgramFiles")) else { return false };
     let want = std::path::PathBuf::from(pf).join("cimon");
     exe.parent().is_some_and(|d| d.to_string_lossy().eq_ignore_ascii_case(&want.to_string_lossy()))

@@ -21,6 +21,9 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+pub const NOTIFY_STOP: &str = "NotifyStop";
+pub const NOTIFY_JOBS: &str = "NotifyJobs";
+
 pub const WM_TRAY: u32 = WM_APP + 1;
 pub const WM_STATUS: u32 = WM_APP + 2;
 pub const WM_NOTICE: u32 = WM_APP + 3;
@@ -42,6 +45,9 @@ struct Tray {
     exe: Option<(std::path::PathBuf, u64, std::time::SystemTime)>,
     /// a new tray executable is installed; the menu offers a restart
     update_ready: bool,
+    /// what the icon showed last — notifications are about changes
+    last: Option<poll::Snapshot>,
+    memory: model::Memory,
     icon: icon::Icon,
     shield: windows_sys::Win32::Graphics::Gdi::HBITMAP,
     shared: Arc<Mutex<poll::Snapshot>>,
@@ -81,10 +87,11 @@ pub fn run() {
         let (poke, rx) = std::sync::mpsc::channel();
         let first = model::view(cimon_ctl::query().unwrap_or(cimon_ctl::State::Other), None);
         let icon = icon::Icon::add(hwnd, first.color, &first.tip);
-        TRAY.with(|t| *t.borrow_mut() = Some(Tray { mutex: m, exe: exe_stamp(), update_ready: false, icon, shield: menu::shield(), shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
+        TRAY.with(|t| *t.borrow_mut() = Some(Tray { mutex: m, exe: exe_stamp(), update_ready: false, last: None, memory: Default::default(), icon, shield: menu::shield(), shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
         poll::spawn(hwnd as usize, shared, rx);
         // a minute's check whether an upgrade replaced this executable
         SetTimer(hwnd, TIMER_EXE, 60_000, None);
+        first_run(hwnd);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
@@ -151,6 +158,31 @@ fn refresh(t: &mut Tray) {
     let snap = t.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
     let v = model::view(snap.svc, snap.probe.as_ref());
     t.icon.update(v.color, &v.tip);
+    if let Some(prev) = t.last.replace(snap.clone()) {
+        notify_change(t, &prev, &snap);
+    }
+}
+
+/// Balloons for changes the user would want to know about (docs/tray.md §3.3).
+fn notify_change(t: &mut Tray, prev: &poll::Snapshot, now: &poll::Snapshot) {
+    let notices = model::changes((prev.svc, prev.probe.as_ref()), (now.svc, now.probe.as_ref()), &mut t.memory, settings::get_bool(NOTIFY_STOP, true), settings::get_bool(NOTIFY_JOBS, false));
+    for n in notices {
+        log::line(&format!("notice: {}", n.text));
+        t.icon.notify(n.title, &n.text, n.warning);
+    }
+}
+
+/// The first run of the installed tray asks whether to start it at sign-in.
+fn first_run(hwnd: HWND) {
+    if !icon::installed() || settings::get_bool("AskedAutostart", false) {
+        return;
+    }
+    settings::set_bool("AskedAutostart", true);
+    let (t, c) = (wide("로그인할 때 cimon 트레이를 자동으로 시작할까?\n(나중에 메뉴의 「로그인할 때 시작」 으로 바꿀 수 있다)"), wide("cimon"));
+    // SAFETY: NUL-terminated strings
+    if unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) } == IDYES {
+        settings::set_autostart(true);
+    }
 }
 
 unsafe fn show_menu(hwnd: HWND) {
@@ -180,6 +212,9 @@ fn confirm(hwnd: HWND, text: &str) -> bool {
 
 /// A service action on a worker thread; its answer comes back as a balloon.
 fn act(hwnd: HWND, a: actions::Action) {
+    if matches!(a, actions::Action::StopNow | actions::Action::Restart) {
+        with_tray(|t| t.memory.expect_stop = true);
+    }
     let Some((notices, poke)) = with_tray(|t| (t.notices.clone(), t.poke.clone())) else { return };
     let h = hwnd as usize;
     std::thread::spawn(move || {
@@ -244,6 +279,10 @@ fn command(hwnd: HWND, cmd: usize, snap: &poll::Snapshot) {
             }
         }
         menu::ID_RELAUNCH => relaunch(hwnd),
+        menu::ID_AUTOSTART => settings::set_autostart(!settings::autostart()),
+        menu::ID_NOTIFY_STOP => settings::set_bool(NOTIFY_STOP, !settings::get_bool(NOTIFY_STOP, true)),
+        menu::ID_NOTIFY_JOBS => settings::set_bool(NOTIFY_JOBS, !settings::get_bool(NOTIFY_JOBS, false)),
+        menu::ID_TASKBAR => web::open("ms-settings:taskbar"),
         menu::ID_STOP_IDLE => act(hwnd, actions::Action::DrainStop),
         menu::ID_CANCEL_DRAIN => act(hwnd, actions::Action::CancelDrain),
         menu::ID_QUIT => {

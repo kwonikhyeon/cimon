@@ -55,7 +55,7 @@ git config --system core.longpaths true
 
 ## 2. cimon.exe 배치
 
-`cargo build --release` 로 만든 `target\release\cimon.exe` 를 **`C:\Program Files\cimon\`** 에 둔다.
+`cargo build --release` 로 만든 `target\release\cimon.exe` 를 **`C:\Program Files\cimon\`** 에 둔다. 알림 영역 앱(docs/tray.md)을 쓰려면 `target\release\cimon-tray.exe` 도 같은 폴더에 둔다 — 트레이는 옆의 `cimon.exe` 만 부르고, 그 폴더에서 돌 때만 아이콘 위치를 Windows 가 기억한다.
 
 - `D:\cimon` 아래에 두지 않는다. setup 이 `D:\cimon` 의 권한 상속을 끊어 빌드 계정은 정해진 폴더만 읽는데, 빌드 단계는 빌드 계정으로 `cimon.exe __exec` 를 거쳐 돈다 — 빌드 계정이 실행 파일을 읽을 수 있어야 한다.
 - setup 은 **자기를 실행한 경로**를 서비스 경로로 등록한다. 최종 위치에 둔 파일로 실행한다.
@@ -197,16 +197,24 @@ sc.exe start cimon
 
 Claude Code 에서 프로젝트 하나를 `build` 로 돌려 판정과 산출물 다운로드까지 확인한다. 아래 「확인할 것」 을 처음 실제로 지나가는 실행이다.
 
+## 13. 알림 영역 앱 (선택, docs/tray.md)
+
+```powershell
+& $c setup --service-acl                 # 서비스 DACL — 로그인한 사용자는 조회만(트레이의 「작업 끝나면 중지」 전에 필요)
+& $c setup --operator $env:USERNAME      # (권장) 이 사용자는 UAC 없이 켜고 끈다 — 다음 로그인부터
+& "C:\Program Files\cimon\cimon-tray.exe" # 처음 실행 때 로그인할 때 시작할지 묻는다
+```
+
+아이콘은 숨겨진 아이콘 칸(^)에 들어간다. 작업 표시줄로 끌어다 놓거나 메뉴의 「작업 표시줄에 항상 보이게…」 로 꺼낸다. `cimon ctl status` 는 관리자가 아니어도 서비스 상태와 DACL 의 문제를 보여 준다.
+
 ## 업그레이드 (design §16.6)
 
 ```powershell
-& "<새 cimon.exe>" recipe check --main   # 새 검사기로 main 이 통과해야 한다
-& $c drain                               # 새 작업 거절, 실행 중 작업이 끝날 때까지 기다린다
-sc.exe stop cimon
-# C:\Program Files\cimon\cimon.exe 교체
+& $c upgrade --from "<새 cimon.exe>"     # 확인 → recipe check --main → 작업 끝나면 중지 → 교체(옆의 cimon-tray.exe 도) → 시작 → 새 build 확인, 안 되면 되돌림
 & $c setup                               # 권한·ACL 을 새 버전 기준으로 맞춘다(다시 돌려도 된다)
-sc.exe start cimon                       # 시작할 때 drain 표시를 지운다
 ```
+
+트레이의 「관리자 > 새 버전 올리기…」 가 같은 명령을 UAC 창에서 돌린다. 실행 중인 작업을 기다리지 않으려면 `--now`. 손으로 하려면: `recipe check --main` → `drain` → `sc.exe stop cimon` → 교체 → `sc.exe start cimon`.
 
 ## 실제 머신에서 확인한 것
 

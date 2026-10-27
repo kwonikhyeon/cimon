@@ -85,6 +85,60 @@ pub fn view(svc: State, probe: Option<&Probe>) -> View {
     View { color, tip }
 }
 
+/// (running, queued, stopping when idle) from a probe.
+pub fn jobs(probe: Option<&Probe>) -> (u64, u64, bool) {
+    match probe {
+        Some(Probe::Answered(h)) => (h.running, h.queued, h.stopping_when_idle),
+        _ => (0, 0, false),
+    }
+}
+
+/// A balloon (docs/tray.md §3.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Notice {
+    pub title: &'static str,
+    pub text: String,
+    pub warning: bool,
+}
+
+/// What the tray remembers between snapshots to tell surprises from its own doing.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Memory {
+    /// the tray stopped (or restarted) the service itself
+    pub expect_stop: bool,
+    /// the last stop was a surprise: say when it runs again
+    pub stopped_unexpectedly: bool,
+}
+
+/// The balloons a change from `prev` to `now` calls for.
+pub fn changes(prev: (State, Option<&Probe>), now: (State, Option<&Probe>), mem: &mut Memory, notify_stop: bool, notify_jobs: bool) -> Vec<Notice> {
+    let mut out = vec![];
+    let was_running = prev.0 == State::Running;
+    let (prev_running, _, prev_stopping) = jobs(prev.1);
+    if was_running && matches!(now.0, State::Stopped | State::StopPending) {
+        if prev_stopping {
+            out.push(Notice { title: "cimon", text: "작업이 끝나 cimon 을 멈췄다(대기 중인 작업은 다음 시작 때 돈다)".into(), warning: false });
+        } else if !mem.expect_stop {
+            mem.stopped_unexpectedly = true;
+            if notify_stop {
+                out.push(Notice { title: "cimon 이 멈췄다", text: "트레이가 멈춘 것이 아니다 — 서비스는 실패하면 스스로 다시 시작한다. 계속 멈춰 있으면 서비스 로그를 본다".into(), warning: true });
+            }
+        }
+        mem.expect_stop = false;
+    }
+    if now.0 == State::Running && !was_running && mem.stopped_unexpectedly {
+        mem.stopped_unexpectedly = false;
+        if notify_stop {
+            out.push(Notice { title: "cimon", text: "cimon 이 다시 실행 중이다".into(), warning: false });
+        }
+    }
+    let (now_running, now_queued, _) = jobs(now.1);
+    if was_running && now.0 == State::Running && now_running < prev_running && notify_jobs {
+        out.push(Notice { title: "cimon", text: format!("작업 {}개가 끝났다 — 실행 {now_running} · 대기 {now_queued}", prev_running - now_running), warning: false });
+    }
+    out
+}
+
 /// The token goes only to this machine or over https — a mistyped address must not
 /// carry it elsewhere in the clear.
 pub fn token_allowed(url: &str) -> bool {
@@ -129,6 +183,32 @@ mod tests {
         assert_eq!(view(State::Running, Some(&stopping)), View { color: Color::Yellow, tip: "cimon — 작업 1 끝나면 중지".into() });
         let warned = Probe::Answered(Health { warnings: vec!["a".into(), "b".into()], ..Default::default() });
         assert_eq!(view(State::Running, Some(&warned)).tip, "cimon — 실행 중 · 경고 2");
+    }
+
+    #[test]
+    fn surprises_are_told_and_own_doings_are_not() {
+        let mut m = Memory::default();
+        let busy = h(0, 2);
+        let idle = h(0, 0);
+        // a crash: told, and told again when it is back
+        let n = changes((State::Running, Some(&idle)), (State::Stopped, None), &mut m, true, false);
+        assert!(n.len() == 1 && n[0].warning, "{n:?}");
+        assert!(changes((State::Stopped, None), (State::StartPending, None), &mut m, true, false).is_empty());
+        let n = changes((State::StartPending, None), (State::Running, None), &mut m, true, false);
+        assert_eq!(n.len(), 1, "back again");
+        assert!(!m.stopped_unexpectedly);
+        // the tray's own stop: quiet
+        m.expect_stop = true;
+        assert!(changes((State::Running, Some(&idle)), (State::StopPending, None), &mut m, true, false).is_empty());
+        assert!(changes((State::Stopped, None), (State::Running, None), &mut m, true, false).is_empty(), "no 'back again' after our own stop");
+        // stop when idle: its own line
+        let stopping = Probe::Answered(Health { stopping_when_idle: true, ..Default::default() });
+        let n = changes((State::Running, Some(&stopping)), (State::Stopped, None), &mut m, false, false);
+        assert!(n.len() == 1 && n[0].text.starts_with("작업이 끝나"), "{n:?}");
+        // jobs finishing only when asked for, and a muted stop stays muted
+        assert!(changes((State::Running, Some(&busy)), (State::Running, Some(&idle)), &mut m, true, false).is_empty());
+        assert_eq!(changes((State::Running, Some(&busy)), (State::Running, Some(&idle)), &mut m, true, true).len(), 1);
+        assert!(changes((State::Running, Some(&idle)), (State::Stopped, None), &mut Memory::default(), false, false).is_empty());
     }
 
     #[test]

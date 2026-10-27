@@ -2,7 +2,6 @@
 //! Items this user cannot do without elevating carry the UAC shield.
 
 use super::{poll::Snapshot, wide};
-use crate::model::Probe;
 use cimon_ctl::{Right, State};
 use windows_sys::Win32::Graphics::Gdi::{CreateCompatibleDC, CreateDIBSection, DeleteDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP};
 use windows_sys::Win32::UI::Shell::{SHGetStockIconInfo, SHGSI_ICON, SHGSI_SMALLICON, SHSTOCKICONINFO, SIID_SHIELD};
@@ -21,6 +20,10 @@ pub const ID_DOCTOR: usize = 33;
 pub const ID_CONFIG: usize = 34;
 pub const ID_POWERSHELL: usize = 35;
 pub const ID_RELAUNCH: usize = 40;
+pub const ID_AUTOSTART: usize = 41;
+pub const ID_NOTIFY_STOP: usize = 42;
+pub const ID_NOTIFY_JOBS: usize = 43;
+pub const ID_TASKBAR: usize = 44;
 pub const ID_QUIT: usize = 99;
 
 /// The UAC shield as a menu bitmap (32-bit with alpha).
@@ -67,10 +70,7 @@ unsafe fn mark_shield(menu: HMENU, id: usize, bmp: HBITMAP) {
 
 /// (running, queued, stopping when idle) from the last probe.
 pub fn jobs(snap: &Snapshot) -> (u64, u64, bool) {
-    match &snap.probe {
-        Some(Probe::Answered(h)) => (h.running, h.queued, h.stopping_when_idle),
-        _ => (0, 0, false),
-    }
+    crate::model::jobs(snap.probe.as_ref())
 }
 
 pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP, update_ready: bool) -> HMENU {
@@ -129,6 +129,15 @@ pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP, update_ready: bool) ->
         }
         let w = wide("관리자");
         AppendMenuW(menu, MF_POPUP, admin as usize, w.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        let check = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        add(menu, check(super::settings::autostart()), ID_AUTOSTART, "로그인할 때 시작");
+        let notify = CreatePopupMenu();
+        add(notify, check(super::settings::get_bool(super::NOTIFY_STOP, true)), ID_NOTIFY_STOP, "서비스가 멈추면");
+        add(notify, check(super::settings::get_bool(super::NOTIFY_JOBS, false)), ID_NOTIFY_JOBS, "작업이 끝나면");
+        let w = wide("알림");
+        AppendMenuW(menu, MF_POPUP, notify as usize, w.as_ptr());
+        add(menu, MF_STRING, ID_TASKBAR, "작업 표시줄에 항상 보이게…");
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         if update_ready {
             add(menu, MF_STRING, ID_RELAUNCH, "트레이 다시 시작(새 버전)");
