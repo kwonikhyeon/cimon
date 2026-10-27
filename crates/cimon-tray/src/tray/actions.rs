@@ -51,10 +51,29 @@ fn direct(a: Action) -> Result<(), CtlError> {
     }
 }
 
+/// A stop-when-idle control the service ignores still succeeds at the SCM: wait for
+/// `/healthz` to show it (docs/tray.md §4.2).
+fn taken(want: bool) -> bool {
+    let client = super::poll::client();
+    let url = format!("{}/healthz", super::settings::url());
+    for _ in 0..10 {
+        if let Ok(v) = client.get(&url).send().and_then(|r| r.json::<serde_json::Value>()) {
+            if v["stopping_when_idle"].as_bool() == Some(want) {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
+}
+
 /// Ok: what to tell the user (or nothing — the icon shows it); Err: why it failed.
 pub fn perform(a: Action) -> Result<Option<String>, String> {
     super::log::line(&format!("action {}", a.ctl()));
     match direct(a) {
+        Ok(()) if matches!(a, Action::DrainStop | Action::CancelDrain) && !taken(a == Action::DrainStop) => {
+            Err("cimon 이 이 제어를 받지 않았다 — 옛 버전이거나, 서비스 DACL 이 로그인한 사용자에게 제어를 허용한다(관리자가 cimon setup --service-acl)".into())
+        }
         Ok(()) => Ok(None),
         Err(CtlError::AccessDenied) => {
             super::elevate::cimon(&["ctl", a.ctl()])?;

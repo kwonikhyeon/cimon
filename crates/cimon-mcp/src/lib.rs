@@ -189,7 +189,15 @@ async fn healthz(State(app): State<Arc<App>>, headers: http::HeaderMap) -> impl 
         Json(cimon_engine::health(&app))
     } else {
         // the build id lets `cimon upgrade` see the new executable answer without a token
-        Json(serde_json::json!({ "ok": true, "build": cimon_engine::build_id(), "detail": "send a user token (Authorization: Bearer …) for queue, disk and backup state" }))
+        // the build id lets `cimon upgrade` see the new executable answer, and
+        // stopping_when_idle shows a stop-when-idle control was taken — a control the
+        // service ignores still "succeeds" (docs/tray.md §4.2)
+        Json(serde_json::json!({
+            "ok": true,
+            "build": cimon_engine::build_id(),
+            "stopping_when_idle": app.engine.stop_when_idle.load(std::sync::atomic::Ordering::SeqCst),
+            "detail": "send a user token (Authorization: Bearer …) for queue, disk and backup state",
+        }))
     }
 }
 

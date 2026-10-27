@@ -447,7 +447,7 @@ fn run(cli: Cli) -> Result<i32> {
             eprintln!("{name} is now {}", role.as_str());
             Ok(())
         }
-        Command::Ctl { action } => return ctl::run(action),
+        Command::Ctl { action } => return ctl::run(action, &config_path(&cli.config)),
         Command::EditConfig => ops::edit_config(&config_path(&cli.config)),
         Command::Upgrade { from, now, wait } => upgrade::run(&config_path(&cli.config), &from, now, wait),
     };

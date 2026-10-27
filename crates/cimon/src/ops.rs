@@ -627,7 +627,7 @@ pub fn edit_config(path: &Path) -> Result<()> {
         Err(e) => bail!("the saved config does not load — fix it before the next start: {e:#}"),
     }
     if cimon_ctl::query().ok() == Some(cimon_ctl::State::Running) && ask_yes("restart cimon now so it reads the config? (running jobs are interrupted)")? {
-        crate::ctl::run(crate::ctl::CtlCmd::Restart)?;
+        crate::ctl::run(crate::ctl::CtlCmd::Restart, path)?;
     }
     Ok(())
 }

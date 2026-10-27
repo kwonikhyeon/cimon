@@ -29,16 +29,21 @@ fn stop(cfg: &Config, now: bool, wait_secs: u64) -> Result<()> {
         return Ok(());
     }
     if !now {
-        match cimon_ctl::notify(cimon_ctl::STOP_WHEN_IDLE) {
-            Ok(()) => {
-                println!("waiting for running jobs to end (up to {wait_secs}s) — new jobs are refused");
-                return wait_state(State::Stopped, wait_secs);
-            }
+        // an older cimon ignores the control and the SCM still says it went through:
+        // only /healthz turning stopping_when_idle on shows it was taken
+        let taken = match cimon_ctl::notify(cimon_ctl::STOP_WHEN_IDLE) {
+            Ok(()) => crate::ctl::confirm_stopping(&format!("http://{}/healthz", cfg.server.bind), true),
             Err(e) => {
-                println!("the service did not take stop-when-idle ({e}) — draining instead");
-                crate::ops::drain(cfg, false, wait_secs)?;
+                println!("stop-when-idle failed: {e}");
+                false
             }
+        };
+        if taken {
+            println!("waiting for running jobs to end (up to {wait_secs}s) — new jobs are refused");
+            return wait_state(State::Stopped, wait_secs);
         }
+        println!("the running cimon did not take stop-when-idle (an older version, or its DACL) — draining instead");
+        crate::ops::drain(cfg, false, wait_secs)?;
     }
     cimon_ctl::stop().map_err(|e| anyhow::anyhow!(e))?;
     wait_state(State::Stopped, 120)

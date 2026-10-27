@@ -74,6 +74,9 @@ async fn stop_when_idle_lets_the_job_finish_then_stops() {
     let hz = health(&h).await;
     assert_eq!(hz["stopping_when_idle"], true, "{hz}");
     assert_eq!(hz["draining"], true, "{hz}");
+    // anyone may see it was taken — a control the service ignores still "succeeds"
+    let public: Value = reqwest::get(format!("{}/healthz", h.base)).await.unwrap().json().await.unwrap();
+    assert_eq!(public["stopping_when_idle"], true, "{public}");
     let (v, err) = call_any(&c, "build", json!({"project": P})).await;
     assert!(err && v["error"] == "draining", "new jobs are refused: {v}");
     assert!(!h.shutdown.is_cancelled(), "a job is still running");
