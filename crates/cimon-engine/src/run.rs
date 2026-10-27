@@ -21,7 +21,9 @@ pub async fn runner_loop(app: Arc<App>) {
         if app.engine.shutdown.is_cancelled() {
             return;
         }
-        let next = app.store.oldest_in_state(JobState::Ready).ok().flatten();
+        // stopping once idle: ready jobs wait for the next start (docs/tray.md §4.2)
+        let stopping = app.engine.stop_when_idle.load(Ordering::SeqCst);
+        let next = if stopping { None } else { app.store.oldest_in_state(JobState::Ready).ok().flatten() };
         let Some(job) = next else {
             tokio::select! {
                 _ = app.engine.runner.notified() => {}

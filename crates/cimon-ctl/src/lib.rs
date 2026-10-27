@@ -91,12 +91,18 @@ mod win {
     use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
     const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_INVALID_SERVICE_CONTROL: i32 = 1052;
+    const ERROR_SERVICE_NOT_ACTIVE: i32 = 1062;
     const ERROR_SERVICE_DOES_NOT_EXIST: i32 = 1060;
 
     fn map(e: windows_service::Error) -> CtlError {
         match &e {
             windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_ACCESS_DENIED) => CtlError::AccessDenied,
             windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST) => CtlError::NotInstalled,
+            windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_INVALID_SERVICE_CONTROL) => {
+                CtlError::Other("cimon 이 이 제어를 받지 않았다 — 서비스 DACL 이 로그인한 사용자에게 제어를 허용하거나(관리자가 cimon setup --service-acl) 옛 버전이다".into())
+            }
+            windows_service::Error::Winapi(io) if io.raw_os_error() == Some(ERROR_SERVICE_NOT_ACTIVE) => CtlError::Other("cimon 이 실행 중이 아니다".into()),
             _ => CtlError::Other(e.to_string()),
         }
     }

@@ -47,6 +47,9 @@ pub struct Engine {
     pub build_lock: Mutex<()>,
     /// Conditions found at start that every `/healthz` repeats (e.g. Funnel unverified).
     pub notices: Mutex<Vec<String>>,
+    /// Asked to stop once nothing runs (docs/tray.md §4.2): new jobs are refused, ready
+    /// jobs wait for the next start, and the server stops when the last job ends.
+    pub stop_when_idle: AtomicBool,
 }
 
 impl Engine {
@@ -87,6 +90,7 @@ impl App {
             mirror_locks: Mutex::new(HashMap::new()),
             build_lock: Mutex::new(()),
             notices: Mutex::new(vec![]),
+            stop_when_idle: AtomicBool::new(false),
         };
         Ok(Arc::new(App { config, layout, store, recipes, engine }))
     }
@@ -189,6 +193,7 @@ pub fn health(app: &App) -> serde_json::Value {
         "queued": queued,
         "running": running,
         "draining": app.layout.draining_flag().exists(),
+        "stopping_when_idle": app.engine.stop_when_idle.load(std::sync::atomic::Ordering::SeqCst),
         "disk_free_gb": cimon_runner::free_bytes(&app.layout.root).map(|b| b / (1 << 30)),
         "recipes_main": app.recipes.main_commit(),
         "last_recipe_backup": app.store.last_backup("recipes").ok().flatten(),
@@ -197,6 +202,22 @@ pub fn health(app: &App) -> serde_json::Value {
         "warnings": warnings,
         "version": env!("CARGO_PKG_VERSION"),
     })
+}
+
+/// The stop-when-idle control (docs/tray.md §4.2): `on` refuses new jobs (the
+/// `draining` flag) and lets the server stop once nothing runs; off takes jobs again.
+pub fn stop_when_idle(app: &App, on: bool) {
+    app.engine.stop_when_idle.store(on, std::sync::atomic::Ordering::SeqCst);
+    let flag = app.layout.draining_flag();
+    if on {
+        let _ = std::fs::create_dir_all(app.layout.state_dir());
+        let _ = std::fs::write(&flag, cimon_core::now());
+        tracing::info!("asked to stop once nothing runs — new jobs are refused");
+    } else {
+        let _ = std::fs::remove_file(&flag);
+        app.engine.runner.notify_one();
+        tracing::info!("stop-when-idle cancelled — taking jobs again");
+    }
 }
 
 /// Git environment carrying the stored GitHub token (`cimon github-token`), if any.

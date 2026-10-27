@@ -83,7 +83,19 @@ pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP) -> HMENU {
                 }
             }
             State::Running => {
-                let (running, _, _) = jobs(snap);
+                let (running, _, stopping) = jobs(snap);
+                let may_control = cimon_ctl::may(Right::Control);
+                if stopping {
+                    add(menu, MF_STRING, ID_CANCEL_DRAIN, "작업 끝나면 중지 취소");
+                    if !may_control {
+                        mark_shield(menu, ID_CANCEL_DRAIN, shield);
+                    }
+                } else if running > 0 {
+                    add(menu, MF_STRING | MF_DEFAULT, ID_STOP_IDLE, "작업이 끝나면 중지");
+                    if !may_control {
+                        mark_shield(menu, ID_STOP_IDLE, shield);
+                    }
+                }
                 add(menu, MF_STRING, ID_STOP_NOW, if running > 0 { "지금 중지 — 실행 중인 작업은 중단된다" } else { "중지" });
                 add(menu, MF_STRING, ID_RESTART, "재시작");
                 if !may {

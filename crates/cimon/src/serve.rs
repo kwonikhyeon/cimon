@@ -7,8 +7,19 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 /// Runs until `shutdown` is cancelled (Windows service stop) or Ctrl-C.
+/// The running service's app — the control handler reaches it for stop-when-idle.
+static APP: std::sync::OnceLock<Arc<App>> = std::sync::OnceLock::new();
+
+pub fn app() -> Option<Arc<App>> {
+    APP.get().cloned()
+}
+
 pub async fn run(cfg: Config, shutdown: Option<CancellationToken>) -> Result<()> {
-    let mut notices = vec![];
+    run_with(cfg, shutdown, vec![]).await
+}
+
+/// [`run`] with conditions the caller found that every `/healthz` repeats.
+pub async fn run_with(cfg: Config, shutdown: Option<CancellationToken>, mut notices: Vec<String>) -> Result<()> {
     if cfg.tailscale.require_funnel_off {
         match crate::tailscale::check_funnel()? {
             crate::tailscale::Funnel::Off => {}
@@ -27,6 +38,7 @@ pub async fn run(cfg: Config, shutdown: Option<CancellationToken>) -> Result<()>
     let shutdown = shutdown.unwrap_or_default();
     let app = App::open(cfg).context("opening the job store")?;
     app.engine.notices.lock().unwrap().extend(notices);
+    let _ = APP.set(app.clone());
     // an upgrade drains, stops, replaces and starts: a started service takes jobs again
     let _ = std::fs::remove_file(app.layout.draining_flag());
     let (addr, server) = start(app, shutdown.clone()).await?;
@@ -64,6 +76,26 @@ pub async fn start(
         }
     });
     cimon_engine::start(&app)?;
+    // stop-when-idle (docs/tray.md §4.2): once asked and nothing runs, stop — a clean
+    // exit, so the service control manager does not restart it
+    let (app3, sd3) = (app.clone(), shutdown.clone());
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = sd3.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+            }
+            if app3.engine.stop_when_idle.load(std::sync::atomic::Ordering::SeqCst) {
+                use cimon_core::JobState::*;
+                let running = app3.store.jobs_in_states(&[Running, Collecting, Cancelling]).map(|v| v.len()).unwrap_or(1);
+                if running == 0 {
+                    tracing::info!("nothing runs — stopping as asked");
+                    sd3.cancel();
+                    return;
+                }
+            }
+        }
+    });
     let mut router = cimon_mcp::router(app.clone(), shutdown.clone());
     if app.config.web.enabled {
         router = router.merge(cimon_web::router(app.clone()));
