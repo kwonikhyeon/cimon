@@ -24,6 +24,9 @@ pub fn cimon_exe() -> Result<PathBuf, String> {
 /// Runs `exe args…` elevated in its own window. `args` are fixed strings or values
 /// the caller checked; each is quoted for the C runtime.
 pub fn run(exe: &std::path::Path, args: &[&str]) -> Result<(), String> {
+    // ShellExecuteEx may use COM for the consent UI; this is a worker thread of our own
+    // SAFETY: initializes COM for this thread only
+    unsafe { windows_sys::Win32::System::Com::CoInitializeEx(std::ptr::null(), windows_sys::Win32::System::Com::COINIT_APARTMENTTHREADED as u32) };
     let params: Vec<String> = args.iter().map(|a| cimon_ctl::quote_arg(a)).collect();
     let (verb, file, params) = (wide("runas"), wide(&exe.to_string_lossy()), wide(&params.join(" ")));
     // SAFETY: a zeroed SHELLEXECUTEINFOW with the size and strings set is valid
@@ -43,6 +46,20 @@ pub fn run(exe: &std::path::Path, args: &[&str]) -> Result<(), String> {
         ERROR_CANCELLED => Err("UAC 확인을 취소했다".into()),
         e => Err(format!("관리자 권한으로 실행하지 못했다(오류 {e})")),
     }
+}
+
+/// An administrator PowerShell with `$c` set to this `cimon.exe` (docs/tray.md §5.1) —
+/// the one shell started with a command string, and nothing the user typed is in it.
+pub fn powershell() -> Result<(), String> {
+    let exe = cimon_exe()?;
+    let path = exe.to_string_lossy().to_string();
+    if path.contains('\'') {
+        return Err(format!("{path} 에 작은따옴표가 있어 명령에 넣지 않는다"));
+    }
+    let dir = exe.parent().map(|d| d.to_string_lossy().to_string()).unwrap_or_default();
+    let script = format!("$c = '{path}'; Set-Location '{dir}'; Write-Host ('$c = ' + $c + '   e.g. & $c ctl status')");
+    let ps = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\WindowsPowerShell\v1.0\powershell.exe");
+    run(&ps, &["-NoExit", "-NoProfile", "-Command", &script])
 }
 
 /// `cimon.exe <args> --pause` elevated.

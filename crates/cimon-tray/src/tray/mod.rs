@@ -148,6 +148,26 @@ fn act(hwnd: HWND, a: actions::Action) {
     });
 }
 
+/// An admin command (docs/tray.md §5): always through UAC, in its own window.
+enum Admin {
+    Cimon(&'static [&'static str]),
+    PowerShell,
+}
+
+fn admin(hwnd: HWND, what: Admin) {
+    let Some(notices) = with_tray(|t| t.notices.clone()) else { return };
+    let h = hwnd as usize;
+    std::thread::spawn(move || {
+        let r = match what {
+            Admin::Cimon(args) => elevate::cimon(args),
+            Admin::PowerShell => elevate::powershell(),
+        };
+        if let Err(e) = r {
+            post_notice(h, &notices, "관리자 명령을 실행하지 못했다", &e, true);
+        }
+    });
+}
+
 fn command(hwnd: HWND, cmd: usize, snap: &poll::Snapshot) {
     let (running, queued, _) = menu::jobs(snap);
     match cmd {
@@ -166,6 +186,15 @@ fn command(hwnd: HWND, cmd: usize, snap: &poll::Snapshot) {
                 return;
             }
             act(hwnd, if restart { actions::Action::Restart } else { actions::Action::StopNow });
+        }
+        menu::ID_INVITE => admin(hwnd, Admin::Cimon(&["invite", "--ask"])),
+        menu::ID_PROVISION => admin(hwnd, Admin::Cimon(&["provision", "--ask"])),
+        menu::ID_DOCTOR => admin(hwnd, Admin::Cimon(&["doctor"])),
+        menu::ID_CONFIG => admin(hwnd, Admin::Cimon(&["edit-config"])),
+        menu::ID_POWERSHELL => admin(hwnd, Admin::PowerShell),
+        menu::ID_UPGRADE => {
+            let Some(notices) = with_tray(|t| t.notices.clone()) else { return };
+            post_notice(hwnd as usize, &notices, "cimon", "새 버전 올리기는 아직 없다", true);
         }
         menu::ID_STOP_IDLE => act(hwnd, actions::Action::DrainStop),
         menu::ID_CANCEL_DRAIN => act(hwnd, actions::Action::CancelDrain),

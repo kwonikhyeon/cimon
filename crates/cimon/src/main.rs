@@ -41,9 +41,13 @@ enum Command {
     /// printed one-liner, type the code, and the script stores a new token and registers
     /// cimon with Claude Code. One user per device.
     Invite {
-        name: String,
+        /// The new user (one per device). Without it, --ask asks for it.
+        name: Option<String>,
         #[arg(long)]
         admin: bool,
+        /// Ask for the name (and admin or not) on this console — what the tray opens.
+        #[arg(long)]
+        ask: bool,
         /// Minutes the code stays valid.
         #[arg(long, default_value_t = 10)]
         minutes: u32,
@@ -127,7 +131,13 @@ enum Command {
         /// Recorded in the audit log.
         #[arg(long, default_value_t = whoami())]
         admin: String,
+        /// Ask for the project on this console — what the tray opens.
+        #[arg(long)]
+        ask: bool,
     },
+    /// Open the config file in Notepad, check it when closed, and offer a restart —
+    /// the config is read at start only.
+    EditConfig,
     #[command(name = "__exec", hide = true)]
     Exec { spec: PathBuf },
     #[command(name = "__sweep", hide = true)]
@@ -320,7 +330,12 @@ fn run(cli: Cli) -> Result<i32> {
             }
             Ok(())
         }
-        Command::Invite { name, admin, minutes } => {
+        Command::Invite { name, admin, ask, minutes } => {
+            let (name, admin) = match name {
+                Some(n) => (n, admin),
+                None if ask => (ops::ask("invite whom — one name per device ([A-Za-z0-9._-])")?, admin || ops::ask_yes("as an admin?")?),
+                None => bail!("a name — cimon invite <name> (or --ask)"),
+            };
             let cfg = load_config(&cli.config)?;
             let store = cimon_store::Store::open(&cimon_core::Layout::new(&cfg.paths.root).db())?;
             let (code, expires) = store.create_invite(&name, if admin { Role::Admin } else { Role::Member }, &whoami(), minutes)?;
@@ -360,7 +375,11 @@ fn run(cli: Cli) -> Result<i32> {
             ops::build_secret(&cfg, project, name, remove)
         }
         Command::Service => service::run(cli.config.clone()),
-        Command::Provision { project, kind, version, recipe_ref, from, admin } => {
+        Command::Provision { project, kind, version, recipe_ref, from, admin, ask } => {
+            let project = match project {
+                None if ask => Some(ops::ask("project (list_projects id)")?),
+                p => p,
+            };
             let cfg = load_config(&cli.config)?;
             let app = cimon_engine::App::open(cfg)?;
             let lines = cimon_engine::toolchains::provision(&app, &cimon_engine::toolchains::ProvisionArgs { project, kind, version, recipe_ref, from, admin })
@@ -400,6 +419,7 @@ fn run(cli: Cli) -> Result<i32> {
             Ok(())
         }
         Command::Ctl { action } => return ctl::run(action),
+        Command::EditConfig => ops::edit_config(&config_path(&cli.config)),
     };
     r.map(|()| 0)
 }

@@ -14,6 +14,12 @@ pub const ID_STOP_IDLE: usize = 21;
 pub const ID_STOP_NOW: usize = 22;
 pub const ID_CANCEL_DRAIN: usize = 23;
 pub const ID_RESTART: usize = 24;
+pub const ID_INVITE: usize = 30;
+pub const ID_UPGRADE: usize = 31;
+pub const ID_PROVISION: usize = 32;
+pub const ID_DOCTOR: usize = 33;
+pub const ID_CONFIG: usize = 34;
+pub const ID_POWERSHELL: usize = 35;
 pub const ID_QUIT: usize = 99;
 
 /// The UAC shield as a menu bitmap (32-bit with alpha).
@@ -106,6 +112,22 @@ pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP) -> HMENU {
             State::NotInstalled => add(menu, MF_STRING | MF_GRAYED, 0, "서비스가 설치되지 않았다(cimon setup)"),
             _ => add(menu, MF_STRING | MF_GRAYED, 0, "시작·중지하는 중…"),
         }
+        AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        // admin commands — each one through UAC, in its own window (docs/tray.md §5)
+        let admin = CreatePopupMenu();
+        for (id, text) in [
+            (ID_INVITE, "초대 코드 만들기…"),
+            (ID_UPGRADE, "새 버전 올리기…"),
+            (ID_PROVISION, "툴체인 설치(provision)…"),
+            (ID_DOCTOR, "점검(doctor)"),
+            (ID_CONFIG, "설정 파일 열기"),
+            (ID_POWERSHELL, "관리자 PowerShell 열기"),
+        ] {
+            add(admin, MF_STRING, id, text);
+            mark_shield(admin, id, shield);
+        }
+        let w = wide("관리자");
+        AppendMenuW(menu, MF_POPUP, admin as usize, w.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
         add(menu, MF_STRING, ID_QUIT, "트레이 끝내기");
         menu

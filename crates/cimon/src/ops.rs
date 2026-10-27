@@ -587,6 +587,51 @@ pub fn service_acl(operator: Option<String>, remove: bool) -> Result<()> {
     Ok(())
 }
 
+/// One answer typed on this console (`--ask`: the tray opens the window, the command
+/// asks — nothing the user types passes through a command line).
+pub fn ask(question: &str) -> Result<String> {
+    use std::io::Write;
+    print!("{question}: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    let a = line.trim().to_string();
+    if a.is_empty() {
+        bail!("nothing typed");
+    }
+    Ok(a)
+}
+
+pub fn ask_yes(question: &str) -> Result<bool> {
+    use std::io::Write;
+    print!("{question} [y/N]: ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+/// `cimon edit-config` (admin): Notepad on the config file, then a check of what was
+/// saved — a broken config would stop the next start — and an offer to restart.
+pub fn edit_config(path: &Path) -> Result<()> {
+    println!("opening {} — close Notepad to continue", path.display());
+    let before = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    let notepad = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into())).join(r"System32\notepad.exe");
+    std::process::Command::new(notepad).arg(path).status().context("starting Notepad")?;
+    if std::fs::read(path)? == before {
+        println!("unchanged");
+        return Ok(());
+    }
+    match Config::load(path) {
+        Ok(_) => println!("the config loads"),
+        Err(e) => bail!("the saved config does not load — fix it before the next start: {e:#}"),
+    }
+    if cimon_ctl::query().ok() == Some(cimon_ctl::State::Running) && ask_yes("restart cimon now so it reads the config? (running jobs are interrupted)")? {
+        crate::ctl::run(crate::ctl::CtlCmd::Restart)?;
+    }
+    Ok(())
+}
+
 /// `--pause`: the exit code and a prompt, then wait for Enter — the window an elevated
 /// command opens closes when it ends, and its output is the only answer the user gets.
 pub fn pause_for_enter(code: i32) {
