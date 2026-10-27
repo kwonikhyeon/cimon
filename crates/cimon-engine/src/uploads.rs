@@ -348,6 +348,18 @@ pub fn sweep(app: &App) {
     }
 }
 
+/// Whether `viewer` may have a job's artifact links and logs. A job that took uploads
+/// can carry them in its outputs (a deploy bundle holds the site's TLS key), so those go
+/// to its requester and admins only. A store error counts as "took uploads".
+pub fn may_see_outputs(app: &App, job: &cimon_store::JobRow, viewer: &cimon_core::AuthUser) -> bool {
+    viewer.is_admin() || job.created_by == viewer.name || app.store.job_uploads(job.id).is_ok_and(|v| v.is_empty())
+}
+
+/// What others are told instead of the outputs.
+pub fn outputs_hidden(job: &cimon_store::JobRow) -> String {
+    format!("{} 은 업로드를 받은 작업이다 — 산출물과 로그는 요청한 {} 와 관리자만 받는다", cimon_core::job_label(job.id), job.created_by)
+}
+
 /// The job result's and provenance's record: who handed what over — a file's size and
 /// sha256, nothing of a text value.
 pub fn record(app: &App, job_id: i64) -> Option<Value> {

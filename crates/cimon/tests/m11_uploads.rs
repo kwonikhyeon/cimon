@@ -19,6 +19,8 @@ if not exist \"%~2\\release.jks\" (echo dir wrong & exit /b 1)\r\n\
 echo password is %STORE_PASSWORD%\r\n\
 echo caches %GRADLE_USER_HOME%\r\n\
 if exist \"%GRADLE_USER_HOME%\\gradle\\init.d\\planted.gradle\" (echo planted init script & exit /b 1)\r\n\
+if not exist out mkdir out\r\n\
+echo signed> out\\signed.txt\r\n\
 echo release ok\r\n";
 
 fn recipes() -> MemTree {
@@ -51,6 +53,11 @@ kind = "package"
 run = ["./release.cmd", "${upload.keystore}", "${upload.keystore.dir}"]
 env = { STORE_PASSWORD = "${upload.store-password}" }
 uncounted = true
+
+  [[step.artifact]]
+  name = "signed.txt"
+  glob = "out/signed.txt"
+  expect = 1
 "#,
     );
     t
@@ -176,6 +183,27 @@ async fn an_upload_reaches_its_step_once_and_is_gone_after() {
     assert!(log.contains(&format!("homes\\j{id}\\caches")), "the job's own caches: {log}");
     let s = serde_json::to_string(&v).unwrap();
     assert!(!s.contains(PASSWORD) && !s.contains(&password) && !s.contains(&keystore), "the result holds fingerprints only");
+
+    // its outputs may carry what was uploaded: the requester and admins get them, briefly
+    let arts = v["artifacts"].as_array().unwrap();
+    assert_eq!(arts.len(), 1, "{v:#}");
+    // both in the same RFC 3339 form: compared as text
+    let kept = arts[0]["retained_until"].as_str().unwrap().to_string();
+    assert!(kept < cimon_core::after_secs(25 * 3600), "[uploads].artifact_days = 1: {kept}");
+    let (a, err) = call_any(&admin, "artifacts", json!({"job": v["job_id"]})).await;
+    assert!(!err && a["artifacts"].as_array().unwrap().len() == 1, "an admin: {a}");
+    let other_token = h.app.store.create_user("member-x", cimon_core::Role::Member).unwrap();
+    let other = h.task_client(&other_token).await;
+    let (st, _) = call_any(&other, "job_status", json!({"job": v["job_id"]})).await;
+    assert!(st["artifacts"].as_array().unwrap().is_empty(), "{st:#}");
+    assert!(st["artifacts_hidden"].as_str().unwrap().contains("member-b"), "{st:#}");
+    let (a, err) = call_any(&other, "artifacts", json!({"job": v["job_id"]})).await;
+    assert!(err && a["error"] == "outputs_private", "{a}");
+    let (l, err) = call_any(&other, "job_log", json!({"job": v["job_id"], "step": "release"})).await;
+    assert!(err && l["error"] == "outputs_private", "{l}");
+    let (l, err) = call_any(&other, "job_log", json!({"job": v["job_id"]})).await;
+    assert!(!err && l["steps"].as_array().is_some(), "the step list stays visible: {l}");
+    other.cancel().await.unwrap();
 
     // once: the bytes are gone, the handle is spent
     assert!(!blob.exists(), "deleted with the job");

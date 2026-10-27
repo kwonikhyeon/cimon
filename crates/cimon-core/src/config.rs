@@ -279,12 +279,20 @@ pub struct UploadsConfig {
     /// Untaken uploads one user may have at a time.
     #[serde(default = "d_upload_pending")]
     pub max_pending_per_user: u32,
+    /// How long the artifacts of a job that took uploads are kept (at most the project's
+    /// retention) — they may carry what was uploaded.
+    #[serde(default = "d_upload_artifact_days")]
+    pub artifact_days: u32,
 }
 
 impl Default for UploadsConfig {
     fn default() -> Self {
-        UploadsConfig { ttl_minutes: d_upload_ttl(), max_bytes: d_upload_max(), max_pending_per_user: d_upload_pending() }
+        UploadsConfig { ttl_minutes: d_upload_ttl(), max_bytes: d_upload_max(), max_pending_per_user: d_upload_pending(), artifact_days: d_upload_artifact_days() }
     }
+}
+
+fn d_upload_artifact_days() -> u32 {
+    1
 }
 
 fn d_upload_ttl() -> u32 {

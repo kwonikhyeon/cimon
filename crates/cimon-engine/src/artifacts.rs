@@ -111,7 +111,11 @@ pub fn collect(ctx: &mut JobCtx<'_>, step: &cimon_recipe::Step) -> Result<(), Ou
     let app = ctx.app;
     let id = ctx.job.id;
     let dest_dir = app.layout.job_artifacts(id);
-    let retention = ctx.resolved.project.retention_days.map(|d| d as i64).unwrap_or(RETENTION_DAYS);
+    let mut retention = ctx.resolved.project.retention_days.map(|d| d as i64).unwrap_or(RETENTION_DAYS);
+    // a job that took uploads may carry them in its outputs: keep those briefly (design §11.7)
+    if ctx.private_caches() {
+        retention = retention.min(app.config.uploads.artifact_days.max(1) as i64);
+    }
     let defs: Vec<ArtifactDef> = requested(ctx, step).into_iter().cloned().collect();
     for a in defs {
         let _ = app.store.set_status(id, &format!("산출물 수집: {}", a.name));

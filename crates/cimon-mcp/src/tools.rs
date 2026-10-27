@@ -274,14 +274,15 @@ fn call_blocking(app: &Arc<App>, user: &cimon_core::AuthUser, name: &str, args: 
             let job = find_job(app, &args)?;
             let task = task_arg(&args);
             ok_structured(if job.state.is_terminal() && job.result_json.is_some() {
-                cimon_engine::result::view(app, &job, task.as_deref())
+                cimon_engine::result::view(app, &job, task.as_deref(), user)
             } else {
                 cimon_engine::result::progress(app, &job)
             })
         }
-        "job_log" => job_log(app, args),
+        "job_log" => job_log(app, user, args),
         "artifacts" => {
             let job = find_job(app, &args)?;
+            outputs_allowed(app, &job, user)?;
             let list = cimon_engine::artifacts::listing(app, &job);
             let n = list.len();
             let note = if n == 0 { " (요청한 산출물이 없거나 아직 수집 전)" } else { "" };
@@ -334,7 +335,16 @@ fn find_job(app: &App, args: &Value) -> Result<cimon_store::JobRow, ToolError> {
         .ok_or_else(|| ToolError::new("unknown_job", format!("{} does not exist or its record expired (records are kept 30 days)", cimon_core::job_label(id))))
 }
 
-fn job_log(app: &App, args: Value) -> ToolResult {
+/// A job that took uploads keeps its artifacts and logs to its requester and admins.
+fn outputs_allowed(app: &App, job: &cimon_store::JobRow, user: &cimon_core::AuthUser) -> Result<(), ToolError> {
+    if cimon_engine::uploads::may_see_outputs(app, job, user) {
+        Ok(())
+    } else {
+        Err(ToolError::new("outputs_private", cimon_engine::uploads::outputs_hidden(job)))
+    }
+}
+
+fn job_log(app: &App, user: &cimon_core::AuthUser, args: Value) -> ToolResult {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct A {
@@ -357,6 +367,7 @@ fn job_log(app: &App, args: Value) -> ToolResult {
     if !steps.iter().any(|s| s.step_id == step) {
         return Err(ToolError::new("unknown_step", format!("{} has no step {step:?}", cimon_core::job_label(job.id))));
     }
+    outputs_allowed(app, &job, user)?;
     let path = app.layout.step_log(job.id, &step);
     let file = match std::fs::File::open(&path) {
         Ok(f) => f,
@@ -499,7 +510,7 @@ pub(crate) fn ok_structured(value: Value) -> ToolResult {
 }
 
 /// `tasks/get` (design §7.5): every field present, `statusMessage` on every answer.
-pub(crate) fn get_task(app: &Arc<App>, task_id: &str) -> Result<DetailedTask, ToolError> {
+pub(crate) fn get_task(app: &Arc<App>, user: &cimon_core::AuthUser, task_id: &str) -> Result<DetailedTask, ToolError> {
     use cimon_core::JobState::*;
     use rmcp::model::{TaskPayload, TaskStatus};
     let t = app.store.task(task_id)?.ok_or_else(|| ToolError::new("unknown_task", format!("unknown or expired task {task_id}")))?;
@@ -527,7 +538,7 @@ pub(crate) fn get_task(app: &Arc<App>, task_id: &str) -> Result<DetailedTask, To
         Intake | Provisioning | Ready | Running | Collecting | Cancelling | Merged => DetailedTask::new(base(TaskStatus::Working, status_msg), TaskPayload::Working),
         Cancelled | QueueTimeout => DetailedTask::new(base(TaskStatus::Cancelled, status_msg), TaskPayload::Cancelled),
         Done | Interrupted => {
-            let view = cimon_engine::result::view(app, &job, Some(task_id));
+            let view = cimon_engine::result::view(app, &job, Some(task_id), user);
             let result = completion_result(&view);
             let obj = match serde_json::to_value(&result).unwrap_or_default() {
                 Value::Object(m) => m,

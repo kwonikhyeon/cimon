@@ -515,10 +515,11 @@ pub fn project(app: &App, s: &Session, rref: &str, commit: &str, r: &cimon_recip
 }
 
 pub fn job(app: &App, s: &Session, j: &cimon_store::JobRow) -> Markup {
-    let view = if j.state.is_terminal() && j.result_json.is_some() { cimon_engine::result::view(app, j, None) } else { cimon_engine::result::progress(app, j) };
+    let view = if j.state.is_terminal() && j.result_json.is_some() { cimon_engine::result::view(app, j, None, &s.user) } else { cimon_engine::result::progress(app, j) };
+    let may_see = cimon_engine::uploads::may_see_outputs(app, j, &s.user);
     let steps = view["steps"].as_array().cloned().unwrap_or_default();
     let first_bad = steps.iter().find(|st| matches!(st["result"].as_str(), Some("fail") | Some("inconclusive"))).and_then(|st| st["id"].as_str().map(str::to_string));
-    let log_tail = first_bad.as_ref().and_then(|sid| std::fs::read(app.layout.step_log(j.id, sid)).ok()).map(|b| {
+    let log_tail = first_bad.as_ref().filter(|_| may_see).and_then(|sid| std::fs::read(app.layout.step_log(j.id, sid)).ok()).map(|b| {
         let t = String::from_utf8_lossy(&b).to_string();
         let lines: Vec<&str> = t.lines().collect();
         lines[lines.len().saturating_sub(200)..].iter().map(|l| cimon_runner_strip(l)).collect::<Vec<_>>().join("\n")
@@ -550,6 +551,7 @@ pub fn job(app: &App, s: &Session, j: &cimon_store::JobRow) -> Markup {
                 }
             } }
         }
+        @if let Some(h) = view["artifacts_hidden"].as_str() { p.meta { (h) } }
         @if let Some(arts) = view["artifacts"].as_array() { @if !arts.is_empty() {
             div.panel { h2 { "산출물" }
                 div.tbl { table {

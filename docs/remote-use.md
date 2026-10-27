@@ -168,6 +168,7 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 - 핸들은 올린 사람만, **한 번만**, 기본 **60분 안에** 쓴다. 지나면 다시 올린다.
 - 업로드를 받는 작업은 레시피의 `refs` 브랜치(기본 `default_ref`)와 `main` 레시피로만 돈다. 시도 레시피나 다른 브랜치로 요청하면 거절된다. 일회 클론과 작업 전용 캐시로 지으므로 평소보다 오래 걸린다.
 - 단계 로그에서 text 값은 `***` 로 가려진다. 결과에는 파일의 이름·크기·sha256 과 text 의 이름만 남는다(비밀번호의 해시는 내지 않는다). 작업이 끝나면 서버는 받은 파일을 지운다.
+- 그 작업의 산출물과 단계 로그는 **요청한 나와 관리자만** 받는다 — 산출물에 올린 것이 들어갈 수 있어서다(Wi-Fi 배포 묶음에는 현장 TLS 키가 들어간다). 산출물은 기본 **1일** 보관하니 바로 받는다. 받은 링크는 남에게 넘기지 않는다.
 - 빌드 코드는 받은 키를 읽을 수 있다 — 내 PC 에서 직접 빌드할 때와 같다. 믿는 브랜치만 이렇게 짓는다.
 
 ## 산출물 받기
@@ -198,6 +199,7 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 | `queue_full` | 내 대기 작업이 상한(기본 5개)이다 — 기다리거나 `cancel_job` |
 | `upload_missing` · `upload_invalid` | 고른 단계에 업로드가 필요하다, 또는 핸들이 만료·사용됐다 — 「비밀 파일이 필요한 빌드」 대로 다시 올린다 |
 | `upload_ref_not_allowed` · `upload_trial_recipe` | 업로드를 받는 작업은 허용 브랜치와 `main` 레시피로만 — `describe_project` 의 `uploads.refs` |
+| `outputs_private` · 결과의 `artifacts_hidden` | 남이 업로드를 받아 돌린 작업이다 — 산출물·로그는 그 사람과 관리자만 받는다 |
 | `draining` | 관리자가 업그레이드 중이다 — 잠시 뒤 다시 |
 | `ref_not_allowed` · `unknown_project` | 그 프로젝트가 허용한 브랜치·등록된 id 인지 — `describe_project`, `list_projects` |
 | 느리다 | `tailscale status` 에 `relay` 가 보이면 중계(DERP) 경로다. 다운로드는 이어받기로 |

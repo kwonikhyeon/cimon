@@ -81,8 +81,9 @@ pub fn build_with_steps(
     v
 }
 
-/// The stored result with fresh artifact links, task-specific fields and the web link.
-pub fn view(app: &App, job: &JobRow, task_id: Option<&str>) -> Value {
+/// The stored result with fresh artifact links (for a viewer who may have them — design
+/// §11.7), task-specific fields and the web link.
+pub fn view(app: &App, job: &JobRow, task_id: Option<&str>, viewer: &cimon_core::AuthUser) -> Value {
     let mut v: Value = job.result_json.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| json!({}));
     if let Some(t) = task_id {
         v["task_id"] = json!(t);
@@ -96,7 +97,12 @@ pub fn view(app: &App, job: &JobRow, task_id: Option<&str>) -> Value {
     if v.get("deduplicated").is_none() {
         v["deduplicated"] = json!(false);
     }
-    let arts = crate::artifacts::listing(app, job);
+    let arts = if crate::uploads::may_see_outputs(app, job, viewer) {
+        crate::artifacts::listing(app, job)
+    } else {
+        v["artifacts_hidden"] = json!(crate::uploads::outputs_hidden(job));
+        vec![]
+    };
     if !arts.is_empty() {
         v["artifacts"] = json!(arts);
         v["download_hint"] = json!("Invoke-WebRequest <url> -OutFile <path>; (Get-FileHash <path>).Hash 를 sha256 과 대조");

@@ -92,13 +92,13 @@ impl ServerHandler for CimonMcp {
 
     async fn get_task(&self, request: GetTaskParams, context: RequestContext<RoleServer>) -> Result<GetTaskResult, McpError> {
         let parts = context.extensions.get::<http::request::Parts>();
-        if crate::auth_user(parts).is_none() {
+        let Some(user) = crate::auth_user(parts) else {
             return Err(McpError::invalid_request("unauthenticated", None));
-        }
+        };
         // store and log reads block; keep them off the async workers
         let app = self.app.clone();
         let id = request.task_id.clone();
-        match tokio::task::spawn_blocking(move || tools::get_task(&app, &id)).await {
+        match tokio::task::spawn_blocking(move || tools::get_task(&app, &user, &id)).await {
             Ok(Ok(t)) => Ok(GetTaskResult::new(t)),
             Ok(Err(ToolError { message, .. })) => Err(McpError::invalid_params(message, None)),
             Err(e) => Err(McpError::internal_error(format!("tasks/get failed: {e}"), None)),
