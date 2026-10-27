@@ -201,7 +201,15 @@ pub fn health(app: &App) -> serde_json::Value {
         "last_db_offsite": app.store.last_offsite("db").ok().flatten(),
         "warnings": warnings,
         "version": env!("CARGO_PKG_VERSION"),
+        "build": build_id(),
     })
+}
+
+/// The first 12 hex of this executable's sha256 — what `cimon upgrade` waits to see
+/// (`version` repeats between builds).
+pub fn build_id() -> &'static str {
+    static B: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    B.get_or_init(|| std::env::current_exe().ok().and_then(|p| artifacts::sha256_file(&p).ok()).map(|h| h[..12].to_string()).unwrap_or_default())
 }
 
 /// The stop-when-idle control (docs/tray.md §4.2): `on` refuses new jobs (the

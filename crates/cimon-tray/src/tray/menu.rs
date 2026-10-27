@@ -20,6 +20,7 @@ pub const ID_PROVISION: usize = 32;
 pub const ID_DOCTOR: usize = 33;
 pub const ID_CONFIG: usize = 34;
 pub const ID_POWERSHELL: usize = 35;
+pub const ID_RELAUNCH: usize = 40;
 pub const ID_QUIT: usize = 99;
 
 /// The UAC shield as a menu bitmap (32-bit with alpha).
@@ -72,7 +73,7 @@ pub fn jobs(snap: &Snapshot) -> (u64, u64, bool) {
     }
 }
 
-pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP) -> HMENU {
+pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP, update_ready: bool) -> HMENU {
     // SAFETY: a new menu filled here; the caller destroys it
     unsafe {
         let menu = CreatePopupMenu();
@@ -129,6 +130,9 @@ pub fn build(snap: &Snapshot, tip: &str, shield: HBITMAP) -> HMENU {
         let w = wide("관리자");
         AppendMenuW(menu, MF_POPUP, admin as usize, w.as_ptr());
         AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+        if update_ready {
+            add(menu, MF_STRING, ID_RELAUNCH, "트레이 다시 시작(새 버전)");
+        }
         add(menu, MF_STRING, ID_QUIT, "트레이 끝내기");
         menu
     }

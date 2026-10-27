@@ -36,6 +36,12 @@ pub fn wide(s: &str) -> Vec<u16> {
 type Notices = Arc<Mutex<Vec<(String, String, bool)>>>;
 
 struct Tray {
+    /// the single-instance mutex — released before a restart starts the new tray
+    mutex: windows_sys::Win32::Foundation::HANDLE,
+    /// this executable as it was at start: (path, size, modified) — an upgrade replaces it
+    exe: Option<(std::path::PathBuf, u64, std::time::SystemTime)>,
+    /// a new tray executable is installed; the menu offers a restart
+    update_ready: bool,
     icon: icon::Icon,
     shield: windows_sys::Win32::Graphics::Gdi::HBITMAP,
     shared: Arc<Mutex<poll::Snapshot>>,
@@ -75,8 +81,10 @@ pub fn run() {
         let (poke, rx) = std::sync::mpsc::channel();
         let first = model::view(cimon_ctl::query().unwrap_or(cimon_ctl::State::Other), None);
         let icon = icon::Icon::add(hwnd, first.color, &first.tip);
-        TRAY.with(|t| *t.borrow_mut() = Some(Tray { icon, shield: menu::shield(), shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
+        TRAY.with(|t| *t.borrow_mut() = Some(Tray { mutex: m, exe: exe_stamp(), update_ready: false, icon, shield: menu::shield(), shared: shared.clone(), poke, taskbar_created, notices: Default::default() }));
         poll::spawn(hwnd as usize, shared, rx);
+        // a minute's check whether an upgrade replaced this executable
+        SetTimer(hwnd, TIMER_EXE, 60_000, None);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
@@ -88,6 +96,42 @@ pub fn run() {
             }
         });
         log::line("exit");
+    }
+}
+
+const TIMER_EXE: usize = 1;
+const NIN_BALLOONUSERCLICK: u32 = WM_USER + 5;
+
+fn exe_stamp() -> Option<(std::path::PathBuf, u64, std::time::SystemTime)> {
+    let p = std::env::current_exe().ok()?;
+    let m = std::fs::metadata(&p).ok()?;
+    Some((p.clone(), m.len(), m.modified().ok()?))
+}
+
+/// After an upgrade put a new `cimon-tray.exe` in place: say so once.
+fn check_exe(t: &mut Tray) {
+    let Some((p, len, modified)) = &t.exe else { return };
+    let now = std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()));
+    if t.update_ready || now == Some((*len, Some(*modified))) || now.is_none() {
+        return;
+    }
+    t.update_ready = true;
+    log::line("a new tray executable is installed");
+    t.icon.notify("cimon 트레이", "새 버전이 설치됐다 — 이 알림이나 메뉴의 「트레이 다시 시작」 을 누르면 바뀐다", false);
+}
+
+/// Starts the installed tray and ends this one.
+fn relaunch(hwnd: HWND) {
+    let Some((mutex, path)) = with_tray(|t| (t.mutex, t.exe.as_ref().map(|e| e.0.clone()))) else { return };
+    let Some(path) = path else { return };
+    // SAFETY: our own mutex handle; the new tray must be able to take it
+    unsafe { windows_sys::Win32::Foundation::CloseHandle(mutex) };
+    match std::process::Command::new(&path).spawn() {
+        Ok(_) => {
+            log::line("restarting into the new tray");
+            unsafe { DestroyWindow(hwnd) };
+        }
+        Err(e) => log::line(&format!("could not start {}: {e}", path.display())),
     }
 }
 
@@ -113,7 +157,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let Some((menu, snap)) = with_tray(|t| {
         let snap = t.shared.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let tip = model::view(snap.svc, snap.probe.as_ref()).tip;
-        (menu::build(&snap, &tip, t.shield), snap)
+        (menu::build(&snap, &tip, t.shield, t.update_ready), snap)
     }) else {
         return;
     };
@@ -151,6 +195,7 @@ fn act(hwnd: HWND, a: actions::Action) {
 /// An admin command (docs/tray.md §5): always through UAC, in its own window.
 enum Admin {
     Cimon(&'static [&'static str]),
+    Upgrade(String),
     PowerShell,
 }
 
@@ -160,6 +205,7 @@ fn admin(hwnd: HWND, what: Admin) {
     std::thread::spawn(move || {
         let r = match what {
             Admin::Cimon(args) => elevate::cimon(args),
+            Admin::Upgrade(path) => elevate::cimon(&["upgrade", "--from", &path]),
             Admin::PowerShell => elevate::powershell(),
         };
         if let Err(e) = r {
@@ -193,9 +239,11 @@ fn command(hwnd: HWND, cmd: usize, snap: &poll::Snapshot) {
         menu::ID_CONFIG => admin(hwnd, Admin::Cimon(&["edit-config"])),
         menu::ID_POWERSHELL => admin(hwnd, Admin::PowerShell),
         menu::ID_UPGRADE => {
-            let Some(notices) = with_tray(|t| t.notices.clone()) else { return };
-            post_notice(hwnd as usize, &notices, "cimon", "새 버전 올리기는 아직 없다", true);
+            if let Some(path) = elevate::pick_exe(hwnd) {
+                admin(hwnd, Admin::Upgrade(path));
+            }
         }
+        menu::ID_RELAUNCH => relaunch(hwnd),
         menu::ID_STOP_IDLE => act(hwnd, actions::Action::DrainStop),
         menu::ID_CANCEL_DRAIN => act(hwnd, actions::Action::CancelDrain),
         menu::ID_QUIT => {
@@ -211,12 +259,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_TRAY => {
             match (lp as u32) & 0xffff {
                 WM_CONTEXTMENU | NIN_SELECT | NIN_KEYSELECT => show_menu(hwnd),
+                NIN_BALLOONUSERCLICK if with_tray(|t| t.update_ready) == Some(true) => relaunch(hwnd),
                 _ => {}
             }
             0
         }
         WM_STATUS => {
             with_tray(refresh);
+            0
+        }
+        WM_TIMER if wp == TIMER_EXE => {
+            with_tray(check_exe);
             0
         }
         WM_NOTICE => {

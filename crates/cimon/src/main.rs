@@ -3,6 +3,7 @@
 use cimon::{init_tracing, serve};
 
 mod ctl;
+mod upgrade;
 mod lsa;
 mod ops;
 mod recipe_cli;
@@ -138,6 +139,18 @@ enum Command {
     /// Open the config file in Notepad, check it when closed, and offer a restart —
     /// the config is read at start only.
     EditConfig,
+    /// Replace the installed cimon.exe (and cimon-tray.exe beside it) with a new build:
+    /// check, stop once jobs end, replace, start, and go back if it does not come up.
+    Upgrade {
+        #[arg(long)]
+        from: PathBuf,
+        /// Stop now instead of waiting for running jobs.
+        #[arg(long)]
+        now: bool,
+        /// Seconds to wait for running jobs.
+        #[arg(long, default_value_t = 3600)]
+        wait: u64,
+    },
     #[command(name = "__exec", hide = true)]
     Exec { spec: PathBuf },
     #[command(name = "__sweep", hide = true)]
@@ -197,8 +210,24 @@ pub fn config_path(cli: &Option<PathBuf>) -> PathBuf {
 }
 
 /// The `--config` of the installed service, from its command line in the registry.
-#[cfg(windows)]
 fn service_config() -> Option<PathBuf> {
+    config_arg(&image_path()?)
+}
+
+/// The installed service's executable (the first token of its command line).
+pub fn service_exe() -> Option<PathBuf> {
+    let line = image_path()?;
+    let line = line.trim();
+    let exe = match line.strip_prefix('"') {
+        Some(q) => q.split('"').next()?,
+        None => line.split_whitespace().next()?,
+    };
+    Some(PathBuf::from(expand_env(exe)))
+}
+
+/// The service's command line from the registry (`ImagePath`, unexpanded).
+#[cfg(windows)]
+fn image_path() -> Option<String> {
     use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
     let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
     let key = wide(&format!(r"SYSTEM\CurrentControlSet\Services\{}", ops::SERVICE_NAME));
@@ -213,11 +242,11 @@ fn service_config() -> Option<PathBuf> {
         return None;
     }
     let line = String::from_utf16_lossy(&buf[..bytes as usize / 2]);
-    config_arg(line.trim_end_matches('\0'))
+    Some(line.trim_end_matches('\0').to_string())
 }
 
 #[cfg(not(windows))]
-fn service_config() -> Option<PathBuf> {
+fn image_path() -> Option<String> {
     None
 }
 
@@ -420,6 +449,7 @@ fn run(cli: Cli) -> Result<i32> {
         }
         Command::Ctl { action } => return ctl::run(action),
         Command::EditConfig => ops::edit_config(&config_path(&cli.config)),
+        Command::Upgrade { from, now, wait } => upgrade::run(&config_path(&cli.config), &from, now, wait),
     };
     r.map(|()| 0)
 }

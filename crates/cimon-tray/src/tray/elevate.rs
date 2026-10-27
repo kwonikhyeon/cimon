@@ -62,6 +62,31 @@ pub fn powershell() -> Result<(), String> {
     run(&ps, &["-NoExit", "-NoProfile", "-Command", &script])
 }
 
+/// Asks for the new `cimon.exe` to upgrade to (docs/tray.md §5.3).
+pub fn pick_exe(owner: windows_sys::Win32::Foundation::HWND) -> Option<String> {
+    use windows_sys::Win32::UI::Controls::Dialogs::{GetOpenFileNameW, OFN_FILEMUSTEXIST, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW};
+    let filter: Vec<u16> = "cimon.exe\0cimon.exe\0실행 파일 (*.exe)\0*.exe\0\0".encode_utf16().collect();
+    let title = wide("올릴 새 cimon.exe");
+    let mut file = vec![0u16; 1024];
+    // SAFETY: buffers outlive the call; a zeroed OPENFILENAMEW with the size set is valid
+    let ok = unsafe {
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = owner;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.lpstrFile = file.as_mut_ptr();
+        ofn.nMaxFile = file.len() as u32;
+        ofn.lpstrTitle = title.as_ptr();
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        GetOpenFileNameW(&mut ofn)
+    };
+    if ok == 0 {
+        return None;
+    }
+    let n = file.iter().position(|c| *c == 0).unwrap_or(file.len());
+    Some(String::from_utf16_lossy(&file[..n]))
+}
+
 /// `cimon.exe <args> --pause` elevated.
 pub fn cimon(args: &[&str]) -> Result<(), String> {
     let exe = cimon_exe()?;

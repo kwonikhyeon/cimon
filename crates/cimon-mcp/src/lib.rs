@@ -188,7 +188,8 @@ async fn healthz(State(app): State<Arc<App>>, headers: http::HeaderMap) -> impl 
     if authed {
         Json(cimon_engine::health(&app))
     } else {
-        Json(serde_json::json!({ "ok": true, "detail": "send a user token (Authorization: Bearer …) for queue, disk and backup state" }))
+        // the build id lets `cimon upgrade` see the new executable answer without a token
+        Json(serde_json::json!({ "ok": true, "build": cimon_engine::build_id(), "detail": "send a user token (Authorization: Bearer …) for queue, disk and backup state" }))
     }
 }
 
