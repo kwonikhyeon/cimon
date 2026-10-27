@@ -91,6 +91,9 @@ pub fn setup(config_path: &Path, cfg: &Config, dry_run: bool) -> Result<()> {
         cmd("sc.exe", &["description", SERVICE_NAME, "Cimon says: build. Remote build and test service (MCP)."])?;
         Ok(())
     }));
+    steps.push(step(format!("service DACL — logged-on users may only query; {} may start, stop and control (docs/tray.md §4.1)", cimon_ctl::dacl::OPERATORS), || {
+        write_service_dacl().map(|_| ())
+    }));
     let key = layout.link_key();
     steps.push(step(format!("link key {}", key.display()), move || {
         if !key.exists() {
@@ -526,11 +529,62 @@ pub fn doctor(cfg: &Config, network: bool) -> Result<usize> {
     }
     let svc = std::process::Command::new("sc.exe").args(["query", SERVICE_NAME]).output().map(|o| o.status.success()).unwrap_or(false);
     report(svc, &format!("Windows service {SERVICE_NAME} registered"), String::new());
+    if svc {
+        // who may stop it or change it (docs/tray.md §4.1)
+        match cimon_ctl::dacl::read() {
+            Ok(sddl) => {
+                let p = cimon_ctl::dacl::problems(&sddl);
+                report(p.is_empty(), "service DACL", if p.is_empty() { String::new() } else { format!("{} — cimon setup --service-acl", p.join("; ")) });
+            }
+            Err(e) => report(false, "service DACL", e.to_string()),
+        }
+    }
     if layout.draining_flag().exists() {
         report(false, "draining", "new jobs are refused — cimon drain --off".into());
     }
     println!("{failed} check(s) failed");
     Ok(failed)
+}
+
+/// Writes the service DACL cimon wants (with the operators group if it exists) and reads
+/// it back. Returns the SDDL written.
+fn write_service_dacl() -> Result<String> {
+    let sddl = cimon_ctl::dacl::service_sddl(cimon_ctl::dacl::operators_sid().as_deref());
+    cimon_ctl::dacl::write(&sddl).map_err(|e| anyhow::anyhow!("writing the {SERVICE_NAME} service DACL: {e}"))?;
+    let back = cimon_ctl::dacl::read().map_err(|e| anyhow::anyhow!("reading it back: {e}"))?;
+    let problems = cimon_ctl::dacl::problems(&back);
+    if !problems.is_empty() {
+        bail!("the service DACL still lets: {}", problems.join("; "));
+    }
+    Ok(back)
+}
+
+/// `cimon setup --service-acl` / `--operator <user> [--remove]` (admin): who may start,
+/// stop and control cimon without UAC (docs/tray.md §4.1). The member change takes
+/// effect at that user's next logon.
+pub fn service_acl(operator: Option<String>, remove: bool) -> Result<()> {
+    let group = cimon_ctl::dacl::OPERATORS;
+    if let Some(user) = &operator {
+        if user.is_empty() || !user.chars().all(|c| c.is_alphanumeric() || matches!(c, '.' | '_' | '-' | ' ' | '\\')) {
+            bail!("{user:?} is not a Windows user name");
+        }
+        if cimon_ctl::dacl::operators_sid().is_none() {
+            cmd("net.exe", &["localgroup", group, "/add", "/comment:cimon: start, stop and control the service without UAC"])?;
+        }
+        let out = std::process::Command::new("net.exe").args(["localgroup", group, user, if remove { "/delete" } else { "/add" }]).output()?;
+        let text = format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+        // 1378: already a member; 1377: not a member — both leave things as asked
+        if !out.status.success() && !text.contains("1378") && !text.contains("1377") {
+            bail!("net localgroup {group} {user}: {}", text.trim());
+        }
+        println!("{user} {} {group}", if remove { "removed from" } else { "added to" });
+    }
+    let sddl = write_service_dacl()?;
+    println!("service DACL: {sddl}");
+    if operator.is_some() && !remove {
+        println!("{} must sign out and in again for the group to apply", operator.unwrap_or_default());
+    }
+    Ok(())
 }
 
 /// `--pause`: the exit code and a prompt, then wait for Enter — the window an elevated

@@ -73,6 +73,13 @@ pub fn run(cmd: CtlCmd) -> Result<i32> {
         CtlCmd::Status => {
             let s = cimon_ctl::query().map_err(explain)?;
             println!("{}: {}", cimon_ctl::SERVICE, s.as_str());
+            // readable by logged-on users: who may stop or change the service
+            if let Ok(sddl) = cimon_ctl::dacl::read() {
+                match cimon_ctl::dacl::problems(&sddl).as_slice() {
+                    [] => println!("service DACL: ok"),
+                    p => println!("service DACL: {} — an admin runs `cimon setup --service-acl`", p.join("; ")),
+                }
+            }
             return Ok(if s == State::Running { 0 } else { 3 });
         }
         CtlCmd::Start => start()?,

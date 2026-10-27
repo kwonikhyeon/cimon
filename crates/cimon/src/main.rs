@@ -58,6 +58,16 @@ enum Command {
         /// Print what would be done without changing anything.
         #[arg(long)]
         dry_run: bool,
+        /// Only write the service DACL (docs/tray.md §4.1).
+        #[arg(long)]
+        service_acl: bool,
+        /// Only let this Windows user start, stop and control cimon without UAC (the
+        /// cimon-operators group), and write the service DACL.
+        #[arg(long)]
+        operator: Option<String>,
+        /// With --operator: take the user out of the group instead.
+        #[arg(long, requires = "operator")]
+        remove: bool,
     },
     /// Check the machine (design §16.4); non-zero exit when something fails.
     Doctor {
@@ -322,7 +332,8 @@ fn run(cli: Cli) -> Result<i32> {
             println!("  macOS / Linux:         curl -fsSL {url}/connect.sh | sh");
             Ok(())
         }
-        Command::Setup { dry_run } => {
+        Command::Setup { service_acl, operator, remove, .. } if service_acl || operator.is_some() => ops::service_acl(operator, remove),
+        Command::Setup { dry_run, .. } => {
             let path = config_path(&cli.config);
             let cfg = load_config(&cli.config)?;
             ops::setup(&path, &cfg, dry_run)

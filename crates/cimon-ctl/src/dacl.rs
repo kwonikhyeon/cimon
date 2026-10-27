@@ -168,6 +168,37 @@ mod win {
         })
     }
 
+    /// The SID of the `cimon-operators` group as a string, if the group exists.
+    pub fn operators_sid() -> Option<String> {
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::LookupAccountNameW;
+        let name = wide(OPERATORS);
+        // SAFETY: sized buffers from the first call; the string SID is LocalFree'd
+        unsafe {
+            let (mut sid_len, mut dom_len, mut use_) = (0u32, 0u32, 0i32);
+            LookupAccountNameW(std::ptr::null(), name.as_ptr(), std::ptr::null_mut(), &mut sid_len, std::ptr::null_mut(), &mut dom_len, &mut use_);
+            if sid_len == 0 {
+                return None;
+            }
+            let mut sid = vec![0u8; sid_len as usize];
+            let mut dom = vec![0u16; dom_len.max(1) as usize];
+            if LookupAccountNameW(std::ptr::null(), name.as_ptr(), sid.as_mut_ptr().cast(), &mut sid_len, dom.as_mut_ptr(), &mut dom_len, &mut use_) == 0 {
+                return None;
+            }
+            let mut out: *mut u16 = std::ptr::null_mut();
+            if ConvertSidToStringSidW(sid.as_mut_ptr().cast(), &mut out) == 0 {
+                return None;
+            }
+            let mut n = 0;
+            while *out.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(out, n));
+            LocalFree(out.cast());
+            Some(s)
+        }
+    }
+
     /// Replaces the service's DACL (administrator).
     pub fn write(sddl: &str) -> Result<(), CtlError> {
         let w = wide(sddl);
@@ -185,7 +216,12 @@ mod win {
 }
 
 #[cfg(windows)]
-pub use win::{read, write};
+pub use win::{operators_sid, read, write};
+
+#[cfg(not(windows))]
+pub fn operators_sid() -> Option<String> {
+    None
+}
 
 #[cfg(not(windows))]
 pub fn read() -> Result<String, CtlError> {

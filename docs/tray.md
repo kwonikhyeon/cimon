@@ -2,7 +2,7 @@
 
 빌드 머신에 로그인한 관리자가 작업 표시줄 알림 영역(「숨겨진 아이콘 표시」)에서 cimon 서비스의 상태를 보고, 켜고 끄고, 관리자 명령을 실행하게 하는 작은 Windows 앱이다. 지금은 이 일들이 매번 관리자 PowerShell 을 열고 `sc.exe`·`cimon.exe` 를 손으로 치는 일이다 — 특히 새 버전을 올리는 세 줄(중지·복사·시작).
 
-상태: 구현 중 — T1(상태 표시)·T2(UAC 로 켜고 끄기) 완료.
+상태: 구현 중 — T1(상태 표시)·T2(UAC 로 켜고 끄기)·T3(서비스 DACL·operators) 완료.
 
 ## 1. 범위
 
@@ -121,7 +121,9 @@ D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCR
 | IU · SU | `CCLCSWLORC` | 상태 조회만 — **`CR` 을 뺀다** |
 | `cimon-operators` | `LCRPWPLOCRRC` | 상태 조회·시작·중지·사용자 정의 제어 |
 
-**`cimon setup --operator <사용자>`(관리자, 한 번)** — 매번 UAC 를 띄우지 않고 켜고 끄려면 실행한다.
+이미 설치한 머신은 **`cimon setup --service-acl`**(관리자)로 DACL 만 다시 쓴다. `cimon ctl status` 는 관리자가 아니어도 지금 DACL 의 문제를 보여 주고, `cimon doctor` 는 문제가 있으면 실패한다.
+
+**`cimon setup --operator <사용자>`(관리자, 한 번)** — 매번 UAC 를 띄우지 않고 켜고 끄려면 실행한다. setup 의 나머지 단계는 돌지 않는다.
 
 1. 로컬 그룹 `cimon-operators` 를 만들고 사용자를 넣는다. 걸러진 토큰에도 일반 그룹은 남으므로 UAC 없이 통한다.
 2. 위 표대로 DACL 을 쓴다. `--operator` 없이 setup 을 다시 돌려도 그룹 ACE 는 유지한다 — 그룹이 있으면 넣는다.
@@ -130,7 +132,7 @@ D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCR
 `cimon-operators` 에 **주지 않는 권한**은 `DC`(설정 바꾸기)·`WD`·`WO`·`SD` 다. 설정을 바꿀 수 있으면 binPath 를 바꿔 서비스 계정 권한으로 아무 코드나 실행할 수 있기 때문이다.
 
 - **남는 위험**: 그룹에 든 사람은 빌드를 멈출 수 있다(가용성). 권한을 넓히지는 못한다.
-- **되돌리기**: `cimon setup --operator <사용자> --remove`. 그룹이 비면 ACE 도 지운다. `cimon doctor` 는 서비스 DACL 에 위험한 권한이 들어 있지 않은지 확인한다.
+- **되돌리기**: `cimon setup --operator <사용자> --remove`. 빈 그룹의 ACE 는 아무에게도 권한을 주지 않으므로 그대로 둔다.
 
 ### 4.2 「작업이 끝나면 중지」 — 서비스가 스스로 멈춘다
 
@@ -143,7 +145,7 @@ D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCR
 
 - 트레이는 `ControlService(128)` 만 보낸다. 상태는 `/healthz` 의 `draining` 과 SCM 상태로 본다.
 - 128·129 를 처리하는 버전은 **§4.1 의 DACL 을 쓴 setup 과 함께** 나가야 한다. 그렇지 않으면 대화형 사용자 누구나 서비스를 멈출 수 있다. 서비스는 시작할 때 자기 DACL 을 읽어, IU·SU·WD 에 `CR`·`WP`·`DC` 가 있으면 128·129 를 받지 않고 서비스 로그와 `/healthz` 경고로 「`cimon setup` 을 다시 실행하라」 를 알린다.
-- `cimon drain`(CLI)도 같은 제어를 보내도록 바꾼다 — 길이 하나가 된다. 서비스가 멈춰 있으면 지금처럼 표시 파일을 쓴다.
+- `cimon drain`(CLI)은 그대로 둔다 — 새 작업을 거절하고 실행 중인 작업을 기다릴 뿐 서비스를 멈추지 않는다(업그레이드 전에 쓴다). 멈추기까지 하려면 `cimon ctl drain-stop` 이다.
 - **중지 메뉴의 기본값**: 실행 중인 작업이 있으면 「작업이 끝나면 중지」 다. 「지금 중지」 는 확인 창에서 실행 중인 작업 id 를 보여 준다.
 
 ### 4.3 권한이 없을 때
@@ -229,7 +231,7 @@ crates/cimon-tray/      (새) 바이너리, #![windows_subsystem = "windows"]
 |---|---|
 | `cimon/src/service.rs` | 사용자 정의 제어 128·129 처리. 「작업 끝나면 중지」 감시는 서빙 루프의 작업 하나가 맡는다 |
 | `cimon/src/main.rs` | `ctl <start\|stop\|drain-stop\|cancel-drain\|restart\|status>` · `upgrade --from` · `edit-config` · 전역 `--pause` |
-| `cimon/src/ops.rs` | setup 이 서비스 DACL 을 명시적으로 쓰고(§4.1) `cimon-tray.exe` 를 함께 복사 · `setup --operator <user> [--remove]` · `drain` 이 제어 128 을 보냄 · doctor 의 서비스 DACL 검사(IU·SU 에 `CR`, 누구에게든 `DC` 가 있으면 실패) |
+| `cimon/src/ops.rs` | setup 이 서비스 DACL 을 명시적으로 쓰고(§4.1) · `setup --service-acl` · `setup --operator <user> [--remove]` · doctor 의 서비스 DACL 검사(IU·SU 에 `CR`, SY·BA 밖의 누구에게든 `DC` 가 있으면 실패) |
 | `cimon-mcp` | `POST /login-link`(토큰 인증, `cimon_web::login_link`) |
 | 문서 | setup.md(트레이 설치·`--operator`), design §4.2·§16.6, 이 문서 |
 
