@@ -43,9 +43,21 @@ mod imp {
         let cell: std::sync::Arc<std::sync::OnceLock<service_control_handler::ServiceStatusHandle>> = Default::default();
         let stopped: std::sync::Arc<std::sync::Mutex<bool>> = Default::default();
         let (cell2, stopped2) = (cell.clone(), stopped.clone());
-        // the controls are honored only while the DACL keeps them from logged-on users
-        let dacl_problems = cimon_ctl::dacl::read().map(|s| cimon_ctl::dacl::problems(&s)).unwrap_or_else(|e| vec![format!("could not read it: {e}")]);
-        let controls_ok = dacl_problems.is_empty();
+        // the controls are honored only while the DACL keeps them from logged-on users —
+        // read again at each control and every half minute until it is fixed, so an admin's
+        // `cimon setup --service-acl` takes effect without a restart
+        let dacl_problems = current_dacl_problems();
+        let controls_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(dacl_problems.is_empty()));
+        if !dacl_problems.is_empty() {
+            let ok = controls_ok.clone();
+            std::thread::spawn(move || loop {
+                std::thread::sleep(Duration::from_secs(30));
+                if recheck(&ok) {
+                    return;
+                }
+            });
+        }
+        let ok2 = controls_ok.clone();
         let handle = service_control_handler::register(crate::ops::SERVICE_NAME, move |c| match c {
             ServiceControl::Stop | ServiceControl::Shutdown => {
                 if let Some(h) = cell2.get().copied() {
@@ -69,7 +81,7 @@ mod imp {
             // stop when idle / cancel (docs/tray.md §4.2) — only while the DACL keeps them
             // to operators and admins; otherwise anyone logged on could stop the service
             ServiceControl::UserEvent(code) if matches!(code.to_raw(), cimon_ctl::STOP_WHEN_IDLE | cimon_ctl::CANCEL_STOP_WHEN_IDLE) => {
-                if !controls_ok {
+                if !ok2.load(std::sync::atomic::Ordering::SeqCst) && !recheck(&ok2) {
                     tracing::warn!("refused control {} — the service DACL lets logged-on users send it (cimon setup --service-acl)", code.to_raw());
                     return ServiceControlHandlerResult::NotImplemented;
                 }
@@ -93,7 +105,7 @@ mod imp {
             let rt = tokio::runtime::Runtime::new()?;
             let mut notices = vec![];
             if !dacl_problems.is_empty() {
-                let w = format!("서비스 DACL: {} — 「작업 끝나면 중지」 제어를 받지 않는다. 관리자가 cimon setup --service-acl 을 실행한다", dacl_problems.join("; "));
+                let w = format!("{DACL_NOTICE} {} — 「작업 끝나면 중지」 제어를 받지 않는다. 관리자가 cimon setup --service-acl 을 실행한다", dacl_problems.join("; "));
                 tracing::warn!("{w}");
                 notices.push(w);
             }
@@ -114,6 +126,26 @@ mod imp {
         drop(done);
         res
     }
+
+    fn current_dacl_problems() -> Vec<String> {
+        cimon_ctl::dacl::read().map(|s| cimon_ctl::dacl::problems(&s)).unwrap_or_else(|e| vec![format!("could not read it: {e}")])
+    }
+
+    /// Reads the DACL again; once it is right, controls are taken and the start-up
+    /// warning leaves `/healthz`.
+    fn recheck(ok: &std::sync::atomic::AtomicBool) -> bool {
+        if !current_dacl_problems().is_empty() {
+            return false;
+        }
+        ok.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(app) = cimon::serve::app() {
+            app.engine.notices.lock().unwrap_or_else(|p| p.into_inner()).retain(|n| !n.starts_with(DACL_NOTICE));
+        }
+        tracing::info!("the service DACL is right now — stop-when-idle controls are taken");
+        true
+    }
+
+    const DACL_NOTICE: &str = "서비스 DACL:";
 
     pub fn dispatch() -> anyhow::Result<()> {
         service_dispatcher::start(crate::ops::SERVICE_NAME, ffi_service_main)?;
