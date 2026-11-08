@@ -235,9 +235,9 @@ async fn provision_from_a_local_copy_when_the_source_is_down() {
     assert_eq!(v["verdict"], "pass", "{v:#}");
 
     // an install that stops working is caught by the probe at job start, as
-    // environment — not halfway through a step
+    // environment — not halfway through a step (built anew: the first build would be reused)
     std::fs::write(std::path::Path::new(&inst.root).join("hello-1.2.3").join("bin").join("hello.cmd"), "@echo broken\r\n").unwrap();
-    let v = run_build(&c, json!({"project": "m3local"})).await;
+    let v = run_build(&c, json!({"project": "m3local", "rebuild": true})).await;
     assert_eq!(v["verdict"], "inconclusive", "{v:#}");
     assert_eq!(v["failure_class"], "environment", "{v:#}");
     assert!(v["summary"].as_str().unwrap().contains("does not work for the build account"), "{}", v["summary"]);
@@ -259,7 +259,7 @@ async fn base_kind_checks() {
     assert_eq!(v["verdict"], "pass", "{v:#}");
     // remove the base tool: the job says what is missing and how to get it
     std::fs::remove_file(tooldir.path().join("bin").join("mybase.cmd")).unwrap();
-    let v = run_build(&c, json!({"project": "m3base"})).await;
+    let v = run_build(&c, json!({"project": "m3base", "rebuild": true})).await;
     assert_eq!(v["reason_code"], "base_missing", "{v:#}");
     assert!(v["summary"].as_str().unwrap().contains("install mybase"), "{}", v["summary"]);
 }

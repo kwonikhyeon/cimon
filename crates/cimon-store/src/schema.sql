@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS jobs (
   request_json     TEXT NOT NULL,
   plan_json        TEXT,
   merge_key        TEXT,
+  reuse_key        TEXT,
   merged_into      INTEGER REFERENCES jobs(id),
   state            TEXT NOT NULL,
   verdict          TEXT,

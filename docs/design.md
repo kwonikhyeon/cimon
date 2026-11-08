@@ -386,6 +386,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 | `artifacts` | 선택된 단계의 `default = true` 산출물 | 이름 목록. `[]` 면 수집 안 함. 이름을 대면 그 생산 단계가 **도구의 후보 종류와 상관없이** 들어간다 |
 | `params` | 각 `default` | 선언된 것만. **선택된 어느 단계에도 적용되지 않는 파라미터를 명시하면 거절**(`param_not_applicable`) |
 | `clean` | `false` | warm 트리 대신 일회 클론(§11.4) |
+| `rebuild` | `false` | 같은 입력으로 통과한 빌드가 남아 있어도 새로 짓는다 — 다시 쓰기(§8.3)를 건너뛴다. 동시 병합은 그대로 한다(돌고 있는 작업은 어차피 새 빌드다) |
 | `uploads` | 없음 | 레시피 `[upload.<name>]` → 핸들(§11.7). 고른 단계가 받는 업로드는 필수, 받지 않는 업로드를 주면 거절 |
 
 | 도구 | `steps`·`tags` 로 고를 수 있는 종류 | 아무것도 고르지 않으면 |
@@ -418,6 +419,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
   "siblings": [],
   "trial": false,
   "deduplicated": false,
+  "reused": false,
   "recipe": { "source": "central", "ref": "main", "commit": "a1b2c3d…", "sha256": "…" },
   "workspace": { "mode": "warm", "slot": 1 },
   "params": { "backend_url": "http://192.168.0.20:8800" },
@@ -446,6 +448,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 - **출력 스키마(`outputSchema`)는 선언하지 않는다.** 선언하면 거절 결과(`isError`, `{error, message}`)까지 그 스키마에 맞아야 한다. 결과의 모양은 이 절이 정본이고, 성공·「접수됨」(§7.5) 결과는 언제나 `job_id`·`done`·`summary` 를 싣는다.
 - **Claude 가 알아야 할 것은 전부 `structuredContent` 에** — 요약도 `summary` 로. 같은 요약을 `content` 텍스트에도 싣는다(Agent SDK 문서는 `structuredContent` 가 있으면 `content` 를 넘기지 않는다고 한다. 원격 서버도 그런지는 확인 안 함).
 - 실패면 `summary` 첫 줄에 실패 분류·실패한 단계·**첫 에러 줄**. `excluded`·`warnings` 가 있으면 그 수를 적는다.
+- 다시 쓴 결과(§8.3)는 `reused: true`·`deduplicated: true`·`follows_job`(지은 작업)·`built_at`(그 작업이 끝난 시각)을 싣고, `summary` 끝에 「새로 빌드하지 않았다 — j000100 이 <시각> 에 … 다시 지으려면 rebuild: true」 를 붙인다. `job_id` 와 단계·산출물은 지은 작업의 것이다. 동시 병합의 결과는 `deduplicated: true`, `reused: false`.
 - 리뷰 화면이 켜져 있으면(`[web].enabled`) `job_url` 을 싣는다. 꺼져 있으면 싣지 않는다.
 - 산출물은 `resource_link` 블록으로도 싣는다.
 
@@ -469,7 +472,7 @@ recipe_edit(새 브랜치)  ──>  [open]  ──recipe_close──>  [closed]
 | collecting | working | `산출물 수집 1/1` |
 | cancelling | working | `취소 중 — fixture 내리는 중(admin-a 요청)` |
 | done | completed | — |
-| merged | (따르는 작업의 상태) | `j000118 과 같은 요청 — 그 작업을 따른다` |
+| merged | (따르는 작업의 상태) | `j000118 과 같은 요청 — 그 작업을 따른다` / 다시 쓰기면 completed(§8.3) |
 | cancelled | cancelled | `admin-a 가 취소함` / `요청한 task 가 모두 떨어짐` |
 | queue_timeout | cancelled | `12시간 동안 시작하지 못해 취소함` |
 | interrupted | completed(`isError: true`) | `서비스 재시작으로 중단됨` |
@@ -576,8 +579,15 @@ intake --> provisioning --> ready --> running --> collecting --> done(verdict)
 ### 8.3 대기열
 
 - **순서**: 러너 하나. `ready` 작업을 요청 시각 순서로.
-- **중복 병합 — 접수 끝에서 한 번**: 키 `(project, commit, 형제 커밋들, 레시피 커밋·sha256, 도구, 정렬한 steps·tags·artifacts, 기본값을 채운 params, clean)` 이 같은 작업이 `ready`·`running` 이면 이 작업을 `merged` 로 끝내고 task 들을 그 작업에 붙인다. 키에 결과를 바꾸는 입력이 모두 들어 있으므로 같은 결과다. 끝난 작업과는 병합하지 않는다. 병합된 결과에는 `deduplicated: true` 와 따르는 작업 번호.
+- **중복 병합 — 접수 끝에서 한 번**: 키 `(project, commit, 형제 커밋들, 레시피 커밋·sha256, 도구, 정렬한 steps·tags·artifacts, 기본값을 채운 params, clean)` 이 같은 작업이 `ready`·`running` 이면 이 작업을 `merged` 로 끝내고 task 들을 그 작업에 붙인다. 키에 결과를 바꾸는 입력이 모두 들어 있으므로 같은 결과다. 병합된 결과에는 `deduplicated: true` 와 따르는 작업 번호.
   - 호출 시점(커밋 확정 전)의 병합은 하지 않는다 — push 직후 다시 요청한 사람에게 옛 커밋의 결과를 주게 되기 때문이다.
+- **끝난 빌드 다시 쓰기 — 병합보다 먼저, 접수 끝에서**: 같은 커밋을 다시 짓지 않고 남아 있는 산출물을 준다.
+  - 키(`reuse_key`)는 **계획**에서 만든다: `(project, commit, 형제 커밋들, 레시피 sha256, 도구, setup·단계 id, 정렬한 산출물, 기본값을 채운 params, 툴체인 버전, clean)`. 호출 인자가 아니라 계획이라, 기본 산출물을 이름으로 대도 같은 빌드다. 레시피는 `main` 커밋이 아니라 그 프로젝트가 읽는 파일의 sha256(§6.2) — 다른 프로젝트의 레시피를 반영해도 이 프로젝트의 빌드는 낡지 않는다.
+  - 대상: 계획의 단계가 **전부 `build`·`package`** 이고 fixture 가 없는 작업. test·scenario 는 부를 때마다 다시 돈다(다시 돌리려고 부르는 일이 많고, 결과가 바깥 상태에 기댄다). 시도 실행(반영 조건이 그 실행을 센다)과 업로드를 받는 작업(§11.7)은 키를 갖지 않는다.
+  - 원본: 키가 같고 `done`·`pass` 이며 산출물이 **전부 남아 있는**(지우지 않았고, 파일이 있고, 링크 수명 1시간 안에 만료되지 않는) 작업 중 가장 최근 것. 없으면 병합·실행으로 넘어간다.
+  - 다시 쓰면 이 작업은 `merged`(`reason_code = reused`, `merged_into` = 원본)로 끝나고 task 들이 원본으로 옮겨 간다 — 병합과 같은 길이라 `tasks/get`·`job_status`·`artifacts`·`job_log` 가 원본을 보인다. 결과 표시는 §7.4. 원본의 **작업 레코드는 이 작업만큼, 산출물은 이때부터 보관 기간만큼** 더 남긴다(레코드보다 길게는 아니다). 확인과 연장은 한 트랜잭션이다 — 정리기와 경합해도 지워진 산출물을 주지 않는다.
+  - `rebuild: true` 면 건너뛴다. 이렇게 새로 지은 빌드도 다음 요청의 원본이 된다(가장 최근 것이 먼저).
+  - 다시 쓰지 않아야 하는데 키로는 보이지 않는 변화 — 빌드 비밀 값, `cimon.toml`, 빌드 머신의 base 도구, cimon 버전 — 뒤에 새로 지으려면 `rebuild: true`.
 - **시작 전 작업의 상한**: 아무도 보지 않아도 유지한다(원칙 5). 시작 전 상태로 12시간(`max_queue_hours`)을 넘기면 `queue_timeout`. 사용자당 시작 전 작업이 5개(`max_queued_per_user`) 이상이면 새 호출을 `queue_full` 로 거절.
 - 디스크 여유가 하한 아래면 정리기를 먼저 돌리고, 그래도 모자라면 거절.
 
@@ -846,6 +856,7 @@ CREATE TABLE jobs (
   request_json     TEXT NOT NULL,
   plan_json        TEXT,                         -- 선택·닫기·제외 결과(시도 실행 조건 계산에 쓴다)
   merge_key        TEXT,                         -- §8.3 — 접수 끝에 채운다
+  reuse_key        TEXT,                         -- §8.3 다시 쓰기 — 대상이 아닌 작업은 NULL
   merged_into      INTEGER REFERENCES jobs(id),
   state            TEXT NOT NULL,                -- intake | provisioning | ready | running | collecting | cancelling
                                                  -- | done | merged | cancelled | queue_timeout | interrupted
@@ -866,6 +877,7 @@ CREATE TABLE jobs (
 );
 CREATE INDEX jobs_ready ON jobs(state, created_at);
 CREATE INDEX jobs_merge ON jobs(merge_key) WHERE state IN ('ready','running');
+CREATE INDEX jobs_reuse ON jobs(reuse_key) WHERE state = 'done';  -- 이 열 이전 DB 는 열면 ALTER TABLE 로 더한다
 CREATE INDEX jobs_trial ON jobs(project, recipe_ref, recipe_commit) WHERE trial = 1;
 
 CREATE TABLE tasks (                             -- 호출 하나 = task 하나(§7.5)
@@ -1177,8 +1189,8 @@ login_code_minutes = 5
 
 | 대상 | 지우는 때 |
 |---|---|
-| 산출물 | 7일(`project.toml` `retention_days` 로 프로젝트별) |
-| 작업 레코드·task·단계·단계 로그 | 30일(= `ttlMs`). 지운 로그는 `job_log` 가 「만료」 를 답한다 |
+| 산출물 | 7일(`project.toml` `retention_days` 로 프로젝트별). 다시 쓰이면(§8.3) 그때부터 다시 |
+| 작업 레코드·task·단계·단계 로그 | 30일(= `ttlMs`). 다시 쓰인 작업은 다시 쓴 작업만큼 더. 지운 로그는 `job_log` 가 「만료」 를 답한다 |
 | 레시피 체크아웃 `recipes\<commit>\` | 끝나지 않은 작업이 안 쓰고 7일 안 쓰임 |
 | 닫힌 제안의 커밋 `refs/cimon/closed/<id>` | 30일. 제안·댓글 레코드는 남긴다 |
 | 열린 제안 | 30일 동안 커밋·시도 실행 없음 → 자동 닫기 |
@@ -1297,6 +1309,7 @@ login_code_minutes = 5
 | 2026-10-26 | `scaffold_recipe`·프로젝트 레시피는 형식만, 구현은 2단계 | 1단계에 쓰는 곳이 없다 |
 | 2026-10-26 | 리뷰 화면은 보기·토론·반영 전용, 의미 차이가 중심. 줄 댓글·좌우 보기·구문 강조는 뺀다. 처음의 「PR 화면 없음 — `recipe_diff` 로 대신」 을 대체한다 | 편집은 한 곳에서. 여러 프로젝트에 걸친 변경을 사람이 훑어보기에는 화면이 낫다. 1단계 규모에 맞게 |
 | 2026-10-26 | 리뷰 화면 로그인은 MCP 가 발급하는 일회용 링크 | 브라우저에 Bearer 토큰을 넣지 않는다. 신원 헤더는 로컬 프로세스가 꾸밀 수 있다 |
+| 2026-11-07 | 끝난 빌드를 다시 쓴다 — 접수 끝에서, 통과한 build·package 만, 기본 켜짐, `rebuild: true` 로 끈다. 처음의 「끝난 작업과는 병합하지 않는다」 를 대체한다 | 같은 커밋의 빌드를 여러 사람이 받는 일이 흔하고 빌드는 길다. 커밋을 확정한 뒤라 push 직후 요청에 옛 결과를 주지 않는다. 시험은 다시 돌리려고 부르는 일이 많아 넣지 않았다 |
 
 ---
 

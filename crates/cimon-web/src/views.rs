@@ -515,7 +515,7 @@ pub fn project(app: &App, s: &Session, rref: &str, commit: &str, r: &cimon_recip
 }
 
 pub fn job(app: &App, s: &Session, j: &cimon_store::JobRow) -> Markup {
-    let view = if j.state.is_terminal() && j.result_json.is_some() { cimon_engine::result::view(app, j, None, &s.user) } else { cimon_engine::result::progress(app, j) };
+    let view = if j.state.is_terminal() && j.result_json.is_some() { cimon_engine::result::view(app, j, None, None, &s.user) } else { cimon_engine::result::progress(app, j) };
     let may_see = cimon_engine::uploads::may_see_outputs(app, j, &s.user);
     let steps = view["steps"].as_array().cloned().unwrap_or_default();
     let first_bad = steps.iter().find(|st| matches!(st["result"].as_str(), Some("fail") | Some("inconclusive"))).and_then(|st| st["id"].as_str().map(str::to_string));

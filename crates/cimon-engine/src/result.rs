@@ -81,21 +81,50 @@ pub fn build_with_steps(
     v
 }
 
-/// The stored result with fresh artifact links (for a viewer who may have them — design
-/// §11.7), task-specific fields and the web link.
-pub fn view(app: &App, job: &JobRow, task_id: Option<&str>, viewer: &cimon_core::AuthUser) -> Value {
-    let mut v: Value = job.result_json.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| json!({}));
-    if let Some(t) = task_id {
-        v["task_id"] = json!(t);
-        if let Ok(Some(origin)) = app.store.task_origin_job(t) {
-            if origin != job.id {
-                v["deduplicated"] = json!(true);
-                v["follows_job"] = json!(job_label(job.id));
-            }
+/// `reason_code` of a job that ended by taking a finished job's result (design §8.3).
+pub const REUSED: &str = "reused";
+
+/// Follows `merged` jobs to the job whose result they share (design §8.3). Returns
+/// the job itself when it was not merged.
+pub fn follow(app: &App, job: JobRow) -> JobRow {
+    let mut job = job;
+    for _ in 0..5 {
+        match job.merged_into {
+            Some(into) if job.state == cimon_core::JobState::Merged => match app.store.job(into) {
+                Ok(Some(j)) => job = j,
+                _ => break,
+            },
+            _ => break,
         }
     }
-    if v.get("deduplicated").is_none() {
-        v["deduplicated"] = json!(false);
+    job
+}
+
+/// The stored result with fresh artifact links (for a viewer who may have them — design
+/// §11.7), task-specific fields and the web link. `asked` is the job the caller named
+/// when that job follows `job` (merged or reused); with a task id, the task's own job.
+pub fn view(app: &App, job: &JobRow, task_id: Option<&str>, asked: Option<i64>, viewer: &cimon_core::AuthUser) -> Value {
+    let mut v: Value = job.result_json.as_deref().and_then(|r| serde_json::from_str(r).ok()).unwrap_or_else(|| json!({}));
+    let mut origin = asked;
+    if let Some(t) = task_id {
+        v["task_id"] = json!(t);
+        origin = app.store.task_origin_job(t).ok().flatten();
+    }
+    v["deduplicated"] = json!(false);
+    v["reused"] = json!(false);
+    if let Some(o) = origin.filter(|o| *o != job.id) {
+        v["deduplicated"] = json!(true);
+        v["follows_job"] = json!(job_label(job.id));
+        if app.store.job(o).ok().flatten().is_some_and(|j| j.reason_code.as_deref() == Some(REUSED)) {
+            let built = job.finished_at.clone().unwrap_or_default();
+            v["reused"] = json!(true);
+            v["built_at"] = json!(built);
+            let s = v["summary"].as_str().unwrap_or_default().to_string();
+            v["summary"] = json!(format!(
+                "{s} · 새로 빌드하지 않았다 — {} 이 {built} 에 같은 커밋·레시피·단계로 지은 결과다. 다시 지으려면 rebuild: true",
+                job_label(job.id)
+            ));
+        }
     }
     let arts = if crate::uploads::may_see_outputs(app, job, viewer) {
         crate::artifacts::listing(app, job)

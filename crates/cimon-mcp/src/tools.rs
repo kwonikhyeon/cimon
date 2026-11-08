@@ -77,6 +77,7 @@ fn run_args_schema(with_tool: bool) -> Value {
         "artifacts": {"type": "array", "items": {"type": "string"}, "description": "받을 산출물 이름. [] 면 수집 안 함"},
         "params": {"type": "object", "description": "레시피에 선언된 파라미터만"},
         "clean": {"type": "boolean", "description": "warm 트리 대신 일회 클론"},
+        "rebuild": {"type": "boolean", "description": "같은 커밋·레시피·단계로 통과한 빌드가 남아 있어도 새로 짓는다(기본은 그 결과를 다시 준다)"},
         "uploads": {
             "type": "object",
             "additionalProperties": {"type": "string"},
@@ -103,7 +104,11 @@ pub(crate) fn definitions(_app: &App) -> Vec<Tool> {
             json!({"type": "object", "properties": {"project": {"type": "string"}, "recipe_ref": {"type": "string"}}, "required": ["project"], "additionalProperties": false}),
         ),
         tool("plan", "build/test/run 이 무엇을 할지 실행 없이(프로젝트를 fetch 하지 않는다).", run_args_schema(true)),
-        tool("build", "build·package 단계를 돌린다(task). 기본은 default = true 인 build. 끝나면 판정·요약·산출물 링크.", run_args_schema(false)),
+        tool(
+            "build",
+            "build·package 단계를 돌린다(task). 기본은 default = true 인 build. 끝나면 판정·요약·산출물 링크. 같은 커밋·레시피·단계·산출물·파라미터로 통과한 빌드의 산출물이 남아 있으면 새로 짓지 않고 그 결과를 바로 준다(reused: true) — 새로 지으려면 rebuild: true.",
+            run_args_schema(false),
+        ),
         tool("test", "test·scenario 단계를 돌린다(task). 기본은 default = true 인 test. 필요한 빌드는 after 로 따라온다.", run_args_schema(false)),
         tool("run", "build·package·test·scenario 를 한 작업으로(task). 기본은 기본 build + 기본 test.", run_args_schema(false)),
         tool("job_status", "작업의 상태·판정·요약·경고. job 은 j000123 또는 task id.", job_schema()),
@@ -271,17 +276,23 @@ fn call_blocking(app: &Arc<App>, user: &cimon_core::AuthUser, name: &str, args: 
             ok_structured(v)
         }
         "job_status" => {
-            let job = find_job(app, &args)?;
+            let asked = find_job(app, &args)?;
+            let asked_id = asked.id;
+            let job = cimon_engine::result::follow(app, asked);
             let task = task_arg(&args);
             ok_structured(if job.state.is_terminal() && job.result_json.is_some() {
-                cimon_engine::result::view(app, &job, task.as_deref(), user)
+                cimon_engine::result::view(app, &job, task.as_deref(), Some(asked_id), user)
             } else {
-                cimon_engine::result::progress(app, &job)
+                let mut p = cimon_engine::result::progress(app, &job);
+                if job.id != asked_id {
+                    p["follows_job"] = json!(cimon_core::job_label(job.id));
+                }
+                p
             })
         }
         "job_log" => job_log(app, user, args),
         "artifacts" => {
-            let job = find_job(app, &args)?;
+            let job = cimon_engine::result::follow(app, find_job(app, &args)?);
             outputs_allowed(app, &job, user)?;
             let list = cimon_engine::artifacts::listing(app, &job);
             let n = list.len();
@@ -358,7 +369,7 @@ fn job_log(app: &App, user: &cimon_core::AuthUser, args: Value) -> ToolResult {
         grep: Option<String>,
     }
     let a: A = parse(args.clone())?;
-    let job = find_job(app, &args)?;
+    let job = cimon_engine::result::follow(app, find_job(app, &args)?);
     let steps = app.store.steps(job.id)?;
     let Some(step) = a.step else {
         let list: Vec<Value> = steps.iter().map(|s| json!({"step": s.step_id, "result": s.result})).collect();
@@ -538,7 +549,7 @@ pub(crate) fn get_task(app: &Arc<App>, user: &cimon_core::AuthUser, task_id: &st
         Intake | Provisioning | Ready | Running | Collecting | Cancelling | Merged => DetailedTask::new(base(TaskStatus::Working, status_msg), TaskPayload::Working),
         Cancelled | QueueTimeout => DetailedTask::new(base(TaskStatus::Cancelled, status_msg), TaskPayload::Cancelled),
         Done | Interrupted => {
-            let view = cimon_engine::result::view(app, &job, Some(task_id), user);
+            let view = cimon_engine::result::view(app, &job, Some(task_id), None, user);
             let result = completion_result(&view);
             let obj = match serde_json::to_value(&result).unwrap_or_default() {
                 Value::Object(m) => m,
