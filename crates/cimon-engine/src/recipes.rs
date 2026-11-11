@@ -63,6 +63,9 @@ pub struct RunArgs {
     /// `[upload.<name>]` → the handle `POST /uploads` returned (design §11.7).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub uploads: BTreeMap<String, String>,
+    /// Build anew even when a passing build of the same inputs is still kept (design §8.3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rebuild: bool,
     /// only for `plan`
     #[serde(default)]
     pub tool: Option<String>,
@@ -73,6 +76,36 @@ impl RunArgs {
     /// (design §11.7), whatever the call said.
     pub fn effective_clean(&self, plan: &Plan) -> bool {
         self.clean || !plan.uploads.is_empty()
+    }
+}
+
+/// Why a job's passing result is never handed to a later request (design §8.3) — `None`
+/// when it can be. Only builds are reused: a test is usually asked for to run again,
+/// a fixture depends on state outside the build, a trial run exists to be run, and a
+/// job that took uploads is its caller's alone.
+pub fn not_reusable(plan: &Plan, trial: bool, args: &RunArgs) -> Option<&'static str> {
+    use cimon_recipe::Kind;
+    if trial {
+        return Some("시도 실행은 언제나 새로 돈다");
+    }
+    if !args.uploads.is_empty() || !plan.uploads.is_empty() {
+        return Some("업로드를 받는 작업은 그 호출자만의 것이다");
+    }
+    if plan.steps.iter().any(|s| !matches!(s.kind, Kind::Build | Kind::Package)) {
+        return Some("test·scenario 단계는 부를 때마다 다시 돈다");
+    }
+    if !plan.fixtures.is_empty() {
+        return Some("fixture 를 띄우는 작업은 바깥 상태에 기대므로 다시 돈다");
+    }
+    None
+}
+
+/// What `plan` says about reuse (design §8.3).
+pub fn reuse_note(plan: &Plan, trial: bool, args: &RunArgs) -> String {
+    match not_reusable(plan, trial, args) {
+        Some(why) => format!("새로 돈다 — {why}"),
+        None if args.rebuild => "새로 짓는다 — rebuild: true".into(),
+        None => "같은 커밋·레시피·단계·산출물·파라미터로 통과한 빌드의 산출물이 남아 있으면 새로 짓지 않고 그 결과를 준다(커밋은 접수 때 확정). 새로 지으려면 rebuild: true".into(),
     }
 }
 
@@ -302,6 +335,7 @@ pub fn plan(app: &App, user: &str, args: &RunArgs) -> Result<Value, Rejection> {
         "toolchains": toolchains,
         "secrets": secrets,
         "unknown": unknowns,
+        "reuse": reuse_note(plan, v.trial, args),
         "summary": summary,
     });
     if !plan.uploads.is_empty() {

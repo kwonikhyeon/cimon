@@ -414,11 +414,18 @@ pub fn intake_one(app: &Arc<App>, id: i64) {
     let job_plan = JobPlan { plan: plan.clone(), versions, siblings: siblings.clone(), repo: project.repo.clone(), notes };
     let trial_secrets = job.trial && crate::build_secrets::trial_gets_secrets(app, &job.created_by);
     let merge_key = merge_key(&job, &commit, &siblings, &plan, request.args.clean, &request.args, trial_secrets);
-    let _ = app.store.set_intake(id, &commit, &serde_json::to_string(&siblings).unwrap(), &serde_json::to_string(&job_plan).unwrap(), &merge_key);
+    let reuse_key = reuse_key(&job, &commit, &job_plan, &request.args);
+    let _ = app.store.set_intake(id, &commit, &serde_json::to_string(&siblings).unwrap(), &serde_json::to_string(&job_plan).unwrap(), &merge_key, reuse_key.as_deref());
     let _ = app.store.set_excluded(id, &plan.excluded);
     drop(_mirror_guard);
     if abandon_if_unwanted(app, id) {
         return;
+    }
+    // a build already made from the same inputs: hand that out instead of building
+    if let Some(k) = reuse_key.as_deref().filter(|_| !request.args.rebuild) {
+        if try_reuse(app, id, k, &project, &plan.artifacts) {
+            return;
+        }
     }
     if try_merge(app, id, &merge_key) {
         return;
@@ -460,6 +467,70 @@ fn try_merge(app: &App, id: i64, merge_key: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Hands `id` the result of the newest passing job with the same reuse key whose
+/// artifacts are all still kept (design §8.3): `id` ends `merged` into it with
+/// `reason_code = reused`, its tasks move there as in a merge, and the result says the
+/// build was reused. The source's record and artifacts are kept on from now.
+fn try_reuse(app: &App, id: i64, key: &str, project: &ProjectFile, artifacts: &[String]) -> bool {
+    let Ok(sources) = app.store.reuse_sources(key, id) else { return false };
+    let retention = project.retention_days.map(|d| d as i64).unwrap_or(crate::artifacts::RETENTION_DAYS);
+    for from in sources {
+        let Ok(rows) = app.store.artifacts(from) else { continue };
+        // the files themselves, not only their rows — a link to a missing file is a 410
+        let live = |name: &String| rows.iter().any(|a| &a.name == name && a.deleted_at.is_none() && std::path::Path::new(&a.path).is_file());
+        if !artifacts.iter().all(live) {
+            continue;
+        }
+        let Ok(Some(src)) = app.store.job(from) else { continue };
+        let msg = format!(
+            "{} 이 {} 에 같은 커밋·레시피·단계로 지은 결과를 다시 쓴다 — 새로 빌드하지 않음",
+            job_label(from),
+            src.finished_at.as_deref().unwrap_or("?")
+        );
+        // an artifact due within the link lifetime is not handed out: the janitor may be at it
+        match app.store.reuse_job(id, from, &msg, &after_secs(crate::artifacts::LINK_SECS), &after_secs(retention * 86400)) {
+            Ok(true) => {
+                if let Ok(Some(j)) = app.store.job(id) {
+                    release_keeps(app, &j);
+                }
+                return true;
+            }
+            Ok(false) => continue,
+            Err(e) => {
+                tracing::warn!("reuse of {} for {}: {e}", job_label(from), job_label(id));
+                return false;
+            }
+        }
+    }
+    false
+}
+
+/// Reuse key (design §8.3): what decides a build's outputs, read from the plan rather
+/// than the call — `build` and `build` naming the default artifacts are the same build.
+/// The recipe enters by its digest, not by main's commit: promoting another project's
+/// recipe does not make this one's builds stale. `None` for a job that is never reused.
+fn reuse_key(job: &cimon_store::JobRow, commit: &str, jp: &JobPlan, args: &RunArgs) -> Option<String> {
+    if recipes::not_reusable(&jp.plan, job.trial, args).is_some() {
+        return None;
+    }
+    let mut artifacts = jp.plan.artifacts.clone();
+    artifacts.sort();
+    let v = json!({
+        "project": job.project_key,
+        "commit": commit,
+        "siblings": jp.siblings.iter().map(|s| (&s.project, &s.commit)).collect::<Vec<_>>(),
+        "recipe_sha256": job.recipe_sha256.as_deref()?,
+        "tool": job.tool,
+        "setup": jp.plan.setup,
+        "steps": jp.plan.step_ids(),
+        "artifacts": artifacts,
+        "params": jp.plan.params,
+        "toolchains": jp.versions,
+        "clean": args.clean,
+    });
+    Some(cimon_core::sha256_hex(v.to_string().as_bytes()))
 }
 
 /// Merge key (design §8.3): everything that changes the result.

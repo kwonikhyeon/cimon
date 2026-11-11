@@ -288,11 +288,12 @@ impl Store {
         Ok(())
     }
 
-    /// Records what intake decided: the pinned commit, siblings, plan and merge key.
-    pub fn set_intake(&self, id: i64, commit: &str, siblings_json: &str, plan_json: &str, merge_key: &str) -> Result<()> {
+    /// Records what intake decided: the pinned commit, siblings, plan, merge key and —
+    /// for a job whose passing result may be handed to a later request — reuse key.
+    pub fn set_intake(&self, id: i64, commit: &str, siblings_json: &str, plan_json: &str, merge_key: &str, reuse_key: Option<&str>) -> Result<()> {
         self.conn().execute(
-            "UPDATE jobs SET commit_sha = ?2, siblings_json = ?3, plan_json = ?4, merge_key = ?5, last_updated_at = ?6 WHERE id = ?1",
-            params![id, commit, siblings_json, plan_json, merge_key, now()],
+            "UPDATE jobs SET commit_sha = ?2, siblings_json = ?3, plan_json = ?4, merge_key = ?5, reuse_key = ?6, last_updated_at = ?7 WHERE id = ?1",
+            params![id, commit, siblings_json, plan_json, merge_key, reuse_key, now()],
         )?;
         Ok(())
     }
@@ -404,6 +405,61 @@ impl Store {
                 return Ok(false);
             }
             tx.execute("UPDATE tasks SET job_id = ?2 WHERE job_id = ?1", params![id, into])?;
+            Ok(true)
+        })
+    }
+
+    /// Finished passing jobs with the same reuse key, newest first (design §8.3).
+    pub fn reuse_sources(&self, reuse_key: &str, id: i64) -> Result<Vec<i64>> {
+        let c = self.conn();
+        let mut st = c.prepare(
+            "SELECT id FROM jobs WHERE reuse_key = ?1 AND id <> ?2 AND state = 'done' AND verdict = 'pass'
+               ORDER BY finished_at DESC, id DESC LIMIT 5",
+        )?;
+        let rows = st.query_map(params![reuse_key, id], |r| r.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Ends `id` as following the finished job `from`, whose result it reuses, and moves
+    /// its tasks there — only if, inside the same transaction, `id` is still pre-start
+    /// without a cancel request, `from` is still a pass, and none of `from`'s artifacts
+    /// is deleted or due before `min_left`. The reuse counts as a use: `from`'s record is
+    /// kept at least as long as `id`'s, and its artifacts until `artifacts_until` (never
+    /// past the record). Returns whether the reuse happened.
+    pub fn reuse_job(&self, id: i64, from: i64, status: &str, min_left: &str, artifacts_until: &str) -> Result<bool> {
+        self.tx(|tx| {
+            let t = now();
+            let source_ok: i64 = tx.query_row("SELECT COUNT(*) FROM jobs WHERE id = ?1 AND state = 'done' AND verdict = 'pass'", [from], |r| r.get(0))?;
+            if source_ok == 0 {
+                return Ok(false);
+            }
+            let gone: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM artifacts WHERE job_id = ?1 AND (deleted_at IS NOT NULL OR expires_at < ?2)",
+                params![from, min_left],
+                |r| r.get(0),
+            )?;
+            if gone > 0 {
+                return Ok(false);
+            }
+            let n = tx.execute(
+                "UPDATE jobs SET state = 'merged', merged_into = ?2, reason_code = 'reused', status_message = ?3, finished_at = ?4, last_updated_at = ?4
+                 WHERE id = ?1 AND state IN ('intake','provisioning','ready') AND cancel_requested_by IS NULL",
+                params![id, from, status, t],
+            )?;
+            if n == 0 {
+                return Ok(false);
+            }
+            tx.execute("UPDATE tasks SET job_id = ?2 WHERE job_id = ?1", params![id, from])?;
+            // the reusing task must not lose its record before its own ttl
+            tx.execute(
+                "UPDATE jobs SET expires_at = MAX(expires_at, (SELECT expires_at FROM jobs WHERE id = ?2)) WHERE id = ?1",
+                params![from, id],
+            )?;
+            tx.execute(
+                "UPDATE artifacts SET expires_at = MAX(expires_at, MIN(?2, (SELECT expires_at FROM jobs WHERE id = ?1)))
+                 WHERE job_id = ?1 AND deleted_at IS NULL",
+                params![from, artifacts_until],
+            )?;
             Ok(true)
         })
     }
@@ -896,11 +952,11 @@ mod tests {
         let a = s.insert_job_with_task(&new_job("u"), "t1", true, None).unwrap();
         let b = s.insert_job_with_task(&new_job("u"), "t2", true, None).unwrap();
         assert_eq!(s.count_pre_start_by_user("u").unwrap(), 2);
-        s.set_intake(a, "c1", "[]", "{}", "k").unwrap();
+        s.set_intake(a, "c1", "[]", "{}", "k", None).unwrap();
         assert!(s.transition(a, &[JobState::Intake], JobState::Ready, "대기").unwrap());
         // a transition from the wrong state does not apply
         assert!(!s.transition(a, &[JobState::Intake], JobState::Running, "x").unwrap());
-        s.set_intake(b, "c1", "[]", "{}", "k").unwrap();
+        s.set_intake(b, "c1", "[]", "{}", "k", None).unwrap();
         assert_eq!(s.merge_target("k", b).unwrap(), Some(a));
         assert!(s.merge_job(b, a, "merged").unwrap());
         assert_eq!(s.tasks_for_job(a).unwrap().len(), 2);
@@ -934,6 +990,80 @@ mod tests {
         // and a cancelled job does not leave pre-start by transition
         s.request_cancel(b, "u").unwrap();
         assert!(!s.transition(b, &[JobState::Intake], JobState::Provisioning, "").unwrap());
+    }
+
+    fn artifact(job: i64, name: &str, expires_at: String) -> ArtifactRow {
+        ArtifactRow {
+            job_id: job,
+            name: name.into(),
+            path: format!("a/{name}"),
+            bytes: 1,
+            sha256: "00".into(),
+            inspect_json: None,
+            created_at: now(),
+            expires_at,
+            deleted_at: None,
+        }
+    }
+
+    #[test]
+    fn reuse_takes_only_a_live_pass_and_extends_what_it_hands_out() {
+        let s = Store::open_in_memory().unwrap();
+        let a = s.insert_job_with_task(&new_job("u"), "ta", true, None).unwrap();
+        s.set_intake(a, "c1", "[]", "{}", "m", Some("r")).unwrap();
+        // not a source while it runs
+        assert!(s.reuse_sources("r", 0).unwrap().is_empty());
+        assert!(s.finish_job(a, JobState::Done, Some("pass"), None, None, "", "ok", "[]", "{}").unwrap());
+        s.insert_artifact(&artifact(a, "app", cimon_core::after_secs(7200))).unwrap();
+        let b = s.insert_job_with_task(&NewJob { expires_at: cimon_core::after_secs(30 * 86400), ..new_job("v") }, "tb", true, None).unwrap();
+        s.set_intake(b, "c1", "[]", "{}", "m", Some("r")).unwrap();
+        assert_eq!(s.reuse_sources("r", b).unwrap(), vec![a]);
+
+        // an artifact due before the margin is not handed out
+        assert!(!s.reuse_job(b, a, "reused", &cimon_core::after_secs(3 * 3600), &cimon_core::after_secs(7 * 86400)).unwrap());
+        assert_eq!(s.require_job(b).unwrap().state, JobState::Intake);
+
+        assert!(s.reuse_job(b, a, "reused", &cimon_core::after_secs(3600), &cimon_core::after_secs(7 * 86400)).unwrap());
+        let jb = s.require_job(b).unwrap();
+        assert_eq!((jb.state, jb.merged_into, jb.reason_code.as_deref()), (JobState::Merged, Some(a), Some("reused")));
+        assert_eq!(s.task("tb").unwrap().unwrap().job_id, a, "the task follows the source");
+        assert_eq!(s.task_origin_job("tb").unwrap(), Some(b));
+        let ja = s.require_job(a).unwrap();
+        assert!(ja.expires_at >= jb.expires_at, "the source record outlives the reusing task: {} < {}", ja.expires_at, jb.expires_at);
+        let until = s.artifact(a, "app").unwrap().unwrap().expires_at;
+        assert!(until > cimon_core::after_secs(6 * 86400), "artifact retention restarts at the reuse: {until}");
+        // a merged (reusing) job is never a source itself
+        assert!(s.reuse_sources("r", 0).unwrap() == vec![a]);
+
+        // a deleted artifact, a cancelled request or a failed source: no reuse
+        let c = s.insert_job_with_task(&new_job("u"), "tc", true, None).unwrap();
+        s.mark_artifact_deleted(a, "app").unwrap();
+        assert!(!s.reuse_job(c, a, "reused", &now(), &cimon_core::after_secs(86400)).unwrap());
+        let d = s.insert_job_with_task(&new_job("u"), "td", true, None).unwrap();
+        let e = s.insert_job_with_task(&new_job("u"), "te", true, None).unwrap();
+        assert!(s.finish_job(d, JobState::Done, Some("fail"), Some("code"), None, "", "x", "[]", "{}").unwrap());
+        assert!(!s.reuse_job(e, d, "reused", &now(), &cimon_core::after_secs(86400)).unwrap());
+        s.request_cancel(c, "u").unwrap();
+        s.insert_artifact(&artifact(a, "app", cimon_core::after_secs(86400))).unwrap();
+        assert!(!s.reuse_job(c, a, "reused", &now(), &cimon_core::after_secs(86400)).unwrap());
+    }
+
+    #[test]
+    fn an_old_database_gets_the_reuse_column() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("old.db");
+        {
+            // the jobs table as schema 1 first shipped it (no reuse_key)
+            let c = rusqlite::Connection::open(&p).unwrap();
+            let old = include_str!("schema.sql").lines().filter(|l| !l.contains("reuse_key")).collect::<Vec<_>>().join("\n");
+            c.execute_batch(&old).unwrap();
+        }
+        let s = Store::open(&p).unwrap();
+        let a = s.insert_job_with_task(&new_job("u"), "ta", true, None).unwrap();
+        s.set_intake(a, "c1", "[]", "{}", "m", Some("r")).unwrap();
+        drop(s);
+        // and opening it again is a no-op
+        Store::open(&p).unwrap();
     }
 
     #[test]

@@ -244,6 +244,95 @@ async fn a_push_is_built_not_an_old_result() {
     c.cancel().await.unwrap();
 }
 
+/// A build whose inputs match a finished passing build is handed that build — no new
+/// run, live links, the record says so — until a caller asks to rebuild, the inputs
+/// differ, the request runs tests, or the kept artifacts are gone (design §8.3).
+#[tokio::test]
+async fn a_passing_build_is_reused_until_asked_to_rebuild() {
+    let h = setup("m2reuse").await;
+    let a = h.task_client(&h.member_token).await;
+    let b = h.task_client(&h.admin_token).await;
+    let args = json!({"project": "m2reuse", "artifacts": ["app.txt"]});
+    let (plan, _) = call_any(&a, "plan", json!({"project": "m2reuse", "tool": "build", "artifacts": ["app.txt"]})).await;
+    assert!(plan["reuse"].as_str().unwrap().contains("rebuild: true"), "{plan:#}");
+    let (plan, _) = call_any(&a, "plan", json!({"project": "m2reuse", "tool": "test"})).await;
+    assert!(plan["reuse"].as_str().unwrap().starts_with("새로 돈다"), "{plan:#}");
+
+    let t1 = start_task(&a, "build", args.clone()).await;
+    let (_, v1, _) = wait_task(&a, &t1, 120).await;
+    assert_eq!(v1["verdict"], "pass", "{v1:#}");
+    assert_eq!(v1["reused"], false);
+
+    // someone else, same commit and inputs: the finished build comes back without a run
+    let t2 = start_task(&b, "build", args.clone()).await;
+    let (st, v2, is_error) = wait_task(&b, &t2, 60).await;
+    assert_eq!(st, TaskStatus::Completed);
+    assert!(!is_error, "{v2:#}");
+    assert_eq!(v2["reused"], true, "{v2:#}");
+    assert_eq!(v2["deduplicated"], true);
+    assert_eq!(v2["job_id"], v1["job_id"]);
+    assert_eq!(v2["follows_job"], v1["job_id"]);
+    assert_eq!(v2["task_id"], t2.as_str());
+    assert_eq!(v2["built_at"].as_str().is_some_and(|s| !s.is_empty()), true, "{v2:#}");
+    assert!(v2["summary"].as_str().unwrap().contains("rebuild: true"), "{v2:#}");
+    assert_eq!(v2["artifacts"][0]["sha256"], v1["artifacts"][0]["sha256"]);
+    let body = reqwest::get(v2["artifacts"][0]["url"].as_str().unwrap()).await.unwrap();
+    assert_eq!(body.status(), 200);
+    let origin = h.app.store.task_origin_job(&t2).unwrap().unwrap();
+    let reusing = h.app.store.require_job(origin).unwrap();
+    assert_eq!(reusing.state, cimon_core::JobState::Merged);
+    assert_eq!(reusing.reason_code.as_deref(), Some("reused"));
+    assert!(reusing.started_at.is_none(), "it never reached the runner");
+    // a caller holding only the reusing job's id (no Tasks) reads the same result
+    let label = cimon_core::job_label(origin);
+    let (s, _) = call_any(&b, "job_status", json!({"job": label})).await;
+    assert_eq!((s["done"].clone(), s["verdict"].clone(), s["reused"].clone()), (json!(true), json!("pass"), json!(true)), "{s:#}");
+    let (arts, err) = call_any(&b, "artifacts", json!({"job": label})).await;
+    assert!(!err, "{arts:#}");
+    assert_eq!(arts["artifacts"][0]["sha256"], v1["artifacts"][0]["sha256"]);
+
+    // other artifacts are another build
+    let t = start_task(&a, "build", json!({"project": "m2reuse", "artifacts": []})).await;
+    let (_, v, _) = wait_task(&a, &t, 120).await;
+    assert_eq!((v["verdict"].clone(), v["reused"].clone()), (json!("pass"), json!(false)), "{v:#}");
+
+    // rebuild: true builds anew, and later requests get that newest build
+    let mut rebuild = args.clone();
+    rebuild["rebuild"] = json!(true);
+    let t3 = start_task(&a, "build", rebuild).await;
+    let (_, v3, _) = wait_task(&a, &t3, 120).await;
+    assert_eq!(v3["verdict"], "pass", "{v3:#}");
+    assert_eq!(v3["reused"], false);
+    assert_ne!(v3["job_id"], v1["job_id"]);
+    let t4 = start_task(&b, "build", args.clone()).await;
+    let (_, v4, _) = wait_task(&b, &t4, 60).await;
+    assert_eq!((v4["reused"].clone(), v4["job_id"].clone()), (json!(true), v3["job_id"].clone()), "{v4:#}");
+
+    // tests run every time they are asked for
+    let t5 = start_task(&a, "test", json!({"project": "m2reuse"})).await;
+    let (_, v5, _) = wait_task(&a, &t5, 120).await;
+    let t6 = start_task(&a, "test", json!({"project": "m2reuse"})).await;
+    let (_, v6, _) = wait_task(&a, &t6, 120).await;
+    assert_eq!(v6["verdict"], "pass", "{v6:#}");
+    assert_eq!(v6["reused"], false);
+    assert_ne!(v5["job_id"], v6["job_id"]);
+
+    // the newest build whose artifacts are all kept is the one handed out; with none
+    // left, it is built again
+    let job_id = |v: &serde_json::Value| cimon_core::parse_job_label(v["job_id"].as_str().unwrap()).unwrap();
+    h.app.store.mark_artifact_deleted(job_id(&v3), "app.txt").unwrap();
+    let t7 = start_task(&b, "build", args.clone()).await;
+    let (_, v7, _) = wait_task(&b, &t7, 60).await;
+    assert_eq!((v7["reused"].clone(), v7["job_id"].clone()), (json!(true), v1["job_id"].clone()), "{v7:#}");
+    h.app.store.mark_artifact_deleted(job_id(&v1), "app.txt").unwrap();
+    let t8 = start_task(&b, "build", args.clone()).await;
+    let (_, v8, _) = wait_task(&b, &t8, 120).await;
+    assert_eq!((v8["verdict"].clone(), v8["reused"].clone()), (json!("pass"), json!(false)), "{v8:#}");
+    assert!(![&v1, &v3].iter().any(|v| v["job_id"] == v8["job_id"]), "{v8:#}");
+    a.cancel().await.unwrap();
+    b.cancel().await.unwrap();
+}
+
 /// A build secret reaches the step through the env value the recipe wrote — and a
 /// missing one is the admin's to fix, not a code failure (design §11.6).
 #[tokio::test]

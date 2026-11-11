@@ -58,6 +58,12 @@ impl Store {
         conn.pragma_update(None, "synchronous", "FULL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(SCHEMA)?;
+        // columns added after schema 1 shipped: a database made before gets them here
+        // (an older cimon reading it ignores them)
+        if !has_column(&conn, "jobs", "reuse_key")? {
+            conn.execute_batch("ALTER TABLE jobs ADD COLUMN reuse_key TEXT")?;
+        }
+        conn.execute_batch("CREATE INDEX IF NOT EXISTS jobs_reuse ON jobs(reuse_key) WHERE state = 'done'")?;
         conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (v INTEGER NOT NULL)")?;
         let v: Option<i64> = conn.query_row("SELECT v FROM schema_version", [], |r| r.get(0)).optional()?;
         match v {
@@ -237,6 +243,12 @@ fn validate_user_name(name: &str) -> Result<()> {
         return Err(StoreError::Conflict(format!("user name {name:?} must be 1-64 chars of [A-Za-z0-9._-]")));
     }
     Ok(())
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut st = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = st.query_map([], |r| r.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(names.iter().any(|n| n == column))
 }
 
 pub(crate) fn opt_state(r: &Row<'_>, idx: usize) -> rusqlite::Result<JobState> {

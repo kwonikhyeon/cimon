@@ -57,7 +57,8 @@ default = false
     let c = h.task_client(&h.member_token).await;
     let v = run(&c, "build", json!({"project": "m5setup"})).await;
     assert_eq!(step(&v, "deps")["result"], "pass", "{v:#}");
-    let v = run(&c, "build", json!({"project": "m5setup"})).await;
+    // the same commit again — built anew on purpose (otherwise the first build is reused)
+    let v = run(&c, "build", json!({"project": "m5setup", "rebuild": true})).await;
     assert_eq!(step(&v, "deps")["result"], "skipped", "{v:#}");
     assert_eq!(step(&v, "deps")["reason"], "setup 생략: 변경 없음");
     // inputs change → runs again
@@ -70,7 +71,7 @@ default = false
     let slot = h.app.store.require_job(job).unwrap().workspace_slot.unwrap();
     assert!(h.app.store.warm_state("m5setup", slot, "deps").unwrap().is_some());
     h.app.store.clear_warm_state("m5setup", slot).unwrap(); // what cancel/interrupt/failure do
-    let v = run(&c, "build", json!({"project": "m5setup"})).await;
+    let v = run(&c, "build", json!({"project": "m5setup", "rebuild": true})).await;
     assert_eq!(step(&v, "deps")["result"], "pass", "cold after invalidation: {v:#}");
     // clean jobs always run setup and never touch warm state
     let v = run(&c, "build", json!({"project": "m5setup", "clean": true})).await;
