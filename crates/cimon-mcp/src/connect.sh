@@ -52,21 +52,32 @@ case "$(uname -s)" in
     [ "$(security find-generic-password -a "$USER" -s cimon -w 2>/dev/null)" = "$token" ] \
       || fail "could not store the token in the keychain"
     get='security find-generic-password -a "$USER" -s cimon -w'
+    where='the login keychain (security)'
     ;;
   *)
     if command -v secret-tool >/dev/null 2>&1; then
       printf '%s' "$token" | secret-tool store --label=cimon service cimon || fail "could not store the token with secret-tool"
       get='secret-tool lookup service cimon'
+      where='the keyring (secret-tool)'
     else
       (umask 077 && printf '%s' "$token" > "$HOME/.cimon/token")
       get='cat "$HOME/.cimon/token"'
+      where='~/.cimon/token'
       printf 'cimon connect: no keyring (secret-tool) - the token is kept in ~/.cimon/token (mode 600)\n'
     fi
     ;;
 esac
+# the header helper: when it cannot read the token it fails with the reason - an empty
+# token would only come back as the server's 401
 cat > "$HOME/.cimon/header.sh" <<EOF
 #!/bin/sh
-printf '{"Authorization":"Bearer %s"}' "\$($get)"
+# cimon header helper - Claude Code runs this for every connection (headersHelper)
+no() { printf 'cimon header helper: %s - if the token is gone, ask the cimon admin for an invite and connect again: curl -fsSL %s/connect.sh | sh\n' "\$1" '$CIMON_URL' >&2; exit 1; }
+t=\$($get) || no "cannot read the token from $where"
+case "\$t" in
+  ''|*[!A-Za-z0-9._~+/=-]*) no "the token in $where is empty or malformed" ;;
+esac
+printf '{"Authorization":"Bearer %s"}' "\$t"
 EOF
 chmod 700 "$HOME/.cimon/header.sh"
 # for steps that need a file from this machine (a signing key): sh ~/.cimon/upload.sh

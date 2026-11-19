@@ -17,8 +17,13 @@ if ($args.Count -eq 0) { Fail 'usage: upload.ps1 <name>=<file> | <name>=env:<VAR
 # the token through the same header helper Claude Code uses
 $helper = Join-Path $env:USERPROFILE '.cimon\header.ps1'
 if (-not (Test-Path $helper)) { Fail "no $helper - connect this PC first: irm $CimonUrl/connect.ps1 | iex" }
-$auth = (& "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $helper | Out-String | ConvertFrom-Json).Authorization
-if (-not $auth) { Fail "$helper printed no Authorization header" }
+$out = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $helper | Out-String
+if ($LASTEXITCODE -ne 0) { Fail "$helper failed (exit $LASTEXITCODE) - its message is above" }
+$auth = $null
+try { $auth = ($out | ConvertFrom-Json).Authorization } catch {}
+Remove-Variable out
+# an older helper prints "Bearer " with nothing after it when it cannot read the token
+if ($auth -notmatch '^Bearer \S') { Fail "$helper printed no token - replace it with the server's: irm $CimonUrl/header.ps1 -OutFile $helper" }
 
 $handles = [ordered]@{}
 foreach ($item in $args) {

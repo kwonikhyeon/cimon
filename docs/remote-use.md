@@ -39,7 +39,7 @@ curl -fsSL https://cimon.<tailnet>.ts.net/connect.sh | sh
 
 1. 초대 코드를 서버에 내고 이 기기용 토큰을 받는다 — 토큰은 화면에도 메신저에도 나오지 않는다.
 2. 토큰을 Windows 는 DPAPI 파일(`%USERPROFILE%\.cimon\token.dpapi`), macOS 는 키체인, Linux 는 `secret-tool`(없으면 권한 600 파일)에 둔다.
-3. 헤더 도우미(`header.ps1` / `header.sh`)를 쓰고 `claude mcp add-json --scope user cimon …` 로 등록한다(이전 등록은 바꾼다).
+3. 헤더 도우미를 둔다 — Windows 는 서버가 내주는 `header.ps1`, macOS·Linux 는 `header.sh`. Windows 는 Claude Code 가 부를 때처럼 한 번 돌려 방금 받은 토큰이 나오는지 확인한다. 그다음 `claude mcp add-json --scope user cimon …` 로 등록한다(이전 등록은 바꾼다).
 4. `claude mcp get cimon` 으로 등록 내용과 연결(Connected)을 확인한다 — 어긋나면 「done」 대신 실패로 끝난다.
 
 `done - signed in as <이름>` 이 나오면 「3. 확인」 으로 간다. 코드는 대소문자·`-` 를 가리지 않고, `O`/`0`·`I`/`1` 을 헷갈려도 된다. 자동 설치 스크립트에서는 코드를 `CIMON_INVITE_CODE` 환경 변수로 넘기면 묻지 않는다.
@@ -71,13 +71,13 @@ Read-Host -AsSecureString "cimon token" | ConvertFrom-SecureString |
 
 이 파일은 이 PC 의 이 Windows 사용자만 풀 수 있다.
 
-**② `%USERPROFILE%\.cimon\header.ps1`** — 헤더 JSON 을 출력한다:
+**② 헤더 도우미 `%USERPROFILE%\.cimon\header.ps1`** — 서버가 내주는 것을 받는다. 토큰을 풀어 헤더 JSON 한 줄을 출력한다:
 
 ```powershell
-$secure = Get-Content "$env:USERPROFILE\.cimon\token.dpapi" | ConvertTo-SecureString
-$token = [System.Net.NetworkCredential]::new('', $secure).Password
-@{ Authorization = "Bearer $token" } | ConvertTo-Json -Compress
+irm https://cimon.<tailnet>.ts.net/header.ps1 -OutFile "$env:USERPROFILE\.cimon\header.ps1"
 ```
+
+직접 쓰지 않는 이유가 있다. `ConvertTo-SecureString` 으로 푸는 세 줄짜리 도우미는 PowerShell 7 에서 띄운 Claude Code 아래에서 깨진다. 그때 Windows PowerShell 5.1 은 7 의 모듈 경로를 물려받아 그 cmdlet 의 모듈을 읽지 못하고, **빈 토큰을 출력한 채 정상 종료한다.** 서버는 그것을 401 로 거절한다. 서버의 도우미는 cmdlet 없이 .NET 으로만 풀고, 토큰을 못 읽으면 이유를 stderr 에 쓰고 실패한다.
 
 **③ Claude Code 에 등록** — **명령 프롬프트(cmd)** 에서. Windows PowerShell 5.1 은 인자 속 따옴표를 깨뜨린다. `<me>`·`<tailnet>` 을 바꾼다:
 
@@ -102,7 +102,8 @@ secret-tool store --label=cimon service cimon
 
 ```sh
 #!/bin/sh
-t=$(security find-generic-password -a "$USER" -s cimon -w)   # Linux: t=$(secret-tool lookup service cimon)
+t=$(security find-generic-password -a "$USER" -s cimon -w) || exit 1   # Linux: t=$(secret-tool lookup service cimon) || exit 1
+[ -n "$t" ] || { echo "cimon header helper: no token" >&2; exit 1; }   # 빈 토큰을 보내지 않는다
 printf '{"Authorization":"Bearer %s"}' "$t"
 ```
 
@@ -197,8 +198,9 @@ Claude Code 에서 `/mcp` 를 열어 `cimon` 이 연결됐는지 본다. 그다�
 |---|---|
 | `/mcp` 에서 연결 실패 | Tailscale 이 켜져 있나, `curl.exe https://cimon.<tailnet>.ts.net/healthz` |
 | healthz 도 안 됨 | `tailscale status` 에 `cimon` 이 보이나. 안 보이면 tailnet 관리자(ACL·그룹) |
+| 401 · 인증 실패 (전에는 됐다, Windows) | 헤더 도우미가 옛 판일 수 있다. PowerShell 7 에서 띄운 Claude Code 아래에서 옛 도우미는 `ConvertTo-SecureString` 을 못 읽고 빈 토큰을 보낸다. 서버의 것으로 바꾼다 — `irm https://cimon.<tailnet>.ts.net/header.ps1 -OutFile "$env:USERPROFILE\.cimon\header.ps1"`(다시 연결할 필요 없다) |
 | 401 | 토큰이 틀렸거나 꺼졌다 — 관리자에게 `cimon token rotate <이름>` |
-| headersHelper 오류 | `powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<me>/.cimon/header.ps1` 을 직접 실행해 JSON 한 줄이 나오는지 |
+| headersHelper 오류 | `powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<me>/.cimon/header.ps1` 을 직접 실행한다. JSON 한 줄이 나오거나, 못 읽은 이유(`cimon header helper: …`)가 나온다. 토큰 파일이 없거나 이 Windows 사용자가 풀 수 없으면 관리자에게 초대를 받아 다시 연결한다 |
 | `queue_full` | 내 대기 작업이 상한(기본 5개)이다 — 기다리거나 `cancel_job` |
 | `upload_missing` · `upload_invalid` | 고른 단계에 업로드가 필요하다, 또는 핸들이 만료·사용됐다 — 「비밀 파일이 필요한 빌드」 대로 다시 올린다 |
 | `upload_ref_not_allowed` · `upload_trial_recipe` | 업로드를 받는 작업은 허용 브랜치와 `main` 레시피로만 — `describe_project` 의 `uploads.refs` |
