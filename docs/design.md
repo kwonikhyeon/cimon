@@ -1123,12 +1123,15 @@ login_code_minutes = 5
    Read-Host -AsSecureString "cimon token" | ConvertFrom-SecureString |
      Set-Content "$env:USERPROFILE\.cimon\token.dpapi"
    ```
-2. `%USERPROFILE%\.cimon\header.ps1`:
+2. `%USERPROFILE%\.cimon\header.ps1` — 서버가 내주는 것(`GET /header.ps1`, 주소만 박혀 있고 비밀은 없다):
    ```powershell
-   $secure = Get-Content "$env:USERPROFILE\.cimon\token.dpapi" | ConvertTo-SecureString
-   $token = [System.Net.NetworkCredential]::new('', $secure).Password
-   @{ Authorization = "Bearer $token" } | ConvertTo-Json -Compress
+   irm https://cimon.<tailnet>.ts.net/header.ps1 -OutFile "$env:USERPROFILE\.cimon\header.ps1"
    ```
+   이 도우미는 두 가지를 지킨다.
+   - **cmdlet 을 쓰지 않는다.** 16진수 DPAPI 블롭(`ConvertFrom-SecureString` 이 쓰는 형식)을 .NET `ProtectedData` 로 푼다. Claude Code 가 PowerShell 7 아래에서 돌면 Windows PowerShell 5.1 은 7 의 `PSModulePath` 를 물려받는다. 그러면 `ConvertTo-SecureString` 의 모듈을 읽지 못한다(`CouldNotAutoloadMatchingModule`).
+   - **토큰을 못 읽으면 실패한다.** 이유를 stderr 에 쓰고 종료 코드 1 로 끝난다. 빈 토큰을 출력하고 정상 종료하면 서버의 401 로만 돌아와 원인이 감춰진다.
+
+   connect 스크립트는 도우미를 받은 뒤 Claude Code 처럼 한 번 돌려 방금 받은 토큰이 나오는지 확인하고 등록한다. 이미 연결한 PC 는 위 한 줄로 도우미만 바꾼다. 업로드 스크립트도 같은 도우미로 토큰을 얻고, 도우미가 실패하거나 빈 토큰을 내면 서버에 보내기 전에 멈춘다.
 3. Claude Code 등록(명령 프롬프트에서, 절대 경로 — Windows 기본 실행 정책은 `.ps1` 을 막으므로 `-ExecutionPolicy Bypass`):
    ```
    claude mcp add-json --scope user cimon "{\"type\":\"http\",\"url\":\"https://cimon.<tailnet>.ts.net/mcp\",\"headersHelper\":\"powershell -NoProfile -ExecutionPolicy Bypass -File C:/Users/<me>/.cimon/header.ps1\"}"
@@ -1174,7 +1177,7 @@ login_code_minutes = 5
 1. Tailscale 설치 → 회사 계정 로그인 → tailnet 관리자가 `group:cimon-users` 에 넣는다.
 2. Claude Code v2.1.304 이상.
 3. 관리자가 `cimon invite <이름>` 으로 **초대 코드**(Crockford base32 8자 = 40비트, 기본 10분, 한 번)를 만든다. 서버에는 코드의 해시와 이름·역할만 남는다.
-4. 팀원이 서버가 내주는 스크립트를 실행한다 — `GET /connect.ps1` · `GET /connect.sh`(서버 주소가 박혀 있고 비밀은 없다). 스크립트가 `POST /connect/redeem` 에 코드를 내면 서버가 그때 사용자를 만들어 토큰을 돌려주고(한 트랜잭션에서 초대를 쓰고 사용자를 만든다), 스크립트가 토큰을 OS 보관소에 넣고 §15.4 의 헤더 도우미와 등록을 대신 한 뒤 `claude mcp get` 으로 연결을 확인한다. 이 경로들은 토큰 없이 열려 있다 — tailnet 이 문이고 코드가 자격 증명이다. 틀린 코드는 0.5초씩 늦게 답한다. 교환 시도는 코드를 찾기 전에 센다 — 출처(Tailscale 로그인, 없으면 이 머신의 호출)마다 10분에 20번, 모든 출처를 합쳐 1000번. 한 출처가 시끄러워도 다른 사람의 연결은 막히지 않고, 40비트·10분짜리 코드는 그 속도로도 맞힐 수 없다. 스크립트는 거절 이유(틀린 코드·시도 초과)를 그대로 보인다. 교환·실패는 Tailscale 신원과 함께 감사 로그에.
+4. 팀원이 서버가 내주는 스크립트를 실행한다 — `GET /connect.ps1` · `GET /connect.sh`(서버 주소가 박혀 있고 비밀은 없다). 스크립트가 `POST /connect/redeem` 에 코드를 내면 서버가 그때 사용자를 만들어 토큰을 돌려주고(한 트랜잭션에서 초대를 쓰고 사용자를 만든다), 스크립트가 토큰을 OS 보관소에 넣고 §15.4 의 헤더 도우미를 둔다(Windows 는 `GET /header.ps1` 을 받아 한 번 돌려 토큰이 나오는지 본다). 그다음 등록을 대신 하고 `claude mcp get` 으로 연결을 확인한다. 이 경로들은 토큰 없이 열려 있다 — tailnet 이 문이고 코드가 자격 증명이다. 틀린 코드는 0.5초씩 늦게 답한다. 교환 시도는 코드를 찾기 전에 센다 — 출처(Tailscale 로그인, 없으면 이 머신의 호출)마다 10분에 20번, 모든 출처를 합쳐 1000번. 한 출처가 시끄러워도 다른 사람의 연결은 막히지 않고, 40비트·10분짜리 코드는 그 속도로도 맞힐 수 없다. 스크립트는 거절 이유(틀린 코드·시도 초과)를 그대로 보인다. 교환·실패는 Tailscale 신원과 함께 감사 로그에.
 5. 확인: `/mcp` 에 cimon 연결, `list_projects` 가 프로젝트 목록.
 
 토큰을 직접 주는 길(`cimon token create`, §15.4 의 수동 등록)도 남는다.
@@ -1310,6 +1313,7 @@ login_code_minutes = 5
 | 2026-10-26 | 리뷰 화면은 보기·토론·반영 전용, 의미 차이가 중심. 줄 댓글·좌우 보기·구문 강조는 뺀다. 처음의 「PR 화면 없음 — `recipe_diff` 로 대신」 을 대체한다 | 편집은 한 곳에서. 여러 프로젝트에 걸친 변경을 사람이 훑어보기에는 화면이 낫다. 1단계 규모에 맞게 |
 | 2026-10-26 | 리뷰 화면 로그인은 MCP 가 발급하는 일회용 링크 | 브라우저에 Bearer 토큰을 넣지 않는다. 신원 헤더는 로컬 프로세스가 꾸밀 수 있다 |
 | 2026-11-07 | 끝난 빌드를 다시 쓴다 — 접수 끝에서, 통과한 build·package 만, 기본 켜짐, `rebuild: true` 로 끈다. 처음의 「끝난 작업과는 병합하지 않는다」 를 대체한다 | 같은 커밋의 빌드를 여러 사람이 받는 일이 흔하고 빌드는 길다. 커밋을 확정한 뒤라 push 직후 요청에 옛 결과를 주지 않는다. 시험은 다시 돌리려고 부르는 일이 많아 넣지 않았다 |
+| 2026-11-19 | Windows 헤더 도우미는 서버가 내주고(`GET /header.ps1`), cmdlet 없이 .NET 으로 토큰을 풀며, 못 풀면 실패한다. 처음의 `ConvertTo-SecureString` 세 줄을 대체한다 | PowerShell 7 아래에서 띄운 5.1 이 그 모듈을 읽지 못해 빈 토큰을 내고 정상 종료했고, 노트북의 빌드 요청이 401 로 거절됐다. 서버 로그에는 남지 않아 원인을 찾기 어려웠다 |
 
 ---
 

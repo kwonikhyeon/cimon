@@ -61,12 +61,16 @@ catch {
 $dir = Join-Path $env:USERPROFILE '.cimon'
 New-Item -ItemType Directory -Force $dir | Out-Null
 ConvertTo-SecureString $r.token -AsPlainText -Force | ConvertFrom-SecureString | Set-Content (Join-Path $dir 'token.dpapi')
+# the header helper is the server's own copy (GET /header.ps1 - a PC connected earlier
+# refreshes it the same way). Run it once the way Claude Code will: Windows PowerShell,
+# under the module path this shell passes on. It must give back this token
 $helper = Join-Path $dir 'header.ps1'
-Set-Content -Path $helper -Encoding ASCII -Value @'
-$secure = Get-Content (Join-Path $env:USERPROFILE '.cimon\token.dpapi') | ConvertTo-SecureString
-$token = [System.Net.NetworkCredential]::new('', $secure).Password
-@{ Authorization = "Bearer $token" } | ConvertTo-Json -Compress
-'@
+try { Invoke-WebRequest -Uri "$CimonUrl/header.ps1" -OutFile $helper -UseBasicParsing }
+catch { Fail "could not fetch the header helper from $CimonUrl/header.ps1: $($_.Exception.Message)" }
+$hdr = & "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $helper
+if ($LASTEXITCODE -ne 0) { Fail "the header helper $helper failed (exit $LASTEXITCODE) - its message is above" }
+if (([string]$hdr).Trim() -cne ('{"Authorization":"Bearer ' + $r.token + '"}')) { Fail "the header helper $helper does not give back the token it was stored with" }
+Remove-Variable hdr
 # for steps that need a file from this PC (a signing key): upload.ps1 next to the helper
 try { Invoke-WebRequest -Uri "$CimonUrl/upload.ps1" -OutFile (Join-Path $dir 'upload.ps1') -UseBasicParsing }
 catch { Write-Host "cimon connect: could not fetch upload.ps1 - get it later from $CimonUrl/upload.ps1" -ForegroundColor Yellow }

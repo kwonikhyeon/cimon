@@ -17,8 +17,14 @@ command -v curl >/dev/null 2>&1 || fail "curl is needed"
 [ -f "$HOME/.cimon/header.sh" ] || fail "no ~/.cimon/header.sh - connect this machine first: curl -fsSL $CIMON_URL/connect.sh | sh"
 # the token through the same header helper Claude Code uses; it goes to curl in a
 # private config file, not on its command line
-auth=$(sh "$HOME/.cimon/header.sh" | sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p')
-[ -n "$auth" ] || fail "~/.cimon/header.sh printed no Authorization header"
+out=$(sh "$HOME/.cimon/header.sh") || fail "~/.cimon/header.sh failed - its message is above"
+auth=$(printf '%s' "$out" | sed -n 's/.*"Authorization":"\([^"]*\)".*/\1/p')
+unset out
+# an older helper prints "Bearer " with nothing after it when it cannot read the token
+case "$auth" in
+  "Bearer "?*) ;;
+  *) fail "~/.cimon/header.sh printed no token - connect this machine again: curl -fsSL $CIMON_URL/connect.sh | sh" ;;
+esac
 cfg=$(umask 077 && mktemp)
 # also on Ctrl-C at a prompt: echo back on (only if a prompt turned it off - there may
 # be no terminal at all), the config file gone. set -e applies in a trap: nothing may fail

@@ -2,7 +2,9 @@
 //! a script with this server's address in it, and `POST /connect/redeem` trades a
 //! one-time invite code (`cimon invite`) for a new user's token. The script stores the
 //! token in the OS keystore and registers cimon with Claude Code, so the token never
-//! passes through a person's hands.
+//! passes through a person's hands. `GET /header.ps1` is the Windows header helper the
+//! connect script installs (design §15.4) — a PC connected earlier replaces its copy
+//! from there.
 //!
 //! These routes take no token — the tailnet is the gate, the code the credential.
 //! Failed codes are slowed down, and redeem attempts are limited per source (the
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 
 const PS1: &str = include_str!("connect.ps1");
 const SH: &str = include_str!("connect.sh");
+const HEADER_PS1: &str = include_str!("header.ps1");
 
 /// Redeem attempts in the last window, with their source. Counted before the code is
 /// looked up, so parallel requests cannot slip past the limit.
@@ -69,6 +72,10 @@ pub async fn ps1(State(app): State<Arc<App>>) -> Response {
 
 pub async fn sh(State(app): State<Arc<App>>) -> Response {
     script(&app, SH)
+}
+
+pub async fn header_ps1(State(app): State<Arc<App>>) -> Response {
+    script(&app, HEADER_PS1)
 }
 
 #[derive(serde::Deserialize)]

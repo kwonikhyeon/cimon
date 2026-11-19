@@ -56,6 +56,7 @@ pub fn router(app: Arc<App>, shutdown: CancellationToken) -> Router {
         .route("/connect.ps1", get(connect::ps1))
         .route("/connect.sh", get(connect::sh))
         .route("/connect/redeem", post(connect::redeem))
+        .route("/header.ps1", get(connect::header_ps1))
         .route("/upload.ps1", get(uploads::ps1))
         .route("/upload.sh", get(uploads::sh))
         .with_state(app.clone())
